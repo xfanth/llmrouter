@@ -1,0 +1,22 @@
+# Live API keys. Never commit these.
+providers.yaml
+channels.csv
+freellmapi-keys.csv
+.env
+*.env
+
+# Runtime state
+config/
+data/
+*.redb
+spill/
+
+# Build
+target/
+
+# macOS metadata
+._*
+.DS_Store
+
+# Agent tooling state
+.omc/
