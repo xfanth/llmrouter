@@ -1,0 +1,18 @@
+# Overlay for the smoke tier. The production compose file mounts host paths
+# that only exist on the NAS, so CI swaps them for a fixture config directory
+# and a throwaway named volume.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
+services:
+  llmrouter:
+    volumes:
+      - ./tests/smoke/fixture-config:/config:ro
+      - smoke-data:/data
+    # `!override` replaces the inherited list. Without the tag Compose
+    # concatenates, and the service ends up publishing 8080 twice: once on
+    # 0.0.0.0 from the base file and once here, so the second bind fails.
+    ports: !override
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  smoke-data:

@@ -221,7 +221,10 @@ impl HealthTable {
         interval: Duration,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
-        let mut ticker = tokio::time::interval(interval);
+        // Floored at a second: `tokio::time::interval` panics on a period of
+        // zero, and a zero in `router.yml` means "flush as often as possible",
+        // not "kill health persistence".
+        let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
         // The first tick fires at once; skip it, there is nothing new to write.
         ticker.tick().await;
         loop {
@@ -257,73 +260,15 @@ pub fn wait_seconds(retry_counter: u32, retry_base_secs: u64, backoff_max_secs: 
 
 /// Parses a `Retry-After` header. Handles both forms: a count of seconds, and
 /// an HTTP date, which becomes the seconds between `now` and that date. A date
-/// already past gives 0.
+/// already past gives 0. `httpdate` covers all three date forms RFC 9110
+/// requires a recipient to accept.
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<u64> {
     let value = value.trim();
     if let Ok(secs) = value.parse::<u64>() {
         return Some(secs);
     }
-    let at = parse_http_date(value)?;
-    let now_unix = now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
-    Some(at.saturating_sub(now_unix))
-}
-
-/// RFC 7231 IMF-fixdate, for example `Sun, 06 Nov 1994 08:49:37 GMT`, to unix
-/// seconds.
-///
-// ponytail: only the preferred IMF-fixdate form. The two obsolete forms
-// (RFC 850 and asctime) are vanishingly rare from an API; add them here if one
-// ever shows up.
-fn parse_http_date(value: &str) -> Option<u64> {
-    let b = value.as_bytes();
-    if b.len() < 29 || !value.ends_with("GMT") {
-        return None;
-    }
-    // "Sun, 06 Nov 1994 08:49:37 GMT"
-    //  0    5  8   12   17 20 23
-    if b[3] != b',' || b[4] != b' ' {
-        return None;
-    }
-    let day: u32 = value.get(5..7)?.parse().ok()?;
-    let month = match value.get(8..11)? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year: i64 = value.get(12..16)?.parse().ok()?;
-    let hour: u64 = value.get(17..19)?.parse().ok()?;
-    let minute: u64 = value.get(20..22)?.parse().ok()?;
-    let second: u64 = value.get(23..25)?.parse().ok()?;
-    if day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    if days < 0 {
-        return None;
-    }
-    Some(days as u64 * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date. Howard Hinnant's
-/// `days_from_civil`.
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m = month as i64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(now).unwrap_or_default().as_secs())
 }
 
 /// The winner test, used both by the race and by health: a 2xx carrying
@@ -501,10 +446,16 @@ mod tests {
     #[test]
     fn retry_after_date_form() {
         // 6 Nov 1994 08:49:37 GMT is unix 784_111_777.
-        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
-        assert_eq!(parse_http_date(date), Some(784_111_777));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777 - 90);
-        assert_eq!(parse_retry_after(date, now), Some(90));
+        // The same instant in all three forms RFC 9110 section 5.6.7 lists:
+        // IMF-fixdate, the obsolete RFC 850 form, and asctime.
+        for date in [
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            assert_eq!(parse_retry_after(date, now), Some(90), "{date}");
+        }
     }
 
     #[test]
@@ -532,14 +483,15 @@ mod tests {
 
     #[test]
     fn leap_year_dates() {
+        let epoch = SystemTime::UNIX_EPOCH;
         // 29 Feb 2024 00:00:00 GMT is unix 1_709_164_800.
         assert_eq!(
-            parse_http_date("Thu, 29 Feb 2024 00:00:00 GMT"),
+            parse_retry_after("Thu, 29 Feb 2024 00:00:00 GMT", epoch),
             Some(1_709_164_800)
         );
         // 1 Mar 2000 00:00:00 GMT, the 400 year rule.
         assert_eq!(
-            parse_http_date("Wed, 01 Mar 2000 00:00:00 GMT"),
+            parse_retry_after("Wed, 01 Mar 2000 00:00:00 GMT", epoch),
             Some(951_868_800)
         );
     }
@@ -646,12 +598,15 @@ mod tests {
 
     // The table itself, against a throwaway redb file.
 
-    fn table(backoff_max_secs: u64) -> (HealthTable, tempdir::Dir) {
+    fn table(backoff_max_secs: u64) -> (HealthTable, tempfile::TempDir) {
         table_with_base(1, backoff_max_secs)
     }
 
-    fn table_with_base(retry_base_secs: u64, backoff_max_secs: u64) -> (HealthTable, tempdir::Dir) {
-        let dir = tempdir::Dir::new();
+    fn table_with_base(
+        retry_base_secs: u64,
+        backoff_max_secs: u64,
+    ) -> (HealthTable, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("scratch dir");
         let db = Database::create(dir.path().join("health.redb")).unwrap();
         let t = HealthTable::open(
             Arc::new(db),
@@ -760,7 +715,7 @@ mod tests {
 
     #[test]
     fn the_table_survives_a_restart_and_deadlines_stay_absolute() {
-        let dir = tempdir::Dir::new();
+        let dir = tempfile::tempdir().expect("scratch dir");
         let path = dir.path().join("health.redb");
         let k = HealthKey::ProviderKey {
             provider: "gemini".to_string(),
@@ -795,7 +750,7 @@ mod tests {
 
     #[test]
     fn a_channel_key_round_trips_through_redb() {
-        let dir = tempdir::Dir::new();
+        let dir = tempfile::tempdir().expect("scratch dir");
         let path = dir.path().join("health.redb");
         let k = HealthKey::Channel(ChannelId(0xdead_beef_u64));
         {
@@ -810,36 +765,34 @@ mod tests {
         assert_eq!(t.get(&k).unwrap().eligible_at, 501);
     }
 
-    /// A throwaway directory. Too small to earn a dependency.
-    mod tempdir {
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::{AtomicU64, Ordering};
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_flush_interval_does_not_kill_the_flush_loop() {
+        // `flush_interval: 0s` in `router.yml` used to panic the loop on its
+        // first line, which on a `panic = "abort"` build takes the process
+        // down at boot and otherwise loses health persistence in silence.
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("health.redb");
+        let k = HealthKey::Channel(ChannelId(1));
 
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let db = Arc::new(Database::create(&path).unwrap());
+        let t = Arc::new(
+            HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap(),
+        );
+        t.record_failure(&k, None, 500);
 
-        pub struct Dir(PathBuf);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let loop_task = tokio::spawn(Arc::clone(&t).flush_loop(Duration::ZERO, shutdown.clone()));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        shutdown.cancel();
+        loop_task
+            .await
+            .expect("the flush loop survives a zero interval");
 
-        impl Dir {
-            pub fn new() -> Self {
-                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let p = std::env::temp_dir().join(format!(
-                    "llmrouter-health-test-{}-{}",
-                    std::process::id(),
-                    n
-                ));
-                std::fs::create_dir_all(&p).unwrap();
-                Self(p)
-            }
-
-            pub fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        // And the row really reached redb.
+        drop(t);
+        let db = Arc::new(Database::create(&path).unwrap());
+        let reopened =
+            HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+        assert_eq!(reopened.get(&k).unwrap().eligible_at, 501);
     }
 }

@@ -10,6 +10,7 @@ pub mod cache;
 pub mod catalogue;
 pub mod config;
 pub mod health;
+pub mod logging;
 pub mod metrics;
 pub mod models_api;
 pub mod net;
@@ -27,6 +28,7 @@ pub use config::{
     RouterConfig, WireName,
 };
 pub use health::{HealthEntry, HealthKey, HealthTable};
+pub use logging::{LogSetup, StartupSummary};
 pub use metrics::{AttemptOutcome, Metrics, Outcome};
 pub use net::{LinkState, NetTest};
 pub use probe::{ProbeOutcome, ProbedModel, Prober};

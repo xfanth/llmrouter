@@ -73,12 +73,13 @@ One agent owns one file. Never edit another module's file.
 | `src/wire.rs` | The only module that names `switchyard_translation`. Four buffered functions and two streaming ones. | Format translation |
 | `src/upstream.rs` | The shared `reqwest::Client`, HTTP/2 settings, one channel call buffered or streamed, the shared `Bytes` body. | HTTP client settings, Memory over the life of one client request |
 | `src/race.rs` | N channels, M hedged copies, first copy home wins, cancellation, fallback, the client-disconnect path. | Core loop, Streaming, Concurrency against one provider |
-| `src/server.rs` | axum routes, request and response translation at the edges, status codes (no keepalive: the status line must not go out before the outcome is known). | Endpoints, Status codes, Streaming |
+| `src/server.rs` | axum routes, request and response translation at the edges, status codes, and the keepalive (SSE `: ping` for a streaming client, a leading space for a non-streaming one). Nothing goes out for the first `keepalive_interval`, so any outcome decided inside that window still gets its own 400/404/413/502/503/504. Past it the response is committed to `200` and a later failure is delivered inside the body, as an SSE `error` event or the error JSON. | Endpoints, Status codes, Streaming, Keepalive |
 | `src/models_api.rs` | `GET /v1/models`, one row per distinct model with live channel health. | `GET /v1/models` |
 | `src/admission.rs` | The RSS gate: read `/proc/self/statm`, compare to `memory_high_water`, `503` above it. | Admission: the gate is memory |
 | `src/net.rs` | The two network test calls that run beside every client request. | When the network itself is down |
 | `src/metrics.rs` | Prometheus text, every counter and histogram named in the design. | What it records |
-| `src/main.rs` | Bootstrap: jemalloc, config, state, startup probes, axum serve, graceful shutdown. | Deployment |
+| `src/logging.rs` | The subscriber: pretty console plus pretty uncoloured file at `./logs/<iso_datetime>.log`, the startup progress bars and the startup summary table. | Deployment |
+| `src/main.rs` | Bootstrap: jemalloc, logging, config, state, startup probes, axum serve, graceful shutdown. | Deployment |
 
 ## Rules every agent follows
 

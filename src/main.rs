@@ -1,6 +1,6 @@
 //! Bootstrap.
 //!
-//! jemalloc, config, shared state, the probe waves in the background, axum,
+//! jemalloc, logging, config, shared state, the probe waves in the background, axum,
 //! and a graceful shutdown on SIGTERM that flushes the health table.
 //!
 //! Startup never blocks on an upstream. The port binds and serves with zero
@@ -30,13 +30,15 @@ const RSS_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    install_tracing();
+    // Held for the life of the process: dropping it flushes the file writer.
+    let (log_setup, _log_guard) = llmrouter::logging::init().context("opening the log file")?;
 
     let dir = config_dir();
     let config = Arc::new(
         Config::load(&dir).with_context(|| format!("loading config from {}", dir.display()))?,
     );
     tracing::info!(
+        log_file = %log_setup.path.display(),
         config_dir = %dir.display(),
         providers = config.providers.len(),
         ranked_models = config.intelligence.len(),
@@ -104,6 +106,18 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    // A fresh process owns no spill files, so anything still in there is an
+    // orphan from a run that died before PromptBody::drop could delete it
+    // (SIGKILL, the OOM killer, or a panic under panic="abort"). Each one is a
+    // full client prompt in plaintext on an exported share, so sweep the
+    // directory before the port binds rather than letting them pile up.
+    match std::fs::remove_dir_all(&router.spill_path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => {
+            return Err(e).with_context(|| format!("sweeping {}", router.spill_path.display()));
+        }
+    }
     std::fs::create_dir_all(&router.spill_path)
         .with_context(|| format!("creating {}", router.spill_path.display()))?;
 
@@ -136,7 +150,7 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
     let metrics = Arc::new(Metrics::new()?);
 
     let racer = Arc::new(Racer::new(
-        Arc::new(router.clone()),
+        Arc::clone(&config),
         Arc::clone(&catalogue),
         Arc::clone(&health),
         upstream,
@@ -154,19 +168,6 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
         metrics,
         started_at: Instant::now(),
     }))
-}
-
-/// Structured logs to stdout. `RUST_LOG` picks the level; the default keeps the
-/// router at info and everything noisier at warn.
-fn install_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("llmrouter=info,warn"));
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .init();
 }
 
 /// Where the five config files live. `LLMROUTER_CONFIG_DIR`, or `/config`.
@@ -227,9 +228,8 @@ mod tests {
     /// test in this target that may call `build_state`.
     #[test]
     fn build_state_opens_one_store_and_wires_everything_to_it() {
-        let dir =
-            std::env::temp_dir().join(format!("llmrouter-build-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let dir = tmp.path();
 
         let mut config = Config {
             router: llmrouter::RouterConfig::default(),
@@ -242,7 +242,17 @@ mod tests {
         config.router.cache.path = dir.join("cache.redb");
         config.router.spill_path = dir.join("spill");
 
+        // An orphan left by a run that was killed before its destructor ran.
+        std::fs::create_dir_all(dir.join("spill")).expect("the spill directory is created");
+        let orphan = dir.join("spill").join("orphan.json");
+        std::fs::write(&orphan, b"{}").expect("the orphan is written");
+
         let state = build_state(Arc::new(config)).expect("state builds");
+
+        assert!(
+            !orphan.exists(),
+            "boot must sweep spill files left by a crashed run"
+        );
 
         assert!(state.cache.is_some(), "cache.enabled defaults to true");
         assert_eq!(state.cache.as_ref().unwrap().entry_count().unwrap(), 0);
@@ -259,7 +269,6 @@ mod tests {
         );
 
         drop(state);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The compose file is the only thing that caps the container at 4GB and
@@ -307,5 +316,74 @@ mod tests {
             "the health check must hit /healthz"
         );
         assert_eq!(check["start_period"].as_str(), Some("10s"));
+    }
+
+    /// Swatinem/rust-cache resolves "$root -> $target" by joining the two, so
+    /// an absolute target path lands on a directory that never exists and the
+    /// build output is never cached. Every run would then be a cold build
+    /// while the cache still reports a hit on the registry.
+    #[test]
+    fn the_ci_workflow_keeps_the_target_dir_inside_the_checkout() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect(".github/workflows/ci.yml is missing");
+        let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
+
+        if let Some(dir) = ci["env"]["CARGO_TARGET_DIR"].as_str() {
+            assert!(
+                !dir.starts_with('/'),
+                "CARGO_TARGET_DIR must be relative to the checkout: {dir}"
+            );
+        }
+
+        let mut seen = 0;
+        for (name, job) in ci["jobs"].as_mapping().expect("jobs") {
+            for step in job["steps"].as_sequence().expect("steps") {
+                if !step["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("Swatinem/rust-cache@"))
+                {
+                    continue;
+                }
+                let spec = step["with"]["workspaces"]
+                    .as_str()
+                    .expect("the cache step must name a workspace");
+                let target = spec.split("->").nth(1).expect("workspaces needs a target");
+                assert!(
+                    !target.trim().starts_with('/'),
+                    "job {name:?} caches an absolute target dir, which caches nothing: {spec}"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 2, "both jobs should cache the build");
+    }
+
+    /// Scratch directories named after the process id collide between runs: a
+    /// file left behind by a failed or killed run is still there when a later
+    /// run draws the same pid, and an unrelated test then fails on it. The
+    /// production spill path is configured, so no module needs `temp_dir`.
+    #[test]
+    fn no_module_builds_its_own_scratch_directory() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("src is readable") {
+            let path = entry.expect("a directory entry").path();
+            // The needle is split so this guard does not match itself. A file
+            // that is not UTF-8 (a macOS sidecar on a network share) is not a
+            // module, so it reads as empty rather than failing the test.
+            if path.extension().is_some_and(|e| e == "rs")
+                && std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .contains(concat!("env::temp", "_dir()"))
+            {
+                offenders.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "use tempfile::tempdir() instead of a hand-rolled scratch directory in: {offenders:?}"
+        );
     }
 }

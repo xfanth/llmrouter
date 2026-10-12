@@ -1,0 +1,25 @@
+---
+source: tests/contract/openai_chat.rs
+expression: encoded
+---
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "router/auto",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Red and blue."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 11,
+    "completion_tokens": 4,
+    "total_tokens": 15
+  }
+}

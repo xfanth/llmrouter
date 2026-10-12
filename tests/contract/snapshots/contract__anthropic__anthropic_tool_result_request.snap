@@ -1,0 +1,37 @@
+---
+source: tests/contract/anthropic.rs
+expression: anthropic_again
+---
+{
+  "model": "claude-sonnet-4",
+  "messages": [
+    {
+      "role": "user",
+      "content": "weather in London?"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_fake_02abcdef",
+          "name": "get_weather",
+          "input": {
+            "city": "London"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_fake_02abcdef",
+          "content": "12C and raining"
+        }
+      ]
+    }
+  ],
+  "max_tokens": 256
+}

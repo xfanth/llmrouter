@@ -10,6 +10,7 @@ config/
 data/
 *.redb
 spill/
+logs/
 
 # Build
 target/
@@ -20,3 +21,6 @@ target/
 
 # Agent tooling state
 .omc/
+
+# Coverage reports
+lcov.info

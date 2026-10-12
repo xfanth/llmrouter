@@ -82,6 +82,9 @@ pub struct Channel {
     pub intelligence: u16,
     /// Precomputed rank. Lower is better; the vector sorts on this.
     pub intelligence_rank: u32,
+    /// The provider's own release timestamp in unix seconds, when it
+    /// published one on its `/models` row. `None` when it did not.
+    pub created: Option<u64>,
 
     /// Mutated in place by live traffic and the poller.
     pub health: ChannelHealth,
@@ -224,25 +227,14 @@ impl Catalogue {
             }
         }
 
-        channels.sort_by_key(|c| c.intelligence_rank);
         // Many channels share a rank: the same model on several providers, or
-        // the same provider and model on several keys. Shuffle within each
-        // rank group so ties break at random. No latency tiebreak: measuring
+        // the same provider and model on several keys. Shuffle first, then
+        // sort: `sort_by_key` is stable, so equal ranks keep the shuffled
+        // order and ties break at random. No latency tiebreak: measuring
         // latency means calling the channels first, which is the thing being
         // chosen.
-        let mut rng = rand::thread_rng();
-        let mut start = 0;
-        while start < channels.len() {
-            let rank = channels[start].intelligence_rank;
-            let mut end = start + 1;
-            while end < channels.len() && channels[end].intelligence_rank == rank {
-                end += 1;
-            }
-            if end - start > 1 {
-                channels[start..end].shuffle(&mut rng);
-            }
-            start = end;
-        }
+        channels.shuffle(&mut rand::thread_rng());
+        channels.sort_by_key(|c| c.intelligence_rank);
         self.channels.store(Arc::new(channels));
     }
 
@@ -327,6 +319,7 @@ mod tests {
             modalities_input: vec!["text".to_string()],
             intelligence: 1_000u16.saturating_sub(rank as u16),
             intelligence_rank: rank,
+            created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
         }
@@ -529,10 +522,10 @@ mod tests {
             let middle: Vec<String> = rows[1..4].iter().map(|c| c.provider.to_string()).collect();
             orders.insert(middle);
         }
-        // Three tied rows have six orderings. Seeing more than one over 200
-        // rebuilds is enough to prove the tie-break is not fixed; the odds of
-        // a false failure are 6 * (1/6)^200.
-        assert!(orders.len() > 1, "tied ranks were not shuffled");
+        // Three tied rows have six orderings and every one must be reachable:
+        // a tie-break that only shuffles part of the rank group would show
+        // fewer. Over 200 rebuilds the odds of missing one are negligible.
+        assert_eq!(orders.len(), 6, "tied ranks were not shuffled freely");
     }
 
     #[test]

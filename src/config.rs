@@ -69,9 +69,10 @@ impl Config {
     }
 
     /// The intelligence score and rank for a model id, matched through the
-    /// normalising rules in DESIGN.md. An unranked model scores 0 and sorts to
-    /// the bottom.
-    pub fn rank_of(&self, provider: &str, model_id: &str) -> (u16, u32) {
+    /// normalising rules in DESIGN.md, plus which pass found it. An unranked
+    /// model scores 0 and sorts to the bottom. The caller logs the loose ones,
+    /// so a wrong pairing is visible rather than silent.
+    pub fn rank_of(&self, provider: &str, model_id: &str) -> (u16, u32, RankMatch) {
         // An explicit `ranks_as` in models.yml replaces the model id outright.
         // That is the hand correction for anything the automatic pass gets
         // wrong.
@@ -89,7 +90,11 @@ impl Config {
             .iter()
             .find(|e| normalise_model_name(&e.slug) == target)
         {
-            return (entry.intelligence, entry.intelligence_rank);
+            return (
+                entry.intelligence,
+                entry.intelligence_rank,
+                RankMatch::Exact,
+            );
         }
 
         // Loose pass, for ids carrying a vendor prefix the slug does not:
@@ -104,10 +109,27 @@ impl Config {
                 (!slug.is_empty() && target.ends_with(&slug)).then_some((slug.len(), e))
             })
             .max_by_key(|(len, _)| *len)
-            .map_or((0, u32::MAX), |(_, e)| {
-                (e.intelligence, e.intelligence_rank)
+            .map_or((0, u32::MAX, RankMatch::None), |(_, e)| {
+                (
+                    e.intelligence,
+                    e.intelligence_rank,
+                    RankMatch::Loose(e.slug.clone()),
+                )
             })
     }
+}
+
+/// Which pass in `Config::rank_of` produced the score it returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RankMatch {
+    /// The normalised slug matched the normalised model id outright.
+    Exact,
+    /// Matched only on a suffix, carrying the ranking slug that won. These
+    /// are the ones DESIGN.md asks to be logged at startup: `coder` matching
+    /// `qwen3-coder-plus` is plausible and wrong.
+    Loose(String),
+    /// No ranking row matched, so the score is 0 and the rank is the bottom.
+    None,
 }
 
 /// `router.yml`.
@@ -125,6 +147,22 @@ pub struct RouterConfig {
     pub max_per_channel: usize,
     /// 0 means the M copies fire with the first one.
     pub hedge_delay_ms: u64,
+    /// Stream from the providers. This is about the upstream calls, not the
+    /// client: `stream` in the client's request is a separate thing and a
+    /// mismatch is fine. Off gives the buffered path in **Core loop**.
+    pub streaming: bool,
+    /// How the race picks a winner once streams are running.
+    pub hedge_strategy: HedgeStrategy,
+    /// `tps` only: how long to watch the streams before choosing, measured
+    /// from the first token any channel emits.
+    pub hedge_window_ms: u64,
+    /// No token for this long means the channel failed.
+    #[serde(with = "humantime_serde")]
+    pub stream_stall_timeout: Duration,
+    /// Gap between keepalives, sent from accepting the client request until
+    /// the first real byte of the answer reaches it.
+    #[serde(with = "humantime_serde")]
+    pub keepalive_interval: Duration,
     /// One channel call. The client request itself has no cap.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
@@ -158,6 +196,11 @@ impl Default for RouterConfig {
             race_width: 32,
             max_per_channel: 2,
             hedge_delay_ms: 0,
+            streaming: true,
+            hedge_strategy: HedgeStrategy::default(),
+            hedge_window_ms: 1000,
+            stream_stall_timeout: Duration::from_secs(60),
+            keepalive_interval: Duration::from_secs(15),
             request_timeout: Duration::from_secs(3600),
             connect_timeout: Duration::from_secs(5),
             spill_above_concurrent: 100,
@@ -169,6 +212,19 @@ impl Default for RouterConfig {
             cache: CacheConfig::default(),
         }
     }
+}
+
+/// How the race decides which streaming channel call wins.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HedgeStrategy {
+    /// Tokens per second across `hedge_window_ms`, highest wins. The default:
+    /// it costs a second of buffering and can save seventeen minutes.
+    #[default]
+    Tps,
+    /// Time to first token. The first channel to emit a token wins, and the
+    /// router is committed to it from that moment.
+    Ttft,
 }
 
 /// `router.yml` -> `health_poll`.
@@ -194,7 +250,7 @@ impl Default for HealthPollConfig {
         Self {
             probe_timeout: Duration::from_secs(5),
             retry_base: Duration::from_secs(1),
-            backoff_max: Duration::from_secs(3600),
+            backoff_max: Duration::from_secs(30 * 24 * 3600),
             network_test_timeout: Duration::from_secs(2),
         }
     }
@@ -293,10 +349,19 @@ pub struct ModelOverride {
 /// One row of `model_capabilities.csv`, narrowed to the fields the channel
 /// filter runs on. Every field is optional because the file leaves cells
 /// blank where it does not know.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Capability {
     /// Context window in tokens.
     pub limit_context: Option<u32>,
+    /// Maximum tokens the model will emit in one answer.
+    pub limit_output: Option<u32>,
+    /// Whether the model is a reasoning model.
+    pub reasoning: Option<bool>,
+    /// Whether the model can be held to a JSON schema.
+    pub structured_output: Option<bool>,
+    /// Which input modalities the model takes, lower case, e.g. `text`,
+    /// `image`. Drives `supports_vision` on `GET /v1/models`.
+    pub modalities_input: Option<Vec<String>>,
     /// Whether the model accepts a tools array. 146 of the 935 models on
     /// these providers do not, and a request from a coding tool always
     /// carries tools.
@@ -311,7 +376,14 @@ struct CapabilityRow {
     model_id: String,
     /// `1`, `0` or blank.
     tool_call: Option<u8>,
+    /// `1`, `0` or blank.
+    reasoning: Option<u8>,
+    /// `1`, `0` or blank.
+    structured_output: Option<u8>,
     limit_context: Option<u32>,
+    limit_output: Option<u32>,
+    /// A JSON array of strings, e.g. `["text","image"]`.
+    modalities_input: Option<String>,
 }
 
 /// Reads `model_capabilities.csv`. A missing file is not an error: the join
@@ -340,7 +412,15 @@ fn read_capabilities(path: &Path) -> crate::Result<HashMap<(String, String), Cap
             (row.provider.to_lowercase(), row.model_id.to_lowercase()),
             Capability {
                 limit_context: row.limit_context,
+                limit_output: row.limit_output,
                 tool_call: row.tool_call.map(|n| n != 0),
+                reasoning: row.reasoning.map(|n| n != 0),
+                structured_output: row.structured_output.map(|n| n != 0),
+                modalities_input: row
+                    .modalities_input
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                    .map(|list| list.iter().map(|m| m.to_lowercase()).collect()),
             },
         );
     }
@@ -392,36 +472,35 @@ pub fn parse_byte_size(input: &str) -> std::result::Result<u64, String> {
 
 /// Reads a `.env` file into a map of variable name to its comma-separated
 /// values. Never logs a value.
+/// `dotenvy` owns the shell syntax: `export `, quoting, escapes and inline
+/// comments. All that is left here is the comma split. A malformed line is
+/// skipped rather than failing the whole file, and the error itself is never
+/// printed because it quotes the line, and the line holds key material. The
+/// count is warned about instead, so a dropped variable leaves a trail.
 pub fn parse_env_file(contents: &str) -> HashMap<String, Vec<String>> {
-    let mut out = HashMap::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        // Quotes are shell syntax, not part of a key. The commas inside them
-        // still separate keys.
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(value);
-        let values = value
-            .split(',')
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .collect();
-        out.insert(name.to_string(), values);
+    let mut dropped = 0_usize;
+    let out = dotenvy::from_read_iter(contents.as_bytes())
+        .filter_map(|entry| match entry {
+            Ok((name, value)) => {
+                let values = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                Some((name, values))
+            }
+            Err(_) => {
+                dropped += 1;
+                None
+            }
+        })
+        .collect();
+    if dropped > 0 {
+        tracing::warn!(
+            dropped,
+            "ignored unparseable lines in .env; a value containing spaces must be quoted"
+        );
     }
     out
 }
@@ -551,11 +630,10 @@ mod tests {
 
     #[test]
     fn capabilities_parse_and_a_missing_file_is_empty() {
-        let dir = std::env::temp_dir().join(format!("llmrouter-caps-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let dir = tmp.path();
 
-        assert!(Config::load(&dir)
+        assert!(Config::load(dir)
             .expect("a missing csv is fine")
             .capabilities
             .is_empty());
@@ -574,12 +652,16 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = Config::load(&dir).expect("the csv parses");
+        let cfg = Config::load(dir).expect("the csv parses");
         assert_eq!(
             cfg.capability("gemini", "gemini-3.7-flash"),
             Some(&Capability {
                 limit_context: Some(1_048_576),
+                limit_output: None,
                 tool_call: Some(false),
+                reasoning: Some(false),
+                structured_output: None,
+                modalities_input: Some(vec!["text".to_string()]),
             })
         );
         // The lookup is case-insensitive on both halves of the key.
@@ -594,8 +676,6 @@ mod tests {
             Some(&Capability::default())
         );
         assert_eq!(cfg.capability("gemini", "never-heard-of-it"), None);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -623,11 +703,13 @@ mod tests {
         let parsed = parse_env_file(
             "# a comment\n\
              \n\
-             GEMINI_KEYS=aaa,bbb , ccc\n\
+             GEMINI_KEYS=\"aaa,bbb , ccc\"\n\
              export OPENROUTER_KEYS=\"ddd,eee\"\n\
              QUOTED='fff'\n\
              EMPTY=\n\
              TRAILING=ggg,,\n\
+             COMMENTED=hhh,iii  # second key is the billing account\n\
+             IN_QUOTES=\"jjj,kkk#notacomment\"\n\
              no_equals_sign\n",
         );
         assert_eq!(parsed["GEMINI_KEYS"], vec!["aaa", "bbb", "ccc"]);
@@ -635,6 +717,11 @@ mod tests {
         assert_eq!(parsed["QUOTED"], vec!["fff"]);
         assert!(parsed["EMPTY"].is_empty());
         assert_eq!(parsed["TRAILING"], vec!["ggg"]);
+        // An inline comment is shell syntax, not key material.
+        assert_eq!(parsed["COMMENTED"], vec!["hhh", "iii"]);
+        // A `#` inside quotes is part of the value.
+        assert_eq!(parsed["IN_QUOTES"], vec!["jjj", "kkk#notacomment"]);
+        // A line that is not an assignment is skipped, not fatal.
         assert!(!parsed.contains_key("no_equals_sign"));
     }
 
@@ -659,7 +746,7 @@ mod tests {
         let cfg = config_with(vec![entry("claude-fable-5-1", 53, 1)], Vec::new());
         assert_eq!(
             cfg.rank_of("anthropic", "claude-fable-5-1-20260901"),
-            (53, 1)
+            (53, 1, RankMatch::Exact)
         );
     }
 
@@ -668,7 +755,7 @@ mod tests {
         let cfg = config_with(vec![entry("claude-fable-5-1", 53, 1)], Vec::new());
         assert_eq!(
             cfg.rank_of("openrouter", "anthropic/claude-fable-5.1"),
-            (53, 1)
+            (53, 1, RankMatch::Loose("claude-fable-5-1".to_string()))
         );
     }
 
@@ -683,8 +770,28 @@ mod tests {
             ],
             Vec::new(),
         );
-        assert_eq!(cfg.rank_of("gemini", "gemini-3.7-flash"), (40, 10));
-        assert_eq!(cfg.rank_of("gemini", "gemini-3.7-flash-lite"), (30, 20));
+        assert_eq!(
+            cfg.rank_of("gemini", "gemini-3.7-flash"),
+            (40, 10, RankMatch::Exact)
+        );
+        assert_eq!(
+            cfg.rank_of("gemini", "gemini-3.7-flash-lite"),
+            (30, 20, RankMatch::Exact)
+        );
+    }
+
+    /// The silent wrong pairing DESIGN.md names under "Open problems":
+    /// `qwen3-max-coder` has no row of its own, so the loose pass hands it the
+    /// score of the short slug `coder`. The score is wrong either way; what
+    /// the caller needs is to be told the match was loose, so it can be logged
+    /// rather than slipping through.
+    #[test]
+    fn a_loose_match_reports_the_slug_it_matched() {
+        let cfg = config_with(vec![entry("coder", 12, 44)], Vec::new());
+        assert_eq!(
+            cfg.rank_of("qwen", "qwen3-max-coder"),
+            (12, 44, RankMatch::Loose("coder".to_string()))
+        );
     }
 
     #[test]
@@ -693,7 +800,10 @@ mod tests {
             vec![entry("flash", 10, 50), entry("gemini-3.7-flash", 40, 10)],
             Vec::new(),
         );
-        assert_eq!(cfg.rank_of("gemini", "google/gemini-3.7-flash"), (40, 10));
+        assert_eq!(
+            cfg.rank_of("gemini", "google/gemini-3.7-flash"),
+            (40, 10, RankMatch::Loose("gemini-3.7-flash".to_string()))
+        );
     }
 
     #[test]
@@ -702,15 +812,21 @@ mod tests {
             vec![entry("claude-fable-5-1", 53, 1), entry("tiny", 5, 99)],
             vec![override_for("zai", "glm-5", Some("claude-fable-5-1"))],
         );
-        assert_eq!(cfg.rank_of("zai", "glm-5"), (53, 1));
+        assert_eq!(cfg.rank_of("zai", "glm-5"), (53, 1, RankMatch::Exact));
         // Same model id at another provider gets no override, so it is unranked.
-        assert_eq!(cfg.rank_of("gemini", "glm-5"), (0, u32::MAX));
+        assert_eq!(
+            cfg.rank_of("gemini", "glm-5"),
+            (0, u32::MAX, RankMatch::None)
+        );
     }
 
     #[test]
     fn unranked_model_sorts_to_the_bottom() {
         let cfg = config_with(vec![entry("claude-fable-5-1", 53, 1)], Vec::new());
-        assert_eq!(cfg.rank_of("pollinations", "mystery-model"), (0, u32::MAX));
+        assert_eq!(
+            cfg.rank_of("pollinations", "mystery-model"),
+            (0, u32::MAX, RankMatch::None)
+        );
     }
 
     #[test]
@@ -738,7 +854,18 @@ mod tests {
         assert_eq!(d.memory_high_water, 3 * 1_024 * 1_024 * 1_024);
         assert_eq!(d.cache.max_bytes, 100_000_000_000);
         assert_eq!(d.cache.ttl, Duration::from_secs(168 * 3600));
-        assert_eq!(d.health_poll.backoff_max, Duration::from_secs(3600));
+        // 30 days, not an hour: a monthly quota is the normal way a free tier
+        // runs out, and from a 1 second base the cap is first reached at
+        // failure 23, not 12.
+        assert_eq!(
+            d.health_poll.backoff_max,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert!(d.streaming);
+        assert_eq!(d.hedge_strategy, HedgeStrategy::Tps);
+        assert_eq!(d.hedge_window_ms, 1000);
+        assert_eq!(d.stream_stall_timeout, Duration::from_secs(60));
+        assert_eq!(d.keepalive_interval, Duration::from_secs(15));
     }
 
     #[test]
@@ -747,6 +874,11 @@ mod tests {
 race_width: 32
 max_per_channel: 2
 hedge_delay_ms: 0
+streaming: true
+hedge_strategy: tps
+hedge_window_ms: 1000
+stream_stall_timeout: 60s
+keepalive_interval: 15s
 request_timeout: 3600s
 connect_timeout: 5s
 spill_above_concurrent: 100
@@ -757,7 +889,7 @@ http2_connection_window: 1048576
 health_poll:
   probe_timeout: 5s
   retry_base: 1s
-  backoff_max: 1h
+  backoff_max: 30d
   network_test_timeout: 2s
 cache:
   enabled: true
@@ -771,21 +903,29 @@ cache:
         assert_eq!(cfg.http2_stream_window, 131_072);
         assert_eq!(cfg.cache.max_bytes, 100_000_000_000);
         assert_eq!(cfg.cache.ttl, Duration::from_secs(168 * 3600));
-        assert_eq!(cfg.health_poll.backoff_max, Duration::from_secs(3600));
+        assert_eq!(
+            cfg.health_poll.backoff_max,
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert!(cfg.streaming);
+        assert_eq!(cfg.hedge_strategy, HedgeStrategy::Tps);
+        assert_eq!(cfg.hedge_window_ms, 1000);
+        assert_eq!(cfg.stream_stall_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.keepalive_interval, Duration::from_secs(15));
         // An empty file still boots on the defaults.
         let empty: RouterConfig = serde_yaml::from_str("{}").expect("empty router.yml");
         assert_eq!(empty.race_width, 32);
     }
 
-    /// `hedge_strategy` and `hedge_decision_window` were knobs the race never
-    /// read: there is no streaming in v1, so there was nothing to compare by
-    /// tokens per second. A stale one left in `router.yml` must stop the boot
-    /// rather than quietly change nothing.
+    /// A key the router does not read is a setting an operator believes is
+    /// doing something, so it stops the boot rather than quietly changing
+    /// nothing. `hedge_decision_window` is a name an earlier draft used for
+    /// what is now `hedge_window_ms`.
     #[test]
     fn a_setting_the_router_does_not_read_is_rejected() {
         for yaml in [
-            "hedge_strategy: tps\n",
             "hedge_decision_window: 2s\n",
+            "hedge_window: 1s\n",
             "race_wdith: 32\n",
         ] {
             assert!(
@@ -793,6 +933,28 @@ cache:
                 "{yaml} should not load silently"
             );
         }
+    }
+
+    #[test]
+    fn hedge_strategy_takes_both_names_and_nothing_else() {
+        let tps: RouterConfig = serde_yaml::from_str("hedge_strategy: tps\n").expect("tps");
+        assert_eq!(tps.hedge_strategy, HedgeStrategy::Tps);
+        let ttft: RouterConfig = serde_yaml::from_str("hedge_strategy: ttft\n").expect("ttft");
+        assert_eq!(ttft.hedge_strategy, HedgeStrategy::Ttft);
+        assert!(serde_yaml::from_str::<RouterConfig>("hedge_strategy: fastest\n").is_err());
+    }
+
+    /// From the 1 second default base the wait doubles every failure, so the
+    /// 30 day cap first binds at failure 23. An hourly cap would bind at 12
+    /// and retry a dead channel 24 times a day for the rest of the month.
+    #[test]
+    fn the_backoff_cap_is_reached_at_failure_23() {
+        let cap = RouterConfig::default().health_poll.backoff_max.as_secs();
+        let base = RouterConfig::default().health_poll.retry_base.as_secs();
+        let wait = |counter: u32| (base << (counter - 1)).min(cap);
+        assert!(wait(22) < cap);
+        assert_eq!(wait(23), cap);
+        assert_eq!(wait(12), 2048);
     }
 
     #[test]
@@ -845,14 +1007,17 @@ cache:
 
     #[test]
     fn load_reads_every_file_and_tolerates_missing_ones() {
-        let dir = std::env::temp_dir().join(format!("llmrouter-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let dir = tmp.path();
 
         // Nothing on disk: defaults, and no panic.
-        let bare = Config::load(&dir).expect("empty dir loads");
+        let bare = Config::load(dir).expect("empty dir loads");
         assert_eq!(bare.router.race_width, 32);
         assert!(bare.providers.is_empty());
-        assert_eq!(bare.rank_of("gemini", "anything"), (0, u32::MAX));
+        assert_eq!(
+            bare.rank_of("gemini", "anything"),
+            (0, u32::MAX, RankMatch::None)
+        );
 
         std::fs::write(
             dir.join("router.yml"),
@@ -876,7 +1041,7 @@ cache:
         .unwrap();
         std::fs::write(dir.join(".env"), "GEMINI_KEYS=aaa,bbb\n").unwrap();
 
-        let cfg = Config::load(&dir).expect("full dir loads");
+        let cfg = Config::load(dir).expect("full dir loads");
         assert_eq!(cfg.router.race_width, 8);
         assert_eq!(cfg.router.cache.ttl, Duration::from_secs(30 * 24 * 3600));
         // An unset field in router.yml still falls back to its default.
@@ -884,14 +1049,15 @@ cache:
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.keys_for(&cfg.providers[0]).len(), 2);
         assert_eq!(cfg.models[0].limit_context, Some(1_000_000));
-        assert_eq!(cfg.rank_of("gemini", "gemini-3.7-flash"), (40, 10));
+        assert_eq!(
+            cfg.rank_of("gemini", "gemini-3.7-flash"),
+            (40, 10, RankMatch::Exact)
+        );
 
         std::fs::write(dir.join("router.yml"), "race_width: [not a number]\n").unwrap();
         assert!(
-            Config::load(&dir).is_err(),
+            Config::load(dir).is_err(),
             "malformed router.yml is an error"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

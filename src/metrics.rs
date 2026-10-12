@@ -3,11 +3,17 @@
 //! Omniroute died quietly and nobody was watching. These are the counters that
 //! would have shown it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::Unit;
-use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics::{
+    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
+    with_local_recorder,
+};
+use metrics_exporter_prometheus::{
+    Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
+};
 
 use crate::catalogue::ChannelId;
 
@@ -110,64 +116,87 @@ const STAGE_UPSTREAM: &str = "upstream";
 const STAGE_ROUTER: &str = "router";
 
 /// The recorder and its render handle.
+///
+/// The recorder is owned, not installed as the process-wide one. Nothing else
+/// in the crate writes through the `metrics` macros, so a global recorder
+/// would buy nothing and would cap the process at one `Metrics`, which is what
+/// made the counters untestable: every test shared one set of numbers.
 #[derive(Debug, Clone)]
 pub struct Metrics {
+    recorder: Arc<PrometheusRecorder>,
     handle: PrometheusHandle,
 }
 
 impl Metrics {
-    /// Installs the Prometheus recorder and describes every metric, so the
+    /// Builds the Prometheus recorder and describes every metric, so the
     /// names appear on `/metrics` from the first scrape even at zero.
     pub fn new() -> crate::Result<Self> {
-        let handle = PrometheusBuilder::new()
+        let recorder = PrometheusBuilder::new()
             .set_buckets_for_metric(
                 Matcher::Full("router_latency_seconds".to_owned()),
                 LATENCY_BUCKETS,
             )
             .map_err(|e| crate::RouterError::Config(format!("metrics buckets: {e}")))?
-            .install_recorder()
-            .map_err(|e| crate::RouterError::Config(format!("metrics recorder: {e}")))?;
+            .build_recorder();
+        let metrics = Self {
+            handle: recorder.handle(),
+            recorder: Arc::new(recorder),
+        };
 
-        describe_everything();
-        seed_zero();
+        metrics.on_recorder(|| {
+            describe_everything();
+            seed_zero();
+        });
 
-        Ok(Self { handle })
+        Ok(metrics)
+    }
+
+    /// Runs `f` with this instance's recorder in scope, so the `metrics`
+    /// macros write here rather than to whatever is installed globally.
+    fn on_recorder<T>(&self, f: impl FnOnce() -> T) -> T {
+        with_local_recorder(self.recorder.as_ref(), f)
     }
 
     /// One client request finished. `router_requests_total{outcome}`.
     pub fn record_request(&self, outcome: Outcome) {
-        counter!("router_requests_total", "outcome" => outcome.label()).increment(1);
+        self.on_recorder(|| {
+            counter!("router_requests_total", "outcome" => outcome.label()).increment(1);
+        });
     }
 
     /// One channel call finished. `router_attempts_total{channel,outcome}`.
     pub fn record_attempt(&self, channel: ChannelId, outcome: AttemptOutcome) {
-        counter!(
-            "router_attempts_total",
-            "channel" => channel.to_string(),
-            "outcome" => outcome.label(),
-        )
-        .increment(1);
+        self.on_recorder(|| {
+            counter!(
+                "router_attempts_total",
+                "channel" => channel.to_string(),
+                "outcome" => outcome.label(),
+            )
+            .increment(1);
+        });
     }
 
     /// `router_latency_seconds`, split two ways: the time the winning channel
     /// took, and the time the router itself added. The second one is what
     /// proves the latency target.
     pub fn record_latency(&self, upstream: Duration, router_overhead: Duration) {
-        histogram!("router_latency_seconds", "stage" => STAGE_UPSTREAM)
-            .record(upstream.as_secs_f64());
-        histogram!("router_latency_seconds", "stage" => STAGE_ROUTER)
-            .record(router_overhead.as_secs_f64());
+        self.on_recorder(|| {
+            histogram!("router_latency_seconds", "stage" => STAGE_UPSTREAM)
+                .record(upstream.as_secs_f64());
+            histogram!("router_latency_seconds", "stage" => STAGE_ROUTER)
+                .record(router_overhead.as_secs_f64());
+        });
     }
 
     /// `router_rss_bytes`. The one graph to watch against `memory_high_water`.
     pub fn set_rss(&self, bytes: u64) {
-        gauge!("router_rss_bytes").set(bytes as f64);
+        self.on_recorder(|| gauge!("router_rss_bytes").set(bytes as f64));
     }
 
     /// `router_cache_entries`. A flat line proves memory growth is not
     /// repeating.
     pub fn set_cache_entries(&self, entries: u64) {
-        gauge!("router_cache_entries").set(entries as f64);
+        self.on_recorder(|| gauge!("router_cache_entries").set(entries as f64));
     }
 
     /// The Prometheus text body for `GET /metrics`.
@@ -217,23 +246,11 @@ fn seed_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metrics::with_local_recorder;
-    use metrics_exporter_prometheus::PrometheusRecorder;
 
-    /// A recorder that is not the global one, so several tests can run in the
-    /// same process. `install_recorder` can only be called once per process.
-    fn local() -> (PrometheusRecorder, Metrics) {
-        let recorder = PrometheusBuilder::new()
-            .set_buckets_for_metric(
-                Matcher::Full("router_latency_seconds".to_owned()),
-                LATENCY_BUCKETS,
-            )
-            .expect("buckets are a non-empty ascending list")
-            .build_recorder();
-        let metrics = Metrics {
-            handle: recorder.handle(),
-        };
-        (recorder, metrics)
+    /// A fresh set of counters. Each `Metrics` owns its recorder, so tests in
+    /// one process do not share numbers.
+    fn local() -> Metrics {
+        Metrics::new().expect("the recorder builds")
     }
 
     #[test]
@@ -274,11 +291,7 @@ mod tests {
 
     #[test]
     fn first_scrape_carries_every_request_outcome_at_zero() {
-        let (recorder, metrics) = local();
-        with_local_recorder(&recorder, || {
-            describe_everything();
-            seed_zero();
-        });
+        let metrics = local();
         let text = metrics.render();
 
         for outcome in ALL_OUTCOMES {
@@ -291,15 +304,13 @@ mod tests {
 
     #[test]
     fn counters_add_up_per_label() {
-        let (recorder, metrics) = local();
+        let metrics = local();
         let channel = ChannelId::new("groq", "sk-secret", "llama-4");
-        with_local_recorder(&recorder, || {
-            metrics.record_request(Outcome::Success);
-            metrics.record_request(Outcome::Success);
-            metrics.record_request(Outcome::NoChannel);
-            metrics.record_attempt(channel, AttemptOutcome::Timeout);
-            metrics.record_attempt(channel, AttemptOutcome::Cancelled);
-        });
+        metrics.record_request(Outcome::Success);
+        metrics.record_request(Outcome::Success);
+        metrics.record_request(Outcome::NoChannel);
+        metrics.record_attempt(channel, AttemptOutcome::Timeout);
+        metrics.record_attempt(channel, AttemptOutcome::Cancelled);
         let text = metrics.render();
 
         assert!(text.contains("router_requests_total{outcome=\"success\"} 2"));
@@ -316,10 +327,8 @@ mod tests {
 
     #[test]
     fn latency_splits_into_two_stages() {
-        let (recorder, metrics) = local();
-        with_local_recorder(&recorder, || {
-            metrics.record_latency(Duration::from_millis(1500), Duration::from_micros(800));
-        });
+        let metrics = local();
+        metrics.record_latency(Duration::from_millis(1500), Duration::from_micros(800));
         let text = metrics.render();
 
         // Router overhead of 0.8ms sits above the 0.0005 bucket and inside 0.001.
@@ -333,13 +342,11 @@ mod tests {
 
     #[test]
     fn gauges_hold_the_last_value_not_a_running_total() {
-        let (recorder, metrics) = local();
-        with_local_recorder(&recorder, || {
-            metrics.set_rss(100);
-            metrics.set_rss(250);
-            metrics.set_cache_entries(7);
-            metrics.set_cache_entries(4);
-        });
+        let metrics = local();
+        metrics.set_rss(100);
+        metrics.set_rss(250);
+        metrics.set_cache_entries(7);
+        metrics.set_cache_entries(4);
         let text = metrics.render();
 
         assert!(text.contains("router_rss_bytes 250"));

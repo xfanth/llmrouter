@@ -4,22 +4,34 @@
 //! neutral request once, and the winning reply becomes the client's format
 //! once. The race only ever sees neutral types.
 //!
-//! The router does not stream. DESIGN.md decided whole responses only, with
-//! `stream: false` upstream: that is what keeps a failure recoverable right up
-//! to the moment the reply goes out, and what keeps every request on the cache
-//! path. The client's own `stream` flag is read, ignored and dropped, like its
-//! API key. A channel call can take minutes, so the client waits, and its
-//! status code is the whole signal.
+//! Two settings decide the shape of the reply, and they are independent.
+//! `streaming` in `router.yml` is about the providers: the race always asks
+//! them for a stream, because the hedge strategy needs one to measure. `stream`
+//! in the client's request is about the client. A mismatch is never rejected:
+//! a client that asked for a stream gets the winner forwarded as server-sent
+//! events, and one that did not gets the same stream folded into a single
+//! piece.
+//!
+//! A channel call can take 34 minutes and Claude Code hangs up at 10, so this
+//! module also sends the keepalive: an SSE comment for a streaming client, a
+//! leading space before the JSON body for a non-streaming one, every
+//! `keepalive_interval` until the first real byte.
 
+use std::convert::Infallible;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -31,7 +43,7 @@ use crate::config::{Config, RouterConfig};
 use crate::health::HealthTable;
 use crate::metrics::{Metrics, Outcome};
 use crate::race::{RaceInput, RaceOutcome, Racer};
-use crate::wire::Format;
+use crate::wire::{EventStream, Format};
 
 /// Headroom the filter adds on top of the prompt estimate plus the requested
 /// output, as a percentage. The estimate is characters divided by 3.5, which
@@ -256,16 +268,17 @@ pub async fn metrics_endpoint(state: axum::extract::State<Arc<AppState>>) -> Res
 }
 
 /// Admits the request, parses the body once, then runs the shared completion
-/// path and answers with whatever it decided.
+/// path behind the keepalive and answers with whatever it decided.
 ///
-/// Nothing is written to the client until the outcome is known. There is no
-/// keepalive, and there must never be one: the status line goes out before the
-/// first body byte, so any padding sent while the race is still walking would
-/// commit the response to `200` and then have to deliver a `502` or a `504`
-/// inside a successful body. DESIGN.md "Status codes" gives five outcomes one
-/// code each, and "Why 503 and 504 are separate" needs the caller to tell them
-/// apart. The `504` path is the slow one by design, so a keepalive would break
-/// the contract for exactly the failure that takes longest to decide.
+/// The keepalive is what DESIGN.md "Keepalive" asks for, and it costs
+/// something: the status line goes out before the first body byte, so once a
+/// keepalive byte has been sent the response is committed to `200` and a later
+/// `502` or `504` can only be delivered inside that body. Nothing is sent for
+/// the first `keepalive_interval`, so every outcome decided inside it keeps its
+/// own status line, which is every outcome except a slow race. Past that the
+/// choice is between a committed `200` and a client that hangs up at 10
+/// minutes with nothing at all, and DESIGN.md settles it: "A router that only
+/// works after the client is reconfigured is a broken router."
 async fn completion_response(
     state: Arc<AppState>,
     client_format: Format,
@@ -308,27 +321,265 @@ async fn completion_response(
     };
     drop(body);
 
-    handle_completion(state, client_format, parsed, raw_len).await
+    // The client's own flag, read before the body is handed on. It decides the
+    // shape of the reply and the shape of the keepalive, and nothing else: it
+    // never reaches a provider and it is never a reason to reject anything.
+    let wants_stream = parsed
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let interval = state.config.router.keepalive_interval;
+
+    with_keepalive(
+        Box::pin(handle_completion(
+            state,
+            client_format,
+            parsed,
+            raw_len,
+            wants_stream,
+        )),
+        wants_stream,
+        interval,
+    )
+    .await
+}
+
+/// What the completion path decided: a whole response, or the winner's events.
+enum Served {
+    /// The status line and the body are both already known.
+    Whole(Response),
+    /// Server-sent events for a client that asked for a stream.
+    Events(SseFrames),
+}
+
+impl Served {
+    /// The response, when nothing has gone out to the client yet.
+    fn into_response(self) -> Response {
+        match self {
+            Served::Whole(response) => response,
+            Served::Events(frames) => Sse::new(frames).into_response(),
+        }
+    }
+}
+
+/// Framed server-sent events, ready to hand to axum.
+type SseFrames = Pin<Box<dyn Stream<Item = std::result::Result<Event, Infallible>> + Send>>;
+
+/// The completion path, with a keepalive byte every `interval` until the first
+/// real byte of the answer.
+///
+/// Nothing goes out while the first interval runs, so an outcome decided in
+/// that window keeps its own status code. After it the response is committed
+/// to `200`: see [`completion_response`].
+async fn with_keepalive(
+    mut work: Pin<Box<dyn Future<Output = Served> + Send>>,
+    wants_stream: bool,
+    interval: Duration,
+) -> Response {
+    // Zero turns the keepalive off, which is the behaviour without it: every
+    // outcome keeps its own status line and a slow client hangs up.
+    if interval.is_zero() {
+        return work.await.into_response();
+    }
+    match tokio::time::timeout(interval, &mut work).await {
+        Ok(served) => served.into_response(),
+        Err(_) => committed(work, wants_stream, interval),
+    }
+}
+
+/// The slow path: `200` and its headers go out now, then a keepalive byte every
+/// `interval` until the work finishes, then the answer itself.
+fn committed(
+    work: Pin<Box<dyn Future<Output = Served> + Send>>,
+    wants_stream: bool,
+    interval: Duration,
+) -> Response {
+    if wants_stream {
+        // `: ping`, which the server-sent-events spec says a client must
+        // ignore. Anthropic's own API sends ping events for the same reason.
+        let frames = async_stream::stream! {
+            let mut work = work;
+            let mut ticker = tokio::time::interval(interval);
+            let served = loop {
+                // The yield happens after the select, not inside an arm, so the
+                // pending work future is never held across it.
+                let tick = tokio::select! {
+                    _ = ticker.tick() => true,
+                    served = &mut work => break served,
+                };
+                if tick {
+                    yield Ok(Event::default().comment("ping"));
+                }
+            };
+            match served {
+                Served::Events(mut frames) => {
+                    while let Some(frame) = frames.next().await {
+                        yield frame;
+                    }
+                }
+                // The status line went out as `200` a while ago, so the outcome
+                // can only be delivered in the body now.
+                Served::Whole(response) => {
+                    let status = response.status();
+                    tracing::warn!(
+                        status = status.as_u16(),
+                        "the keepalive had already committed the status line, so the outcome goes out as an sse error event"
+                    );
+                    let body = read_body(response).await;
+                    yield Ok(Event::default()
+                        .event("error")
+                        .data(String::from_utf8_lossy(&body)));
+                }
+            }
+        };
+        Sse::new(Box::pin(frames) as SseFrames).into_response()
+    } else {
+        // One space every interval. JSON parsers skip leading whitespace, so
+        // the body still parses when it finally arrives.
+        let body = async_stream::stream! {
+            let mut work = work;
+            let mut ticker = tokio::time::interval(interval);
+            let served = loop {
+                let tick = tokio::select! {
+                    _ = ticker.tick() => true,
+                    served = &mut work => break served,
+                };
+                if tick {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(b" "));
+                }
+            };
+            match served {
+                Served::Whole(response) => {
+                    let status = response.status();
+                    if !status.is_success() {
+                        tracing::warn!(
+                            status = status.as_u16(),
+                            "the keepalive had already committed the status line, so the outcome goes out inside a 200 body"
+                        );
+                    }
+                    yield Ok(read_body(response).await);
+                }
+                // A client that did not ask for a stream is never handed one:
+                // `handle_completion` folds it into one piece first.
+                Served::Events(_) => {
+                    tracing::error!("a stream was built for a client that did not ask for one");
+                    yield Ok(Bytes::from_static(
+                        br#"{"error":"no_channel","message":"the reply could not be delivered in one piece","detail":{}}"#,
+                    ));
+                }
+            }
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(body))
+            // The builder only fails on an invalid header, and both are
+            // constants, so this cannot fire.
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    }
+}
+
+/// The whole body of a response the router built itself. These are all in
+/// memory already, so there is nothing to stream and no limit to apply.
+async fn read_body(response: Response) -> Bytes {
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "a response body could not be read back");
+            Bytes::from_static(b"{}")
+        })
+}
+
+/// Frames the winner's events as server-sent events.
+///
+/// A stream that dies here ends the client request and nothing is spliced on:
+/// the client already has part of one model's answer, and joining another
+/// model's output onto it produces a reply nobody can trust. The stall timer is
+/// not here but in `race.rs`, on the byte stream, which is the one place every
+/// winning stream passes through and the only place that can back the channel
+/// off for it.
+fn sse_frames(mut events: EventStream, format: Format) -> SseFrames {
+    Box::pin(async_stream::stream! {
+        while let Some(item) = events.next().await {
+            match item {
+                Ok(value) => yield Ok(sse_event(format, &value)),
+                Err(err) => {
+                    tracing::error!(error = %err, "the winning stream died mid-answer");
+                    // No end-of-stream marker after a death. `[DONE]` (or a
+                    // forged `message_stop`) would tell the client the half
+                    // answer it already has is the whole answer, and it would
+                    // never retry. An `error` event names the failure and the
+                    // abrupt close is what ends the request.
+                    yield Ok(Event::default().event("error").data(
+                        r#"{"error":{"type":"upstream_error","message":"the winning stream died mid-answer"}}"#,
+                    ));
+                    return;
+                }
+            }
+        }
+        // OpenAI clients read `data: [DONE]` as the end of the stream.
+        // Anthropic clients read `message_stop`, which the translation already
+        // emits as an event of its own.
+        if !matches!(format, Format::AnthropicMessages) {
+            yield Ok(Event::default().data("[DONE]"));
+        }
+    })
+}
+
+/// One wire event as a server-sent event. Anthropic names its events, so the
+/// `type` field becomes the `event:` line; OpenAI carries the type inside the
+/// data and needs no name.
+///
+/// The name is provider-supplied: an Anthropic-wire channel has its raw event
+/// JSON replayed verbatim, so its own `type` lands here. A carriage return or
+/// newline in an `event:` line cannot be framed and `Event::event` panics on
+/// one, which would kill the connection task mid-answer. Such a name is
+/// dropped and the event goes out unnamed, with the `type` still readable in
+/// the data.
+fn sse_event(format: Format, value: &Value) -> Event {
+    let event = Event::default().data(value.to_string());
+    match format {
+        Format::AnthropicMessages => match value.get("type").and_then(Value::as_str) {
+            Some(name) if !name.contains(['\r', '\n']) => event.event(name),
+            Some(name) => {
+                tracing::warn!(
+                    length = name.len(),
+                    "an event name carried a newline and was dropped"
+                );
+                event
+            }
+            None => event,
+        },
+        _ => event,
+    }
 }
 
 /// The shared path behind both completion endpoints: admit, hash, read the
 /// cache, build the filter, race, write the cache, translate out.
+///
+/// `wants_stream` is the client's own `stream` flag and decides only the shape
+/// of the reply. The providers are asked for a stream whenever `streaming` is
+/// on in `router.yml`, whatever the client asked for, because the hedge
+/// strategy needs a stream to measure.
 async fn handle_completion(
     state: Arc<AppState>,
     client_format: Format,
     body: Value,
     raw_len: usize,
-) -> Response {
+    wants_stream: bool,
+) -> Served {
     let started = Instant::now();
     let (_concurrency, concurrent) = Concurrency::open();
 
     let request = match crate::wire::decode_request(client_format, &body) {
         Ok(request) => request,
         Err(err) => {
-            return ApiError::BadRequest {
-                reason: err.to_string(),
-            }
-            .into_response()
+            return Served::Whole(
+                ApiError::BadRequest {
+                    reason: err.to_string(),
+                }
+                .into_response(),
+            )
         }
     };
     drop(body);
@@ -336,8 +587,8 @@ async fn handle_completion(
     let named_model = crate::wire::named_model(&request);
     let now = now_unix();
 
-    // Every answer is a whole one, so every request can be served from the
-    // cache.
+    // Only a whole answer is ever stored, so every request can be served from
+    // the cache: a hit replays to a streaming client as a stream.
     let key = match state.cache.as_ref() {
         Some(_) => crate::cache::cache_key(&request).ok(),
         None => None,
@@ -346,7 +597,7 @@ async fn handle_completion(
         match cache.get(key, named_model.as_deref(), now) {
             Ok(Some(entry)) => {
                 if let Some(response) =
-                    cached_response(&entry, client_format, named_model.as_deref())
+                    cached_response(&entry, client_format, named_model.as_deref(), wants_stream)
                 {
                     state.metrics.record_request(Outcome::HitCache);
                     tracing::info!(
@@ -379,19 +630,22 @@ async fn handle_completion(
         if let Some(outcome) = error.outcome() {
             state.metrics.record_request(outcome);
         }
-        return error.into_response();
+        return Served::Whole(error.into_response());
     }
 
     // Encoded once and shared. Below the spill threshold it stays in RAM and
     // cloning never copies the prompt; above it the race reads it back from a
     // scratch file per channel call.
-    let outbound = match outbound_body(&request) {
+    let streaming = state.config.router.streaming;
+    let outbound = match outbound_body(&request, streaming) {
         Ok(bytes) => Arc::new(PromptBody::new(bytes, concurrent, &state.config.router).await),
         Err(err) => {
-            return ApiError::BadRequest {
-                reason: err.to_string(),
-            }
-            .into_response()
+            return Served::Whole(
+                ApiError::BadRequest {
+                    reason: err.to_string(),
+                }
+                .into_response(),
+            )
         }
     };
     drop(request);
@@ -407,13 +661,14 @@ async fn handle_completion(
             RaceInput {
                 outbound,
                 filter,
-                // Never ask a channel for a stream: whole responses only.
-                streaming: false,
+                streaming,
                 named_model: named_model.clone(),
             },
             cancel,
         )
         .await;
+    // The winning stream is not held by this token: it moved out of its trial
+    // before the race cancelled the losers.
     drop(guard);
 
     match outcome {
@@ -424,24 +679,47 @@ async fn handle_completion(
         } => {
             if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
                 let best = crate::race::best_for_cache(&winner, &also_finished);
-                write_cache(cache, key, best, now);
+                write_cache(cache, key, best, crate::cache::StreamEnd::Complete, now);
             }
+            drop(also_finished);
 
-            let served = named_model.as_deref().unwrap_or(winner.model_id.as_str());
-            let encoded =
-                match crate::wire::encode_response(&winner.response, client_format, Some(served)) {
-                    Ok(value) => value,
+            let winner = *winner;
+            let served = named_model
+                .clone()
+                .unwrap_or_else(|| winner.model_id.clone());
+            let reply = if wants_stream {
+                // The client asked for a stream and the answer arrived whole,
+                // which is what `streaming: false` in `router.yml` gives. The
+                // whole answer is chunked back out rather than rejected.
+                stream_reply(winner.response, client_format, served.clone())
+            } else {
+                match crate::wire::encode_response(&winner.response, client_format, Some(&served)) {
+                    Ok(value) => Some(Served::Whole(axum::Json(value).into_response())),
                     Err(err) => {
-                        state.metrics.record_request(Outcome::NoChannel);
-                        return ApiError::NoChannel {
-                            attempts,
-                            last_error: Some(format!("could not translate the reply: {err}")),
-                        }
-                        .into_response();
+                        tracing::warn!(error = %err, "the reply could not be translated");
+                        None
                     }
-                };
+                }
+            };
 
+            let Some(reply) = reply else {
+                state.metrics.record_request(Outcome::NoChannel);
+                return Served::Whole(
+                    ApiError::NoChannel {
+                        attempts,
+                        last_error: Some("could not translate the reply".to_string()),
+                    }
+                    .into_response(),
+                );
+            };
+
+            // Sampled after the reply has been translated back into the
+            // client's format, as the streamed arm does. That encode is the
+            // largest piece of work the router does after the race, so a
+            // reading taken earlier would leave it out of the router's half
+            // of the split.
             let total = started.elapsed();
+
             state
                 .metrics
                 .record_latency(winner.latency, total.saturating_sub(winner.latency));
@@ -451,24 +729,136 @@ async fn handle_completion(
                 channel = %winner.channel_id,
                 provider = %winner.provider,
                 model = %winner.model_id,
+                streamed = wants_stream,
                 attempts,
                 ms = total.as_millis() as u64,
                 "served"
             );
-            axum::Json(encoded).into_response()
+            reply
         }
 
-        // The race is only ever asked for buffered calls, so neither streaming
-        // outcome can happen. Treat one as a routing failure rather than
-        // pretend it is a reply.
-        RaceOutcome::Streamed { attempts, .. } => {
-            state.metrics.record_request(Outcome::NoChannel);
-            tracing::error!(attempts, "the race streamed a reply nothing asked for");
-            ApiError::NoChannel {
-                attempts,
-                last_error: Some("the race streamed a reply nothing asked for".to_string()),
+        RaceOutcome::Streamed { winner, attempts } => {
+            let crate::race::StreamWinner {
+                channel_id,
+                provider,
+                model_id,
+                intelligence,
+                chunks,
+                latency,
+            } = *winner;
+            let served = named_model.clone().unwrap_or_else(|| model_id.clone());
+
+            let reply = if wants_stream {
+                // Forwarded as it arrives, with a copy taken on the way past.
+                // The copy only lands once the stream has run to the end, so a
+                // cancelled or failed stream never reaches the cache.
+                let (chunks, complete) = match (state.cache.as_ref(), key) {
+                    (Some(cache), Some(key)) => {
+                        let (forwarded, complete) = crate::wire::tee_stream(chunks);
+                        let cache = Arc::clone(cache);
+                        let winner = crate::race::Winner {
+                            channel_id,
+                            provider: provider.clone(),
+                            model_id: model_id.clone(),
+                            intelligence,
+                            response: crate::wire::NeutralResponse::default(),
+                            latency,
+                        };
+                        (forwarded, Some((cache, key, winner, complete)))
+                    }
+                    _ => (chunks, None),
+                };
+                if let Some((cache, key, mut winner, complete)) = complete {
+                    tokio::spawn(async move {
+                        let Ok(copy) = complete.await else {
+                            return;
+                        };
+                        match crate::wire::aggregate_stream(copy).await {
+                            Ok(response) => {
+                                winner.response = response;
+                                write_cache(
+                                    &cache,
+                                    key,
+                                    &winner,
+                                    crate::cache::StreamEnd::Complete,
+                                    now,
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "a streamed answer could not be folded for the cache");
+                            }
+                        }
+                    });
+                }
+                crate::wire::encode_stream(chunks, client_format, Some(served.clone()))
+                    .map(|events| Served::Events(sse_frames(events, client_format)))
+                    .map_err(|err| err.to_string())
+            } else {
+                // The client wants one piece, so the stream is folded into one
+                // here. That is the only place the whole answer exists, so it
+                // is also the only streamed path that can feed the cache.
+                match crate::wire::aggregate_stream(chunks).await {
+                    Ok(response) => {
+                        let winner = crate::race::Winner {
+                            channel_id,
+                            provider: provider.clone(),
+                            model_id: model_id.clone(),
+                            intelligence,
+                            response,
+                            latency,
+                        };
+                        if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
+                            write_cache(
+                                cache,
+                                key,
+                                &winner,
+                                crate::cache::StreamEnd::Complete,
+                                now,
+                            );
+                        }
+                        crate::wire::encode_response(&winner.response, client_format, Some(&served))
+                            .map(|value| Served::Whole(axum::Json(value).into_response()))
+                            .map_err(|err| err.to_string())
+                    }
+                    Err(err) => Err(err.to_string()),
+                }
+            };
+            // Sampled after the branch above, not before it. On the plain path
+            // the fold consumes the whole winning stream, so a reading taken
+            // earlier would call time to first token the whole request and
+            // leave the router's own work out of its half of the split.
+            let total = started.elapsed();
+
+            match reply {
+                Ok(reply) => {
+                    state
+                        .metrics
+                        .record_latency(latency, total.saturating_sub(latency));
+                    state.metrics.record_request(Outcome::Success);
+                    tracing::info!(
+                        outcome = "success",
+                        channel = %channel_id,
+                        provider = %provider,
+                        model = %model_id,
+                        streamed = wants_stream,
+                        attempts,
+                        ms = total.as_millis() as u64,
+                        "served"
+                    );
+                    reply
+                }
+                Err(error) => {
+                    state.metrics.record_request(Outcome::NoChannel);
+                    tracing::warn!(channel = %channel_id, error = %error, "the winning stream could not be delivered");
+                    Served::Whole(
+                        ApiError::NoChannel {
+                            attempts,
+                            last_error: Some(error),
+                        }
+                        .into_response(),
+                    )
+                }
             }
-            .into_response()
         }
 
         RaceOutcome::NoNetwork { failed } => {
@@ -478,7 +868,7 @@ async fn handle_completion(
                 ms = started.elapsed().as_millis() as u64,
                 "served"
             );
-            ApiError::NoNetwork { failed }.into_response()
+            Served::Whole(ApiError::NoNetwork { failed }.into_response())
         }
 
         RaceOutcome::Exhausted {
@@ -492,30 +882,42 @@ async fn handle_completion(
                 ms = started.elapsed().as_millis() as u64,
                 "served"
             );
-            ApiError::NoChannel {
-                attempts,
-                last_error,
-            }
-            .into_response()
-        }
-
-        RaceOutcome::StreamDied { channel_id, error } => {
-            state.metrics.record_request(Outcome::NoChannel);
-            tracing::error!(channel = %channel_id, error = %error, "a stream died that nothing asked for");
-            ApiError::NoChannel {
-                attempts: 1,
-                last_error: Some(error),
-            }
-            .into_response()
+            Served::Whole(
+                ApiError::NoChannel {
+                    attempts,
+                    last_error,
+                }
+                .into_response(),
+            )
         }
 
         RaceOutcome::ClientGone => {
             tracing::debug!("client went away");
-            StatusCode::from_u16(499)
-                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
-                .into_response()
+            Served::Whole(
+                StatusCode::from_u16(499)
+                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                    .into_response(),
+            )
         }
     }
+}
+
+/// Chunks a whole answer back out as server-sent events, for a client that
+/// asked for a stream and a reply that arrived in one piece. `None` means the
+/// translation failed and the caller owes the client an error instead.
+fn stream_reply(
+    response: crate::wire::NeutralResponse,
+    client_format: Format,
+    served: String,
+) -> Option<Served> {
+    crate::wire::encode_stream(
+        crate::wire::stream_of(response),
+        client_format,
+        Some(served),
+    )
+    .map(|events| Served::Events(sse_frames(events, client_format)))
+    .map_err(|err| tracing::warn!(error = %err, "a whole answer could not be chunked out"))
+    .ok()
 }
 
 /// The checks that can end a request before any channel call: a cold
@@ -572,11 +974,12 @@ fn pre_race_rejection(
     None
 }
 
-/// The body every channel call sends, always with `stream: false`.
+/// The body every channel call sends.
 ///
-/// DESIGN.md decided whole responses only, so a client asking for a stream
-/// never turns into a streamed channel call. Encoded once, into the one format
-/// `DESIGN.md` says every channel speaks.
+/// `streaming` is the router's own setting, not the client's: the providers are
+/// asked for a stream whenever it is on, because the hedge strategy needs one
+/// to measure. `stream_options` goes with it, or an OpenAI-shaped provider
+/// leaves the usage figures out of the stream and the folded answer loses them.
 ///
 /// The `model` field is removed here. The client's model string means nothing
 /// to a provider, and the race decides which model is called, so each channel
@@ -584,10 +987,17 @@ fn pre_race_rejection(
 /// [`crate::upstream::SharedBody`].
 fn outbound_body(
     request: &crate::wire::NeutralRequest,
+    streaming: bool,
 ) -> std::result::Result<Bytes, crate::wire::WireError> {
     let mut value = crate::wire::encode_request(request, Format::OpenAiChat)?;
     if let Some(object) = value.as_object_mut() {
-        object.insert("stream".to_string(), Value::Bool(false));
+        object.insert("stream".to_string(), Value::Bool(streaming));
+        if streaming {
+            object.insert(
+                "stream_options".to_string(),
+                json!({ "include_usage": true }),
+            );
+        }
         object.remove("model");
     }
     serde_json::to_vec(&value)
@@ -595,21 +1005,26 @@ fn outbound_body(
         .map_err(|err| crate::wire::WireError::Translation(err.to_string()))
 }
 
-/// Turns a stored entry back into the client's format. A body that no longer
+/// Turns a stored entry back into the client's format, as one piece or as a
+/// stream depending on what the client asked for. A body that no longer
 /// deserialises is treated as a miss.
 fn cached_response(
     entry: &CacheEntry,
     client_format: Format,
     named_model: Option<&str>,
-) -> Option<Response> {
+    wants_stream: bool,
+) -> Option<Served> {
     let response: crate::wire::NeutralResponse = serde_json::from_slice(&entry.body)
         .map_err(|err| tracing::warn!(error = %err, "cached entry could not be read back"))
         .ok()?;
-    let served = named_model.unwrap_or(entry.model_id.as_str());
-    let encoded = crate::wire::encode_response(&response, client_format, Some(served))
+    let served = named_model.unwrap_or(entry.model_id.as_str()).to_string();
+    if wants_stream {
+        return stream_reply(response, client_format, served);
+    }
+    let encoded = crate::wire::encode_response(&response, client_format, Some(&served))
         .map_err(|err| tracing::warn!(error = %err, "cached entry could not be translated"))
         .ok()?;
-    Some(axum::Json(encoded).into_response())
+    Some(Served::Whole(axum::Json(encoded).into_response()))
 }
 
 /// The bytes stored for one answer: the neutral response with the provider's
@@ -629,7 +1044,16 @@ fn cache_body(response: &crate::wire::NeutralResponse) -> serde_json::Result<Vec
 
 /// Serialises the cache candidate and applies the write rule. A cache failure
 /// never fails the client request.
-fn write_cache(cache: &Cache, key: crate::cache::CacheKey, best: &crate::race::Winner, now: u64) {
+/// `end` says how the answer arrived. A buffered winner is always
+/// [`StreamEnd::Complete`]; a folded stream is only complete because the fold
+/// succeeded, and [`Cache::put_stream`] is where that rule is enforced.
+fn write_cache(
+    cache: &Cache,
+    key: crate::cache::CacheKey,
+    best: &crate::race::Winner,
+    end: crate::cache::StreamEnd,
+    now: u64,
+) {
     let body = match cache_body(&best.response) {
         Ok(body) => body,
         Err(err) => {
@@ -646,7 +1070,7 @@ fn write_cache(cache: &Cache, key: crate::cache::CacheKey, best: &crate::race::W
         provider: best.provider.clone(),
         body,
     };
-    if let Err(err) = cache.put(key, entry, now) {
+    if let Err(err) = cache.put_stream(key, entry, end, now) {
         tracing::warn!(error = %err, "cache write failed");
     }
 }
@@ -878,10 +1302,10 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
 
-    /// A stored entry must hold the answer once. The translation crate's
-    /// default policy keeps the provider's exact reply in `preservation`, so
-    /// serialising the whole neutral response writes the same text twice and
-    /// doubles the cache on disk.
+    /// A stored entry must hold the answer once. `wire` decodes with
+    /// preservation off so the provider's exact reply is never kept beside the
+    /// normalised one, and `cache_body` blanks the field anyway for a response
+    /// that reached the cache by some other route.
     #[test]
     fn a_cache_entry_does_not_store_the_answer_twice() {
         let answer = "x".repeat(10_000);
@@ -906,9 +1330,8 @@ mod tests {
         };
         assert_eq!(
             count(&serde_json::to_vec(&response).expect("the whole response serialises")),
-            2,
-            "the whole neutral response carries the answer in `outputs` and again \
-             in `preservation`, which is the growth this test guards against"
+            1,
+            "the decoded response carries the answer once, not again in `preservation`"
         );
 
         let body = cache_body(&response).expect("the cache body serialises");
@@ -923,13 +1346,12 @@ mod tests {
         assert_eq!(served["model"], "served");
     }
 
-    /// A scratch directory of this test's own.
-    fn spill_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("llmrouter-spill-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("the scratch directory is created");
-        dir
+    /// A scratch directory of this test's own, removed on drop.
+    fn spill_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("llmrouter-spill-{name}-"))
+            .tempdir()
+            .expect("the scratch directory is created")
     }
 
     /// The 404 gate must use the same comparison as `Channel::matches`, which
@@ -955,6 +1377,7 @@ mod tests {
             modalities_input: vec!["text".to_string()],
             intelligence: 900,
             intelligence_rank: 1,
+            created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
         };
@@ -991,7 +1414,7 @@ mod tests {
         let dir = spill_dir("ram");
         let config = RouterConfig {
             spill_above_concurrent: 100,
-            spill_path: dir.clone(),
+            spill_path: dir.path().to_path_buf(),
             ..RouterConfig::default()
         };
 
@@ -1008,7 +1431,6 @@ mod tests {
             0,
             "no scratch file is written below the threshold"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1016,7 +1438,7 @@ mod tests {
         let dir = spill_dir("disk");
         let config = RouterConfig {
             spill_above_concurrent: 100,
-            spill_path: dir.clone(),
+            spill_path: dir.path().to_path_buf(),
             ..RouterConfig::default()
         };
 
@@ -1036,7 +1458,6 @@ mod tests {
             !path.exists(),
             "the scratch file goes when the client has its answer"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1053,7 +1474,7 @@ mod tests {
         )
         .expect("decodes");
 
-        let body = outbound_body(&request).expect("encodes");
+        let body = outbound_body(&request, false).expect("encodes");
         let value: Value = serde_json::from_slice(&body).expect("valid json");
         assert!(
             value.get("model").is_none(),
@@ -1068,26 +1489,311 @@ mod tests {
         assert_eq!(sent["model"], "llama-3.3-70b");
     }
 
+    /// One whole answer, as the race hands it over.
+    fn whole_answer(text: &str) -> crate::wire::NeutralResponse {
+        let provider_reply = json!({
+            "id": "1",
+            "model": "upstream",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        crate::wire::decode_response(&provider_reply, Format::OpenAiChat)
+            .expect("the provider reply decodes")
+    }
+
+    /// The whole body of a response, as text.
+    async fn body_text(response: Response) -> String {
+        String::from_utf8(read_body(response).await.to_vec()).expect("the body is utf-8")
+    }
+
     #[test]
-    fn a_streaming_client_still_gets_a_whole_answer_from_a_whole_channel_call() {
-        // Claude Code sends `stream: true` by default. DESIGN.md says whole
-        // responses only, `stream: false` upstream, so the client's flag must
-        // never reach a provider: a streamed channel call cannot be cached and
-        // cannot fall through to the next channel once it has started.
-        let request = crate::wire::decode_request(
+    fn the_two_streaming_settings_are_independent() {
+        // `stream` in the request is about the client and `streaming` in
+        // `router.yml` is about the providers. Neither one is ever a reason to
+        // reject the other, and the client's flag never reaches a provider.
+        let asked = crate::wire::decode_request(
             Format::OpenAiChat,
             &json!({
-                "model": "claude-sonnet-4-5",
+                "model": "claude-fable-5-1",
                 "messages": [{"role": "user", "content": "fix this bug"}],
                 "stream": true,
             }),
         )
         .expect("decodes");
-        assert!(request.stream, "the client did ask for a stream");
+        assert!(asked.stream, "the client did ask for a stream");
 
-        let body = outbound_body(&request).expect("the outbound body encodes");
+        let body = outbound_body(&asked, false).expect("the outbound body encodes");
         let value: Value = serde_json::from_slice(&body).expect("the outbound body is JSON");
-        assert_eq!(value["stream"], Value::Bool(false));
+        assert_eq!(
+            value["stream"],
+            Value::Bool(false),
+            "a streaming client against buffered providers still posts stream: false"
+        );
+
+        let did_not_ask = crate::wire::decode_request(
+            Format::OpenAiChat,
+            &json!({
+                "model": "claude-fable-5-1",
+                "messages": [{"role": "user", "content": "fix this bug"}],
+            }),
+        )
+        .expect("decodes");
+        assert!(!did_not_ask.stream);
+
+        let body = outbound_body(&did_not_ask, true).expect("the outbound body encodes");
+        let value: Value = serde_json::from_slice(&body).expect("the outbound body is JSON");
+        assert_eq!(
+            value["stream"],
+            Value::Bool(true),
+            "the providers are always streamed when router.yml says so, because the \
+             hedge strategy needs a stream to measure"
+        );
+        assert_eq!(
+            value["stream_options"]["include_usage"],
+            Value::Bool(true),
+            "without this an OpenAI-shaped provider leaves usage out of the stream"
+        );
+        assert!(value.get("model").is_none(), "{value}");
+    }
+
+    /// A streaming client gets an SSE comment every interval until the first
+    /// real byte, and none after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_streaming_client_is_pinged_until_the_first_real_byte() {
+        let work = Box::pin(async {
+            // Past three intervals, which is the prefill DESIGN.md sizes the
+            // keepalive against.
+            tokio::time::sleep(Duration::from_secs(50)).await;
+            stream_reply(
+                whole_answer("the answer"),
+                Format::OpenAiChat,
+                "served".to_string(),
+            )
+            .expect("the whole answer chunks out")
+        });
+
+        let response = with_keepalive(work, true, Duration::from_secs(15)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        let body = body_text(response).await;
+        assert!(
+            body.matches(": ping").count() >= 2,
+            "the client's read timer must keep resetting: {body}"
+        );
+        assert!(body.contains("the answer"), "{body}");
+        let first_data = body.find("data:").expect("the answer is in the body");
+        assert!(
+            !body[first_data..].contains(": ping"),
+            "the keepalive stops at the first real byte: {body}"
+        );
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+    }
+
+    /// A non-streaming client gets the `200` and its headers at once, then one
+    /// space every interval, then the JSON body. JSON parsers skip leading
+    /// whitespace, so the body still parses.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_streaming_client_gets_a_space_every_interval_then_the_json() {
+        let work = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(50)).await;
+            Served::Whole(axum::Json(json!({"id": "1", "content": "the answer"})).into_response())
+        });
+
+        let response = with_keepalive(work, false, Duration::from_secs(15)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+
+        let body = read_body(response).await;
+        assert!(
+            body.starts_with(b" "),
+            "the padding goes out before the body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            body.iter().take_while(|b| **b == b' ').count() >= 2,
+            "one space per interval"
+        );
+        let parsed: Value =
+            serde_json::from_slice(&body).expect("leading whitespace still parses as JSON");
+        assert_eq!(parsed["content"], "the answer");
+    }
+
+    /// An outcome decided inside the first interval has sent nothing yet, so it
+    /// keeps its own status line. That is every outcome except a slow race.
+    #[tokio::test(start_paused = true)]
+    async fn an_outcome_decided_before_the_first_keepalive_keeps_its_status_line() {
+        for wants_stream in [false, true] {
+            let work = Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Served::Whole(
+                    ApiError::NoChannel {
+                        attempts: 3,
+                        last_error: Some("401 invalid api key".to_string()),
+                    }
+                    .into_response(),
+                )
+            });
+
+            let response = with_keepalive(work, wants_stream, Duration::from_secs(15)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "wants_stream = {wants_stream}"
+            );
+            let body: Value = serde_json::from_slice(&read_body(response).await)
+                .expect("the error body is JSON on its own");
+            assert_eq!(body["error"], "no_channel");
+        }
+    }
+
+    /// A zero interval turns the keepalive off and nothing is committed early.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_sends_no_keepalive_at_all() {
+        let work = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Served::Whole(
+                ApiError::NoChannel {
+                    attempts: 1,
+                    last_error: None,
+                }
+                .into_response(),
+            )
+        });
+
+        let response = with_keepalive(work, false, Duration::ZERO).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// A reply that arrived in one piece still serves a client that asked for a
+    /// stream, in that client's own event format.
+    #[tokio::test]
+    async fn a_whole_answer_chunks_out_to_a_streaming_client() {
+        let served = stream_reply(
+            whole_answer("the answer"),
+            Format::OpenAiChat,
+            "served".to_string(),
+        )
+        .expect("the whole answer chunks out");
+        let body = body_text(served.into_response()).await;
+        assert!(body.contains("the answer"), "{body}");
+        assert!(body.contains("\"model\":\"served\""), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+
+        // Anthropic names each event instead, and its own `message_stop` ends
+        // the stream, so there is no `[DONE]` line to add.
+        let served = stream_reply(
+            whole_answer("the answer"),
+            Format::AnthropicMessages,
+            "served".to_string(),
+        )
+        .expect("the whole answer chunks out");
+        let body = body_text(served.into_response()).await;
+        assert!(body.contains("event: message_start"), "{body}");
+        assert!(body.contains("event: message_stop"), "{body}");
+        assert!(!body.contains("[DONE]"), "{body}");
+    }
+
+    /// A stream that dies mid-answer must not be framed as a clean ending.
+    /// `data: [DONE]` tells an OpenAI client the half answer it already has is
+    /// the whole answer, so nothing retries and the user never learns the
+    /// reply was cut off.
+    #[tokio::test]
+    async fn a_stream_that_dies_mid_answer_gets_no_done_marker() {
+        let bytes = futures::stream::iter(vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"half an \"}}]}\n\n".to_vec()),
+            Err(crate::wire::WireError::Stream(
+                "the connection dropped".to_string(),
+            )),
+        ]);
+        let chunks = crate::wire::decode_stream(bytes, Format::OpenAiChat).expect("decodes");
+        let events = crate::wire::encode_stream(chunks, Format::OpenAiChat, None)
+            .expect("the chunks encode");
+
+        let body =
+            body_text(Served::Events(sse_frames(events, Format::OpenAiChat)).into_response()).await;
+        assert!(
+            body.contains("half an "),
+            "the partial answer still goes out: {body}"
+        );
+        assert!(
+            !body.contains("[DONE]"),
+            "a death is not a clean ending: {body}"
+        );
+        assert!(
+            body.contains("event: error"),
+            "the client is told why: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_is_named_for_anthropic_and_unnamed_for_openai() {
+        async fn framed(format: Format, value: &Value) -> String {
+            let event = sse_event(format, value);
+            let frames: SseFrames = Box::pin(futures::stream::once(async move { Ok(event) }));
+            body_text(Sse::new(frames).into_response()).await
+        }
+        let value = json!({"type": "content_block_delta", "index": 0});
+
+        let anthropic = framed(Format::AnthropicMessages, &value).await;
+        assert!(
+            anthropic.contains("event: content_block_delta"),
+            "{anthropic}"
+        );
+        assert!(anthropic.contains("data: {"), "{anthropic}");
+
+        let openai = framed(Format::OpenAiChat, &value).await;
+        assert!(!openai.contains("event:"), "{openai}");
+        assert!(openai.contains("data: {"), "{openai}");
+    }
+
+    /// A provider can put a newline in its own event `type`, and an
+    /// Anthropic-wire channel has its raw JSON replayed verbatim, so that name
+    /// reaches the framing unchecked. Naming the event with it panics, which
+    /// kills the connection after the `200` has gone out.
+    #[tokio::test]
+    async fn an_event_name_with_a_newline_does_not_kill_the_stream() {
+        let value = json!({"type": "content_block_delta\n", "index": 0});
+        let event = sse_event(Format::AnthropicMessages, &value);
+        let frames: SseFrames = Box::pin(futures::stream::once(async move { Ok(event) }));
+        let body = body_text(Sse::new(frames).into_response()).await;
+        assert!(!body.contains("event:"), "the bad name is dropped: {body}");
+        assert!(body.contains("data: {"), "the event still goes out: {body}");
+    }
+
+    /// A cached entry serves both shapes: one piece for a client that asked for
+    /// one, a stream for a client that did not.
+    #[tokio::test]
+    async fn a_cached_entry_serves_a_streaming_client_as_a_stream() {
+        let entry = CacheEntry {
+            schema_version: crate::cache::SCHEMA_VERSION,
+            created_at: 0,
+            model_id: "claude-fable-5-1".to_string(),
+            intelligence: 900,
+            channel_id: crate::catalogue::ChannelId::new("openrouter", "sk-1", "claude-fable-5-1"),
+            provider: "openrouter".to_string(),
+            body: cache_body(&whole_answer("from the cache")).expect("the entry serialises"),
+        };
+
+        let streamed = cached_response(&entry, Format::OpenAiChat, None, true)
+            .expect("the entry replays as a stream");
+        let body = body_text(streamed.into_response()).await;
+        assert!(body.contains("from the cache"), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+
+        let whole = cached_response(&entry, Format::OpenAiChat, None, false)
+            .expect("the entry serves in one piece");
+        let response = whole.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let parsed: Value = serde_json::from_slice(&read_body(response).await).expect("JSON");
+        assert_eq!(parsed["choices"][0]["message"]["content"], "from the cache");
     }
 
     #[test]
@@ -1420,6 +2126,7 @@ mod tests {
                 modalities_input: vec!["text".to_string()],
                 intelligence: 1_000,
                 intelligence_rank: 0,
+                created: None,
                 health: ChannelHealth::live(),
                 telemetry: ChannelTelemetry::default(),
             }
@@ -1467,7 +2174,7 @@ mod tests {
         let dir = spill_dir("body-limit");
         let config = Config {
             router: RouterConfig {
-                spill_path: dir.clone(),
+                spill_path: dir.path().to_path_buf(),
                 ..RouterConfig::default()
             },
             providers: Vec::new(),
@@ -1477,7 +2184,7 @@ mod tests {
             capabilities: std::collections::HashMap::new(),
         };
         let db = Arc::new(
-            redb::Database::create(dir.join("state.redb")).expect("the scratch store opens"),
+            redb::Database::create(dir.path().join("state.redb")).expect("the scratch store opens"),
         );
         let health = Arc::new(
             HealthTable::open(
@@ -1494,8 +2201,9 @@ mod tests {
         );
         let catalogue = Arc::new(Catalogue::new());
         let metrics = Arc::new(Metrics::new().expect("the recorder installs once"));
+        let config = Arc::new(config);
         let racer = Arc::new(Racer::new(
-            Arc::new(config.router.clone()),
+            Arc::clone(&config),
             Arc::clone(&catalogue),
             Arc::clone(&health),
             upstream,
@@ -1505,7 +2213,7 @@ mod tests {
         let state = Arc::new(AppState {
             // u64::MAX, so the RSS gate admits whatever this machine is using.
             admission: Admission::new(u64::MAX, std::time::Duration::from_secs(30)),
-            config: Arc::new(config),
+            config,
             catalogue,
             health,
             cache: None,
@@ -1541,7 +2249,5 @@ mod tests {
             .expect("the error body reads back");
         let parsed: Value = serde_json::from_slice(&bytes).expect("the body is our JSON error");
         assert_eq!(parsed["error"], "bad_request");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

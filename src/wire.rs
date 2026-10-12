@@ -11,7 +11,25 @@
 
 use futures::{Stream, StreamExt};
 use serde_json::Value;
+use std::sync::LazyLock;
 use switchyard_protocol::LlmClientError;
+use switchyard_translation::{PreservationPolicy, TranslationEngine, TranslationPolicy};
+
+/// The crate's free functions hard-wire `TranslationPolicy::default()`, whose
+/// `preservation` is `InMemory`: every decode deep-clones the whole inbound
+/// body into the neutral value and keeps it there. That doubles the parsed
+/// prompt in memory and undoes rule 2, freeing the raw body after the parse.
+///
+/// Nothing here reads a preserved body: `canonical_bytes` drops the field
+/// before hashing and the cache blanks it. The one thing lost is the encoder's
+/// shortcut of replaying a caller's exact body when source and target formats
+/// match; the outbound body is rebuilt from the neutral value instead, and
+/// `UnknownFieldPolicy::Preserve` still carries the odd fields across.
+static POLICY: LazyLock<TranslationPolicy> = LazyLock::new(|| TranslationPolicy {
+    preservation: PreservationPolicy::Disabled,
+    ..TranslationPolicy::default()
+});
+static ENGINE: LazyLock<TranslationEngine> = LazyLock::new(TranslationEngine::default);
 
 /// Which wire format a body is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +76,46 @@ pub enum WireError {
 /// around without naming what is inside.
 pub struct ChunkStream(switchyard_translation::LlmResponseStream);
 
+impl ChunkStream {
+    /// Calls `on_error` for each item the stream fails on, passing the item
+    /// through untouched.
+    ///
+    /// A provider that closes its body part way through an answer produces a
+    /// clean end of stream, not a transport error, so the byte stream sees
+    /// nothing wrong. The decoder is the first thing that knows: it reaches
+    /// the end with no terminal event and fails here. This is the hook that
+    /// carries that back to the caller.
+    pub fn on_error(self, on_error: impl Fn() + Send + 'static) -> Self {
+        Self(Box::pin(futures::TryStreamExt::inspect_err(
+            self.0,
+            move |_| on_error(),
+        )))
+    }
+    /// Calls `on_terminal` once the answer's terminal chunk has gone past,
+    /// passing every item through untouched.
+    ///
+    /// `MessageStop` is where both wire formats meet: the OpenAI decoder makes
+    /// one out of `finish_reason`, the Anthropic decoder out of `message_stop`.
+    /// It is the only neutral signal that the answer is complete, which is what
+    /// the stall timer upstream needs so it stops treating a quiet socket as a
+    /// dead channel.
+    pub fn on_terminal(self, on_terminal: impl Fn() + Send + 'static) -> Self {
+        Self(Box::pin(futures::TryStreamExt::inspect_ok(
+            self.0,
+            move |event| {
+                if event.normalized().iter().any(|chunk| {
+                    matches!(
+                        chunk,
+                        switchyard_protocol::stream::LlmResponseChunk::MessageStop { .. }
+                    )
+                }) {
+                    on_terminal();
+                }
+            },
+        )))
+    }
+}
+
 /// A stream of wire-format event objects, ready for the server to frame as
 /// server-sent events.
 pub struct EventStream(switchyard_translation::RawEventStream);
@@ -77,7 +135,13 @@ pub fn decode_request(
     format: Format,
     body: &Value,
 ) -> std::result::Result<NeutralRequest, WireError> {
-    switchyard_translation::decode_request(format.into(), body)
+    ENGINE
+        .decode_request(
+            switchyard_translation::WireFormat::from(format),
+            body,
+            &POLICY,
+        )
+        .map(|output| output.request)
         .map_err(|error| WireError::InvalidRequest(error.to_string()))
 }
 
@@ -86,8 +150,33 @@ pub fn encode_request(
     request: &NeutralRequest,
     format: Format,
 ) -> std::result::Result<Value, WireError> {
-    switchyard_translation::encode_request(request, format.into())
-        .map_err(|error| WireError::Translation(error.to_string()))
+    let mut body = switchyard_translation::encode_request(request, format.into())
+        .map_err(|error| WireError::Translation(error.to_string()))?;
+    restore_stop(request, format, &mut body);
+    Ok(body)
+}
+
+/// Puts the caller's stop sequences back on an OpenAI chat body.
+///
+/// The translation crate's OpenAI decoder parks `stop` in
+/// `extensions.fields.stop`, but its OpenAI encoder only looks for
+/// `stop_sequences`, the Anthropic spelling. So an OpenAI client talking to an
+/// OpenAI provider, the commonest path we serve, silently loses its stop
+/// sequences and the model runs past where the caller asked it to halt. The
+/// Anthropic encoder reads both spellings, so only this one edge needs it.
+///
+/// Worth keeping even once the crate is fixed: `entry` leaves an already
+/// encoded `stop` alone.
+fn restore_stop(request: &NeutralRequest, format: Format, body: &mut Value) {
+    if format != Format::OpenAiChat {
+        return;
+    }
+    let Some(stop) = request.extensions.fields.get("stop") else {
+        return;
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.entry("stop").or_insert_with(|| stop.clone());
+    }
 }
 
 /// A winning channel's buffered reply, in that provider's format.
@@ -95,7 +184,13 @@ pub fn decode_response(
     body: &Value,
     format: Format,
 ) -> std::result::Result<NeutralResponse, WireError> {
-    switchyard_translation::decode_aggregated_response(body, format.into())
+    ENGINE
+        .decode_response(
+            switchyard_translation::WireFormat::from(format),
+            body,
+            &POLICY,
+        )
+        .map(|output| output.response)
         .map_err(|error| WireError::Translation(error.to_string()))
 }
 
@@ -140,6 +235,60 @@ pub fn encode_stream(
         .map_err(|error| WireError::Stream(error.to_string()))
 }
 
+/// Folds a neutral chunk stream into one whole answer.
+///
+/// This is the buffering half of **Streaming**: the providers always stream,
+/// so a client that did not ask for one still has to be handed a single piece.
+/// The fold is the translation crate's own, which is the only thing that knows
+/// how tool-call arguments and reasoning details rejoin across chunks.
+pub async fn aggregate_stream(
+    chunks: ChunkStream,
+) -> std::result::Result<NeutralResponse, WireError> {
+    switchyard_protocol::stream::LlmResponse::Stream(chunks.0)
+        .into_agg()
+        .await
+        .map_err(|error| WireError::Stream(error.to_string()))
+}
+
+/// Splits a chunk stream in two.
+///
+/// The returned stream forwards every event onwards untouched. A copy of the
+/// whole run arrives on the receiver once the stream has finished cleanly, so
+/// the caller can fold it and offer it to the cache. A stream that fails or is
+/// dropped part way sends nothing, which is the cache rule: only a complete
+/// stream goes in.
+pub fn tee_stream(
+    chunks: ChunkStream,
+) -> (ChunkStream, tokio::sync::oneshot::Receiver<ChunkStream>) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut inner = chunks.0;
+    let forwarded = async_stream::stream! {
+        let mut copy = Vec::new();
+        while let Some(item) = inner.next().await {
+            match item {
+                Ok(event) => {
+                    copy.push(event.clone());
+                    yield Ok(event);
+                }
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+        let _ = sender.send(ChunkStream(Box::pin(futures::stream::iter(
+            copy.into_iter().map(Ok),
+        ))));
+    };
+    (ChunkStream(Box::pin(forwarded)), receiver)
+}
+
+/// Turns a whole answer back into a chunk stream, for replaying a cached or
+/// buffered reply to a client that asked for a stream.
+pub fn stream_of(response: NeutralResponse) -> ChunkStream {
+    ChunkStream(response.into_stream())
+}
+
 /// The format one of the router's own endpoints speaks, from its path.
 pub fn format_for_path(path: &str) -> Option<Format> {
     match path.trim_end_matches('/') {
@@ -169,7 +318,15 @@ const EXCLUDED_FIELDS: [&str; 3] = ["model", "stream", "preservation"];
 /// `presence_penalty` all reach the provider and all move the output, so they
 /// stay in the key. Only caller identity, bookkeeping and streaming options
 /// come out.
-const EXCLUDED_EXTENSION_FIELDS: [&str; 9] = [
+///
+/// `switchyard_anthropic_request` is the translation crate's own marker: the
+/// Anthropic codec stamps it on every request it decodes and strips it again
+/// on encode. It says which endpoint the client used, nothing about the
+/// answer, so leaving it in would give an Anthropic client and an OpenAI
+/// client different keys for the same conversation, which is the one thing
+/// the key is built to avoid.
+const EXCLUDED_EXTENSION_FIELDS: [&str; 10] = [
+    "switchyard_anthropic_request",
     "metadata",
     "prompt_cache_key",
     "prompt_cache_retention",
@@ -306,6 +463,91 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
             strict: None,
         }
+    }
+
+    /// The forwarded half must deliver every event, and the copy must fold
+    /// back into the same answer, or a streamed reply can never be cached.
+    #[tokio::test]
+    async fn a_teed_stream_forwards_and_yields_a_foldable_copy() {
+        let provider_reply = serde_json::json!({
+            "id": "1",
+            "model": "upstream",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello world"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let response =
+            decode_response(&provider_reply, Format::OpenAiChat).expect("the reply decodes");
+
+        let (mut forwarded, complete) = tee_stream(stream_of(response));
+        let mut seen = 0;
+        while let Some(item) = forwarded.0.next().await {
+            item.expect("every forwarded event is good");
+            seen += 1;
+        }
+        assert!(seen > 0, "the forwarded half carries the events");
+
+        let copy = complete.await.expect("a complete stream hands back a copy");
+        let folded = aggregate_stream(copy).await.expect("the copy folds");
+        let out = encode_response(&folded, Format::OpenAiChat, Some("served"))
+            .expect("the folded answer translates");
+        assert_eq!(out["choices"][0]["message"]["content"], "hello world");
+    }
+
+    /// A stream the client abandons part way must leave nothing behind: a
+    /// partial answer in the cache is a wrong answer.
+    #[tokio::test]
+    async fn an_abandoned_stream_offers_nothing_to_the_cache() {
+        let provider_reply = serde_json::json!({
+            "id": "1",
+            "model": "upstream",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello world"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let response =
+            decode_response(&provider_reply, Format::OpenAiChat).expect("the reply decodes");
+
+        let (forwarded, complete) = tee_stream(stream_of(response));
+        drop(forwarded);
+        assert!(complete.await.is_err(), "nothing is offered to the cache");
+    }
+
+    /// Rule 2 frees the inbound body after the parse. That only saves anything
+    /// if the decode has not kept a copy of it inside the neutral request.
+    #[test]
+    fn a_decode_keeps_no_copy_of_the_inbound_body() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "a long prompt"}]
+        });
+        let request = decode_request(Format::OpenAiChat, &body).expect("the body decodes");
+        assert!(
+            request.preservation.requests.is_empty(),
+            "the inbound body must not be cloned into the neutral request"
+        );
+
+        let reply = serde_json::json!({
+            "id": "1",
+            "model": "upstream",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let response = decode_response(&reply, Format::OpenAiChat).expect("the reply decodes");
+        assert!(
+            response.preservation.responses.is_empty(),
+            "the provider reply must not be cloned into the neutral response"
+        );
     }
 
     #[test]

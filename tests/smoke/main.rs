@@ -1,0 +1,287 @@
+//! Smoke tier: the built image under docker compose.
+//!
+//! See tests/README.md. This tier proves the container starts and serves, and
+//! nothing else: bring the stack up, check the three read-only endpoints
+//! answer with the right shape, bring it down again. Business logic belongs in
+//! the contract and integration tiers, which run in-process and contribute
+//! coverage.
+//!
+//! Docker is not available on every development machine, so this skips with a
+//! message rather than failing when there is no working daemon. CI runs it for
+//! real on an ubuntu runner.
+
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+/// The repo root, which is where the compose files live.
+const ROOT: &str = env!("CARGO_MANIFEST_DIR");
+
+/// The router is a release build inside the image, so the first `up` can take
+/// a while on a cold runner.
+const READY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Published by `docker-compose.ci.yml` on the loopback address only.
+const BASE: &str = "http://127.0.0.1:8080";
+
+fn docker_available() -> bool {
+    Command::new("docker")
+        .arg("info")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `docker compose -f docker-compose.yml -f docker-compose.ci.yml <args>`.
+fn compose(args: &[&str]) -> std::process::ExitStatus {
+    Command::new("docker")
+        .current_dir(ROOT)
+        .args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker-compose.ci.yml",
+        ])
+        .args(args)
+        .status()
+        .expect("docker compose runs")
+}
+
+/// One stack per run, so all three endpoints are checked inside a single
+/// `up`/`down` cycle. Splitting them into separate `#[test]`s would race for
+/// the published port.
+#[tokio::test]
+async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
+    if !docker_available() {
+        // A skip is for a developer laptop. On the runner, where this tier is
+        // the only thing that exercises the image, a missing daemon means the
+        // job proved nothing, so it fails rather than passing green.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no working docker daemon, and CI is set: the smoke tier cannot \
+             pass without one"
+        );
+        eprintln!(
+            "SKIPPED smoke tier: no working docker daemon on this machine. \
+             The smoke tests run in GitHub Actions on an ubuntu runner."
+        );
+        return;
+    }
+
+    let built = compose(&["up", "-d", "--build"]).success();
+    let result = if built {
+        check_endpoints(&reqwest::Client::new()).await
+    } else {
+        Err("docker compose up failed".to_owned())
+    };
+
+    teardown(
+        &result,
+        || {
+            let _ = compose(&["logs", "--no-color"]);
+        },
+        || {
+            let _ = compose(&["down", "-v"]);
+        },
+    );
+
+    if let Err(reason) = result {
+        panic!("{reason}");
+    }
+}
+
+/// Down regardless, so a failure does not leave the stack running or the named
+/// volume behind for the next run to inherit. On the failure path the logs are
+/// dumped first: `down -v` destroys the containers, so anything read after it
+/// comes back empty, and the logs are the only diagnostic a CI run leaves.
+fn teardown(result: &Result<(), String>, mut logs: impl FnMut(), mut down: impl FnMut()) {
+    if result.is_err() {
+        logs();
+    }
+    down();
+}
+
+#[test]
+fn teardown_dumps_the_logs_before_it_destroys_the_stack() {
+    let order = std::cell::RefCell::new(Vec::new());
+    teardown(
+        &Err("boom".to_owned()),
+        || order.borrow_mut().push("logs"),
+        || order.borrow_mut().push("down"),
+    );
+    assert_eq!(order.into_inner(), ["logs", "down"]);
+
+    let order = std::cell::RefCell::new(Vec::new());
+    teardown(
+        &Ok(()),
+        || order.borrow_mut().push("logs"),
+        || order.borrow_mut().push("down"),
+    );
+    assert_eq!(order.into_inner(), ["down"]);
+}
+
+async fn check_endpoints(client: &reqwest::Client) -> Result<(), String> {
+    wait_for_healthz(client).await?;
+    check_metrics(client).await?;
+    check_models(client).await
+}
+
+/// The container is up when `/healthz` answers 200 with the status document
+/// the server builds, not merely when the port accepts a connection.
+async fn wait_for_healthz(client: &reqwest::Client) -> Result<(), String> {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        let attempt = client.get(format!("{BASE}/healthz")).send().await;
+        match attempt {
+            Ok(reply) if reply.status().is_success() => {
+                let body: Value = reply
+                    .json()
+                    .await
+                    .map_err(|error| format!("/healthz is not JSON: {error}"))?;
+                if body["status"] != "ok" {
+                    return Err(format!("/healthz status field was {}", body["status"]));
+                }
+                if !body["channels"]["total"].is_u64() {
+                    return Err(format!("/healthz had no channel count: {body}"));
+                }
+                return Ok(());
+            }
+            other => {
+                if Instant::now() >= deadline {
+                    return Err(format!("/healthz never came up: {other:?}"));
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+/// Prometheus text, not JSON and not an empty body. Every metric is registered
+/// at zero on boot, so the names are there before any request has been served.
+async fn check_metrics(client: &reqwest::Client) -> Result<(), String> {
+    let reply = get(client, "/metrics").await?;
+    let content_type = reply
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if !content_type.starts_with("text/plain") {
+        return Err(format!("/metrics content type was {content_type:?}"));
+    }
+
+    let body = reply
+        .text()
+        .await
+        .map_err(|error| format!("/metrics body unreadable: {error}"))?;
+    for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
+        if !body.contains(expected) {
+            return Err(format!("/metrics did not mention {expected}: {body}"));
+        }
+    }
+    Ok(())
+}
+
+/// Valid JSON in the OpenAI list shape. The fixture config has no providers,
+/// so the rows are expected to be empty: the shape is the point, not the
+/// contents.
+async fn check_models(client: &reqwest::Client) -> Result<(), String> {
+    let body: Value = get(client, "/v1/models")
+        .await?
+        .json()
+        .await
+        .map_err(|error| format!("/v1/models is not JSON: {error}"))?;
+
+    if body["object"] != "list" {
+        return Err(format!("/v1/models object field was {}", body["object"]));
+    }
+    if !body["data"].is_array() {
+        return Err(format!("/v1/models data was not an array: {body}"));
+    }
+    Ok(())
+}
+
+async fn get(client: &reqwest::Client, path: &str) -> Result<reqwest::Response, String> {
+    let reply = client
+        .get(format!("{BASE}{path}"))
+        .send()
+        .await
+        .map_err(|error| format!("GET {path} failed: {error}"))?;
+    if !reply.status().is_success() {
+        return Err(format!("GET {path} returned {}", reply.status()));
+    }
+    Ok(reply)
+}
+
+/// The overlay must *replace* the base file's published ports, not add to
+/// them. Compose concatenates `ports` across files, so without the `!override`
+/// tag the service publishes 8080 on 0.0.0.0 and then fails to bind
+/// 127.0.0.1:8080, and `up` never succeeds. Checked by reading the file rather
+/// than by running compose, so it holds on a machine with no docker.
+#[test]
+fn the_ci_overlay_replaces_the_published_ports_rather_than_adding_to_them() {
+    let overlay: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(format!("{ROOT}/docker-compose.ci.yml")).unwrap(),
+    )
+    .expect("the CI overlay is YAML");
+    let ports = &overlay["services"]["llmrouter"]["ports"];
+
+    let serde_yaml::Value::Tagged(tagged) = ports else {
+        panic!("docker-compose.ci.yml must tag `ports` with !override or !reset, found {ports:?}");
+    };
+    assert!(
+        matches!(tagged.tag.to_string().as_str(), "!override" | "!reset"),
+        "unexpected tag on `ports`: {}",
+        tagged.tag
+    );
+}
+
+/// The build context must carry the crate sources and nothing else. The build
+/// stage does `COPY . .` from the repo root, which at runtime also holds
+/// `config/.env` with the live provider keys and `data/cache.redb` with the
+/// cached prompts and answers. The final stage copies only the binary, but the
+/// build stage is still a real addressable layer in the local image store and
+/// in any exported BuildKit cache, so anything sent to it has leaked.
+///
+/// Read from the file rather than run through docker, so it holds on a machine
+/// with no daemon. An allow list is pinned here on purpose: a new runtime file
+/// in the repo root is then excluded by default, rather than by somebody
+/// remembering to add a rule for it.
+#[test]
+fn the_build_context_carries_the_crate_sources_and_nothing_else() {
+    // Tracked, not merely present. `actions/checkout` materialises tracked
+    // content only, so an unstaged .dockerignore passes on the maintainer's
+    // machine and leaves the Actions runner sending the whole repo root.
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", ".dockerignore"])
+        .current_dir(ROOT)
+        .output()
+        .expect("git must be on PATH");
+    assert!(
+        tracked.status.success(),
+        ".dockerignore must be tracked by git, or the Actions checkout has none and `COPY . .` sends the whole repo root"
+    );
+
+    let rules = std::fs::read_to_string(format!("{ROOT}/.dockerignore"))
+        .expect(".dockerignore must exist, or `COPY . .` bakes the keys into the build layer");
+    let rules: Vec<&str> = rules
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+
+    let (first, rest) = rules.split_first().expect(".dockerignore must have rules");
+    assert_eq!(*first, "*", ".dockerignore must deny everything first");
+
+    let allowed: Vec<&str> = rest
+        .iter()
+        .map(|line| {
+            line.strip_prefix('!')
+                .unwrap_or_else(|| panic!("only re-inclusions may follow `*`, found {line:?}"))
+        })
+        .collect();
+    assert_eq!(allowed, ["src", "Cargo.toml", "Cargo.lock"]);
+}

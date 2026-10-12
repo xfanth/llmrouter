@@ -1,0 +1,9 @@
+# Deny everything, then name the build inputs. A deny list would have to be
+# kept in step with every new runtime file, and the cost of missing one is
+# config/.env with the live provider keys, or data/cache.redb with the prompt
+# history, baked into the build stage layer. `cargo build --release` needs
+# these three paths and nothing else. The Dockerfile itself is always sent.
+*
+!src
+!Cargo.toml
+!Cargo.lock

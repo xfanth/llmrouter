@@ -1,0 +1,45 @@
+---
+source: tests/contract/openai_chat.rs
+expression: encoded
+---
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Be terse."
+    },
+    {
+      "role": "user",
+      "content": "List two colours."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file from disk.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_completion_tokens": 256,
+  "temperature": 0.2,
+  "stream": true,
+  "stop": [
+    "\n\n",
+    "END"
+  ]
+}

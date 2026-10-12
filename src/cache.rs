@@ -8,6 +8,11 @@
 //! intelligence, and write only when the candidate is higher, the entry is
 //! absent, or the entry has expired. The client gets the fastest answer; the
 //! cache keeps the best one.
+//!
+//! A streamed answer goes through the same write rule, with one gate in front
+//! of it: only a complete stream may be offered. A cancelled or stalled stream
+//! is a partial answer and a partial answer is wrong, so it never reaches
+//! redb. See [`StreamEnd`] and [`Cache::put_stream`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -51,6 +56,21 @@ pub struct CacheEntry {
     pub provider: String,
     /// The neutral `AggLlmResponse`, serialised.
     pub body: Vec<u8>,
+}
+
+/// How a streamed channel call ended, which is the only thing the cache needs
+/// to know about a stream.
+///
+/// The race picks one winner and cancels the rest the moment it has one. Every
+/// cancelled stream, and any stream that stalled or died partway, is
+/// [`StreamEnd::Cancelled`]. Only a stream the provider ended on its own, with
+/// the whole answer delivered, is [`StreamEnd::Complete`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The provider finished the stream and the whole answer is in hand.
+    Complete,
+    /// Cancelled, stalled or cut off. A partial answer, never cached.
+    Cancelled,
 }
 
 /// Everything on an entry except the body. Stored as JSON in front of the raw
@@ -247,6 +267,29 @@ impl Cache {
         Ok(wrote)
     }
 
+    /// The write rule for a streamed answer: the same single transaction as
+    /// [`Cache::put`], with the completeness gate in front of it.
+    ///
+    /// A stream that was cancelled, stalled or cut off mid-flight holds part
+    /// of an answer, and half an answer served back a week later is simply
+    /// wrong. So a losing stream offers nothing: the late-arrival rule that
+    /// applies to buffered channel calls has no streamed equivalent, because a
+    /// cancelled stream has no complete body to offer. Returns true only when
+    /// the candidate was stored.
+    pub fn put_stream(
+        &self,
+        key: CacheKey,
+        candidate: CacheEntry,
+        end: StreamEnd,
+        now_unix: u64,
+    ) -> crate::Result<bool> {
+        match end {
+            // Nothing is read, nothing is compared, no transaction opens.
+            StreamEnd::Cancelled => Ok(false),
+            StreamEnd::Complete => self.put(key, candidate, now_unix),
+        }
+    }
+
     /// Deletes the oldest 10 percent by `created_at` in one transaction.
     /// Called on write when the file is over `max_bytes`. redb does not shrink
     /// its file, so the cap is on bytes and the freed space is reused.
@@ -313,16 +356,10 @@ mod tests {
 
     const DAY: u64 = 86_400;
 
-    /// A cache on its own file under the temp directory, removed on drop.
+    /// A cache on its own file in a throwaway directory, removed on drop.
     struct TempCache {
         cache: Cache,
-        path: std::path::PathBuf,
-    }
-
-    impl Drop for TempCache {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        _dir: tempfile::TempDir,
     }
 
     impl std::ops::Deref for TempCache {
@@ -333,21 +370,16 @@ mod tests {
     }
 
     fn temp_cache(name: &str, max_bytes: u64) -> TempCache {
-        let path = std::env::temp_dir().join(format!(
-            "llmrouter-cache-test-{}-{}.redb",
-            std::process::id(),
-            name
-        ));
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("scratch dir");
         let config = CacheConfig {
-            path: path.clone(),
+            path: dir.path().join(format!("{name}.redb")),
             max_bytes,
             ttl: Duration::from_secs(7 * DAY),
             ..CacheConfig::default()
         };
         let db = Arc::new(open_database(&config).expect("create"));
         let cache = Cache::open(db, &config).expect("open");
-        TempCache { cache, path }
+        TempCache { cache, _dir: dir }
     }
 
     fn key(byte: u8) -> CacheKey {
@@ -544,6 +576,108 @@ mod tests {
         // The newest write is present, and the cap has not emptied the store.
         assert!(c.get(key(9), None, now).unwrap().is_some());
         assert!(c.entry_count().unwrap() > 1);
+    }
+
+    /// A cancelled stream is half an answer. It must not land in the cache,
+    /// and it must not displace a complete answer already there.
+    #[test]
+    fn a_cancelled_stream_is_never_written() {
+        let c = temp_cache("stream-cancelled", u64::MAX);
+        let now = 10 * DAY;
+
+        // Nothing stored: a cancelled stream still writes nothing.
+        assert!(!c
+            .put_stream(key(1), entry("glm-5.3", 90, now), StreamEnd::Cancelled, now)
+            .unwrap());
+        assert!(c.get(key(1), None, now).unwrap().is_none());
+
+        // A complete stream from a weaker model takes the empty slot.
+        assert!(c
+            .put_stream(key(1), entry("tiny", 1, now), StreamEnd::Complete, now)
+            .unwrap());
+
+        // A cancelled stream from a far smarter model still loses, because it
+        // has no complete body to offer.
+        assert!(!c
+            .put_stream(
+                key(1),
+                entry("claude-fable-5-1", 90, now),
+                StreamEnd::Cancelled,
+                now
+            )
+            .unwrap());
+        assert_eq!(c.get(key(1), None, now).unwrap().unwrap().model_id, "tiny");
+    }
+
+    /// A complete stream is an ordinary candidate: same transaction, same
+    /// intelligence comparison, no streamed exception.
+    #[test]
+    fn a_complete_stream_goes_through_the_same_write_rule() {
+        let c = temp_cache("stream-complete", u64::MAX);
+        let now = 10 * DAY;
+
+        assert!(c
+            .put_stream(key(1), entry("glm-5.3", 50, now), StreamEnd::Complete, now)
+            .unwrap());
+
+        // Lower loses, equal keeps what is stored, higher overwrites.
+        assert!(!c
+            .put_stream(key(1), entry("tiny", 10, now), StreamEnd::Complete, now)
+            .unwrap());
+        assert!(!c
+            .put_stream(key(1), entry("other", 50, now), StreamEnd::Complete, now)
+            .unwrap());
+        assert!(c
+            .put_stream(
+                key(1),
+                entry("claude-fable-5-1", 90, now),
+                StreamEnd::Complete,
+                now
+            )
+            .unwrap());
+
+        let stored = c.get(key(1), None, now).unwrap().unwrap();
+        assert_eq!(stored.model_id, "claude-fable-5-1");
+        assert_eq!(stored.intelligence, 90);
+    }
+
+    /// An expired entry is overwritten by a complete stream, and left alone by
+    /// a cancelled one.
+    #[test]
+    fn a_cancelled_stream_does_not_even_clear_an_expired_entry() {
+        let c = temp_cache("stream-expired", u64::MAX);
+        let stored_at = 1_000_000;
+        c.put(key(1), entry("glm-5.3", 90, stored_at), stored_at)
+            .unwrap();
+        let outside = stored_at + 7 * DAY;
+
+        assert!(!c
+            .put_stream(
+                key(1),
+                entry("tiny", 1, outside),
+                StreamEnd::Cancelled,
+                outside
+            )
+            .unwrap());
+        assert_eq!(c.entry_count().unwrap(), 1);
+        assert_eq!(
+            c.get(key(1), None, stored_at).unwrap().unwrap().model_id,
+            "glm-5.3"
+        );
+
+        // The same candidate, this time complete, takes the expired slot.
+        assert!(c
+            .put_stream(
+                key(1),
+                entry("tiny", 1, outside),
+                StreamEnd::Complete,
+                outside
+            )
+            .unwrap());
+        assert_eq!(
+            c.get(key(1), None, outside).unwrap().unwrap().model_id,
+            "tiny"
+        );
     }
 
     /// redb keeps its file at the high-water mark after a delete, so a cap

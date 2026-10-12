@@ -151,6 +151,16 @@ impl Upstream {
     /// multiplexing the memory budget depends on.
     pub fn new(config: &RouterConfig) -> crate::Result<Self> {
         let client = reqwest::Client::builder()
+            // No redirects. reqwest's default is to follow up to 10, and on a
+            // cross-host hop it only strips `authorization`, `cookie`,
+            // `cookie2`, `proxy-authorization` and `www-authenticate`. An
+            // Anthropic-wire channel carries the provider key in `x-api-key`,
+            // which is not on that list, so a redirect would replay the bare
+            // key to whatever host the `Location` names, over plain http if it
+            // asks for it. An API call has no business following a redirect
+            // anyway: a 3xx becomes an ordinary non-2xx status that the race
+            // already treats as a failure.
+            .redirect(reqwest::redirect::Policy::none())
             .http2_initial_stream_window_size(Some(clamp_window(config.http2_stream_window)))
             .http2_initial_connection_window_size(Some(clamp_window(
                 config.http2_connection_window,
@@ -357,6 +367,7 @@ mod tests {
             modalities_input: vec!["text".to_string()],
             intelligence: 50,
             intelligence_rank: 1,
+            created: None,
             health: ChannelHealth::default(),
             telemetry: ChannelTelemetry::default(),
         }
@@ -445,6 +456,61 @@ mod tests {
     fn an_oversized_window_clamps_instead_of_failing() {
         assert_eq!(clamp_window(131_072), 131_072);
         assert_eq!(clamp_window(u64::MAX), u32::MAX);
+    }
+
+    /// A redirect must not be followed. An Anthropic-wire channel sends the
+    /// raw provider key in `x-api-key`, and reqwest does not strip that header
+    /// on a cross-host hop, so following a `Location` would hand the key to
+    /// whatever host it names. The redirect should surface as a plain 302 and
+    /// the host it points at should never be contacted.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_key_never_reaches_the_new_host() {
+        use tokio::io::AsyncWriteExt;
+
+        // The host the redirect points at. It only has to notice a connection.
+        let collector = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port binds");
+        let collector_addr = collector.local_addr().expect("the port is known");
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&reached);
+        let collector_task = tokio::spawn(async move {
+            if collector.accept().await.is_ok() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // The provider, which answers every request with a redirect.
+        let provider = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port binds");
+        let provider_addr = provider.local_addr().expect("the port is known");
+        let provider_task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = provider.accept().await {
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{collector_addr}/v1/messages\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let upstream = Upstream::new(&RouterConfig::default()).expect("client builds");
+        let channel = channel(&format!("http://{provider_addr}/v1"), WireName::Anthropic);
+        let body = SharedBody::new(Bytes::from_static(br#"{"messages":[]}"#));
+
+        let outcome = upstream
+            .call_buffered(&channel, body)
+            .await
+            .expect("the redirect is a status, not a transport failure");
+        assert_eq!(outcome.status, 302, "the 3xx must surface as a status");
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the key must never reach the host the redirect named"
+        );
+
+        collector_task.abort();
+        provider_task.abort();
     }
 
     #[test]

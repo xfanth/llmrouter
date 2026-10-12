@@ -19,19 +19,34 @@
 //! health move straight away. It hands the move back and the walk holds it
 //! until the link state is known: applied once the link is proven up, dropped
 //! when it is down.
+//!
+//! When the providers are streamed, the winner is picked by `hedge_strategy`:
+//!
+//! * `ttft`: the first channel to emit a token wins, and the router is
+//!   committed to it from that moment.
+//! * `tps`: the default. From `t0`, the first token anywhere, every stream is
+//!   buffered for `hedge_window_ms` and nothing reaches the client. At the end
+//!   of the window the live streams are compared on tokens per second, the
+//!   fastest wins, the rest are cancelled, and the winner's buffer is flushed
+//!   ahead of the rest of its stream.
+//!
+//! No token for `stream_stall_timeout` means the channel failed. Before a
+//! winner is picked that is an ordinary failed trial and the walk carries on.
+//! After it, the client already holds part of the answer, so the stream ends
+//! and the channel backs off. Another channel is never spliced onto it.
 
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalogue::{Catalogue, Channel, ChannelFilter, ChannelId};
-use crate::config::RouterConfig;
+use crate::config::{Config, HedgeStrategy};
 use crate::health::{HealthKey, HealthTable, StreamVerdict};
 use crate::metrics::{AttemptOutcome, Metrics};
 use crate::net::{LinkState, NetTest};
@@ -47,7 +62,10 @@ pub struct RaceInput {
     pub outbound: Arc<PromptBody>,
     /// What a channel must satisfy to enter the race.
     pub filter: ChannelFilter,
-    /// True when the client asked for a stream.
+    /// Stream from the providers. This is `streaming` in `router.yml`, not the
+    /// client's own `stream` flag: the hedge strategy needs a stream to
+    /// measure, and what the client asked for only decides whether the server
+    /// forwards the winning stream or buffers it into one piece.
     pub streaming: bool,
     /// The caller's model, for the `404` when nothing matches and for the
     /// cache rules. `auto` and no model both mean `None`.
@@ -105,6 +123,13 @@ pub enum RaceOutcome {
         attempts: u32,
     },
     /// A channel started streaming. `200`.
+    ///
+    /// Once this is handed back the server owns the stream, and a stream that
+    /// dies mid-answer surfaces as an error item on the chunk stream itself,
+    /// after the `200` and part of the body have gone out. There is no second
+    /// chance and nothing to map to a `504`: the server simply ends the
+    /// response there. A stream that dies *before* any chunk is handed over
+    /// is an ordinary failed trial and the walk carries on.
     Streamed {
         /// The stream served to the client.
         winner: Box<StreamWinner>,
@@ -123,21 +148,6 @@ pub enum RaceOutcome {
         /// The last upstream error, for the body.
         last_error: Option<String>,
     },
-    /// A winning stream died after the client already had part of the answer.
-    /// There is no second chance: the client request ends here.
-    ///
-    /// The race never returns this itself: once [`RaceOutcome::Streamed`] is
-    /// handed back, the server owns the stream and is the only thing that can
-    /// see it die. A stream that dies *before* any chunk is handed over is an
-    /// ordinary failed trial and the walk carries on, which is what keeps the
-    /// "no second chance" rule to streams the client has already started
-    /// reading.
-    StreamDied {
-        /// Which channel's stream died.
-        channel_id: ChannelId,
-        /// What killed it.
-        error: String,
-    },
     /// The client went away. Everything in flight was cancelled.
     ClientGone,
 }
@@ -145,7 +155,7 @@ pub enum RaceOutcome {
 /// Runs races over the shared catalogue, health table and client.
 #[derive(Debug)]
 pub struct Racer {
-    config: Arc<RouterConfig>,
+    config: Arc<Config>,
     catalogue: Arc<Catalogue>,
     health: Arc<HealthTable>,
     upstream: Upstream,
@@ -156,7 +166,7 @@ pub struct Racer {
 impl Racer {
     /// Builds a racer over the shared state.
     pub fn new(
-        config: Arc<RouterConfig>,
+        config: Arc<Config>,
         catalogue: Arc<Catalogue>,
         health: Arc<HealthTable>,
         upstream: Upstream,
@@ -193,9 +203,6 @@ impl Racer {
         // without touching the client's token.
         let race_cancel = cancel.child_token();
 
-        let width = self.config.race_width.max(1);
-        let copies = self.config.max_per_channel.max(1) as u32;
-
         let mut excluded: Excluded = HashSet::new();
         let mut attempts: u32 = 0;
         let mut last_error: Option<String> = None;
@@ -205,19 +212,15 @@ impl Racer {
         let mut held: Vec<PendingFailure> = Vec::new();
         let mut link_up = false;
 
-        let mut inflight = FuturesUnordered::new();
-        for channel in
-            crate::catalogue::query(&snapshot, &input.filter, &excluded, width, now_unix())
-        {
-            excluded.insert(channel.id);
-            attempts = attempts.saturating_add(copies);
-            inflight.push(self.run_trial(
-                channel,
-                Arc::clone(&input.outbound),
-                input.streaming,
-                race_cancel.child_token(),
-            ));
-        }
+        let mut inflight: Trials = Trials::new();
+        self.top_up(
+            &mut inflight,
+            &snapshot,
+            &input,
+            &mut excluded,
+            &mut attempts,
+            &race_cancel,
+        );
 
         if inflight.is_empty() {
             // The filter emptied the list before a single channel call. Nothing
@@ -300,7 +303,53 @@ impl Racer {
                         attempts,
                     };
                 }
-                TrialOutcome::WonStreaming(winner) => {
+                TrialOutcome::WonStreaming(ready) => {
+                    let picked = match self.config.router.hedge_strategy {
+                        // The first token wins outright, and the router is
+                        // committed to that channel from here.
+                        HedgeStrategy::Ttft => Some(ready),
+                        // Nothing goes to the client until the window closes.
+                        HedgeStrategy::Tps => {
+                            match self
+                                .stream_window(ready, &mut inflight, &mut held, &cancel)
+                                .await
+                            {
+                                WindowOutcome::Winner(winner) => Some(winner),
+                                WindowOutcome::AllBroke => None,
+                                WindowOutcome::ClientGone => {
+                                    race_cancel.cancel();
+                                    return RaceOutcome::ClientGone;
+                                }
+                            }
+                        }
+                    };
+                    let Some(picked) = picked else {
+                        // Every stream in the window broke before it closed.
+                        // Nothing reached the client, so this is no different
+                        // from a wave of failed trials: whatever is still in
+                        // flight carries the walk on, and an empty set falls
+                        // through to the exhausted check below.
+                        last_error =
+                            Some("every stream broke inside the decision window".to_string());
+                        // The dead channels are replaced here, which also
+                        // covers the trials that died inside the window: the
+                        // set goes back to N whatever the window cost it.
+                        self.top_up(
+                            &mut inflight,
+                            &snapshot,
+                            &input,
+                            &mut excluded,
+                            &mut attempts,
+                            &race_cancel,
+                        );
+                        if inflight.is_empty() {
+                            let outcome =
+                                exhausted(net_check.as_mut(), net_done, attempts, last_error).await;
+                            self.settle_held(&mut held, &outcome);
+                            return outcome;
+                        }
+                        continue;
+                    };
                     // Dropping the losing trials tears their sockets down; the
                     // winner's stream has already moved out of its trial.
                     race_cancel.cancel();
@@ -312,7 +361,23 @@ impl Racer {
                     hold_finished_failures(&mut inflight, &mut held);
                     // A channel streamed bytes, so the link is up.
                     self.apply_held(&mut held);
-                    return RaceOutcome::Streamed { winner, attempts };
+                    match self.winner_from(*picked) {
+                        Ok(winner) => {
+                            return RaceOutcome::Streamed {
+                                winner: Box::new(winner),
+                                attempts,
+                            }
+                        }
+                        // The decoder refused the stream. Everything else is
+                        // already cancelled, so the walk is over.
+                        Err(error) => {
+                            last_error = Some(error);
+                            let outcome =
+                                exhausted(net_check.as_mut(), net_done, attempts, last_error).await;
+                            self.settle_held(&mut held, &outcome);
+                            return outcome;
+                        }
+                    }
                 }
                 TrialOutcome::Cancelled => {}
                 TrialOutcome::Failed { error, pending } => {
@@ -329,29 +394,14 @@ impl Racer {
                     }
                     // Replace the failed channel at once. One finishes, one
                     // starts: a sliding window of N, not waves of N.
-                    if let Some(channel) =
-                        // The clock is read here, not at the start of the
-                        // request: a channel that came out of backoff while
-                        // this walk was running is eligible again.
-                        crate::catalogue::query(
-                            &snapshot,
-                            &input.filter,
-                            &excluded,
-                            1,
-                            now_unix(),
-                        )
-                        .first()
-                        .copied()
-                    {
-                        excluded.insert(channel.id);
-                        attempts = attempts.saturating_add(copies);
-                        inflight.push(self.run_trial(
-                            channel,
-                            Arc::clone(&input.outbound),
-                            input.streaming,
-                            race_cancel.child_token(),
-                        ));
-                    }
+                    self.top_up(
+                        &mut inflight,
+                        &snapshot,
+                        &input,
+                        &mut excluded,
+                        &mut attempts,
+                        &race_cancel,
+                    );
                 }
             }
 
@@ -360,6 +410,48 @@ impl Racer {
                 self.settle_held(&mut held, &outcome);
                 return outcome;
             }
+        }
+    }
+
+    /// Tops the trials in flight back up to `race_width`.
+    ///
+    /// Every path that loses a trial comes through here, so a stream that
+    /// broke pulls in untried channels exactly as a buffered failure does. A
+    /// query that comes back short leaves the set smaller, and an empty one
+    /// ends the walk at the caller's `inflight.is_empty()` check.
+    fn top_up<'a>(
+        &'a self,
+        inflight: &mut Trials<'a>,
+        snapshot: &'a [Channel],
+        input: &RaceInput,
+        excluded: &mut Excluded,
+        attempts: &mut u32,
+        cancel: &CancellationToken,
+    ) {
+        let copies = self.config.router.max_per_channel.max(1) as u32;
+        let wanted = self
+            .config
+            .router
+            .race_width
+            .max(1)
+            .saturating_sub(inflight.len());
+        if wanted == 0 {
+            return;
+        }
+        // The clock is read here, not at the start of the request: a channel
+        // that came out of backoff while this walk was running is eligible
+        // again.
+        for channel in
+            crate::catalogue::query(snapshot, &input.filter, excluded, wanted, now_unix())
+        {
+            excluded.insert(channel.id);
+            *attempts = attempts.saturating_add(copies);
+            inflight.push(Box::pin(self.run_trial(
+                channel,
+                Arc::clone(&input.outbound),
+                input.streaming,
+                cancel.child_token(),
+            )));
         }
     }
 
@@ -375,8 +467,8 @@ impl Racer {
         streaming: bool,
         cancel: CancellationToken,
     ) -> TrialOutcome<'a> {
-        let copies = self.config.max_per_channel.max(1);
-        let delay = Duration::from_millis(self.config.hedge_delay_ms);
+        let copies = self.config.router.max_per_channel.max(1);
+        let delay = Duration::from_millis(self.config.router.hedge_delay_ms);
         // Our own open copies, so a `429` can tell a sibling copy apart from
         // another client request hitting the same channel.
         let own = Arc::new(AtomicU32::new(0));
@@ -441,7 +533,10 @@ impl Racer {
                 // complete, so there is nothing a later copy could buy that
                 // waiting longer does not cost more of.
                 Some(Ok(win)) => return self.trial_won(channel, win),
-                Some(Err(failure)) => failures.push(failure),
+                Some(Err(failure)) => {
+                    note_failure(channel, &failure);
+                    failures.push(failure);
+                }
                 None => break,
             }
         }
@@ -462,6 +557,40 @@ impl Racer {
                 retry_after_secs,
             }),
         }
+    }
+
+    /// The `tps` decision window.
+    ///
+    /// `first` is the stream that produced the first token anywhere, so `t0`
+    /// is now. Every live stream is buffered for `hedge_window_ms` and nothing
+    /// reaches the client, because sending a token would commit the router to
+    /// a channel it has not finished judging. At the close of the window the
+    /// fastest stream wins and the caller cancels the rest.
+    ///
+    /// Trials that fail inside the window still owe their health move, so they
+    /// are held like any other failure.
+    async fn stream_window<'a, F>(
+        &self,
+        first: Box<ReadyStream>,
+        inflight: &mut FuturesUnordered<F>,
+        held: &mut Vec<PendingFailure<'a>>,
+        cancel: &CancellationToken,
+    ) -> WindowOutcome
+    where
+        F: std::future::Future<Output = TrialOutcome<'a>>,
+    {
+        let window = Duration::from_millis(self.config.router.hedge_window_ms);
+        watch_window(first, inflight, held, cancel, window).await
+    }
+
+    /// Turns the picked stream into the winner the server forwards, with the
+    /// stall timer and the mid-stream death rule attached.
+    fn winner_from(&self, ready: ReadyStream) -> Result<StreamWinner, String> {
+        ready.into_winner(
+            self.config.router.stream_stall_timeout,
+            Arc::clone(&self.health),
+            Arc::clone(&self.catalogue),
+        )
     }
 
     /// Writes every health move held back while the link state was unknown.
@@ -580,7 +709,7 @@ impl Racer {
         // stream ends, not when its first frame arrives.
         let open = InFlight::open(channel, own);
         channel.telemetry.calls.fetch_add(1, Ordering::Relaxed);
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
 
         let call = match self.upstream.call_streamed(channel, body).await {
             Ok(call) => call,
@@ -603,38 +732,59 @@ impl Racer {
             });
         }
 
+        let mut rest = call.body;
+
         if !(200..300).contains(&call.status) {
             channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .record_attempt(channel.id, AttemptOutcome::HttpError);
+            // A bare "status 429" tells an operator nothing about which of a
+            // provider's half dozen 429s this was. The body does, and on this
+            // path it arrives as a stream rather than as bytes, so it has to
+            // be read back before the failure is reported.
+            let body = read_error_body(&mut rest).await;
             return Err(CopyFailure {
-                error: format!("status {}", call.status),
+                error: failure_reason(call.status, &body),
                 retry_after_secs: call.retry_after_secs,
                 self_inflicted: false,
             });
         }
 
-        let mut rest = call.body;
-
-        let buffered = match read_stream_start(&mut rest).await {
-            Ok(start) => start,
-            Err(failure) => {
-                channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .record_attempt(channel.id, AttemptOutcome::HttpError);
-                let (error, retry_after_secs) = match failure {
-                    // The stream died before anything reached the client, so
-                    // this is an ordinary failed trial and the walk carries on.
-                    StreamStartError::Transport(error) => (error, None),
-                    StreamStartError::NotAnAnswer(error) => (error, call.retry_after_secs),
-                };
-                return Err(CopyFailure {
-                    error,
-                    retry_after_secs,
-                    self_inflicted: false,
-                });
-            }
-        };
+        let (buffered, counter) =
+            // The prefill deadline, not `stream_stall_timeout`. That one is
+            // the gap allowed *between* tokens; prefill is not a gap. A 1M
+            // token prompt at 1,000 tok/s is 16.7 minutes of silence before
+            // the first token, and judging it against a 60 second stall timer
+            // fails every long prompt. `request_timeout` already bounds the
+            // channel call, so it is the right ceiling here.
+            match read_stream_start(&mut rest, self.config.router.request_timeout).await {
+                Ok(start) => start,
+                Err(failure) => {
+                    channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
+                    let (outcome, error, retry_after_secs) = match failure {
+                        // A prefill deadline is a timeout, not a bad key. The
+                        // operator reads `http_error` as a dead channel, so a
+                        // provider that is merely slow must not land there.
+                        StreamStartError::Timeout(error) => {
+                            (AttemptOutcome::Timeout, error, None)
+                        }
+                        // The stream died before anything reached the client, so
+                        // this is an ordinary failed trial and the walk carries on.
+                        StreamStartError::Transport(error) => {
+                            (AttemptOutcome::HttpError, error, None)
+                        }
+                        StreamStartError::NotAnAnswer(error) => {
+                            (AttemptOutcome::HttpError, error, call.retry_after_secs)
+                        }
+                    };
+                    self.metrics.record_attempt(channel.id, outcome);
+                    return Err(CopyFailure {
+                        error,
+                        retry_after_secs,
+                        self_inflicted: false,
+                    });
+                }
+            };
 
         self.metrics
             .record_attempt(channel.id, AttemptOutcome::Success);
@@ -645,6 +795,10 @@ impl Racer {
             intelligence: channel.intelligence,
             wire: channel.wire,
             buffered,
+            counter,
+            content_at: tokio::time::Instant::now(),
+            broken: false,
+            finished_at: None,
             elapsed: started.elapsed(),
             rest,
             open,
@@ -657,14 +811,9 @@ impl Racer {
         self.apply_success(channel);
         match win {
             CopyWin::Buffered(winner) => TrialOutcome::Won(winner),
-            CopyWin::Streamed(ready) => match ready.into_winner() {
-                Ok(winner) => TrialOutcome::WonStreaming(Box::new(winner)),
-                // The channel answered, so its backoff stays where it is.
-                Err(error) => TrialOutcome::Failed {
-                    error,
-                    pending: None,
-                },
-            },
+            // The stream is handed over as it stands. Which strategy judges it,
+            // and when it is decoded, is the walk's business, not the trial's.
+            CopyWin::Streamed(ready) => TrialOutcome::WonStreaming(ready),
         }
     }
 
@@ -711,6 +860,27 @@ impl Racer {
             .store(self.health.retry_base_secs(), Ordering::Relaxed);
         channel.health.eligible_at.store(0, Ordering::Relaxed);
     }
+}
+
+/// Logs one failed copy.
+///
+/// A trial reduces M copies to a single reason, so without this the two that
+/// failed for different causes are indistinguishable afterwards and only the
+/// last one's message survives into the `504`.
+///
+/// `key_id` is the label from `providers.yml`, not the secret: no key material
+/// goes anywhere near a log line.
+fn note_failure(channel: &Channel, failure: &CopyFailure) {
+    tracing::debug!(
+        channel = %channel.id,
+        provider = %channel.provider,
+        model = %channel.model_id,
+        key_id = %channel.key_id,
+        self_inflicted = failure.self_inflicted,
+        retry_after_secs = failure.retry_after_secs,
+        error = %failure.error,
+        "channel call copy failed"
+    );
 }
 
 /// The health key for the provider/key pair a channel belongs to.
@@ -840,8 +1010,9 @@ pub struct PendingFailure<'a> {
 pub enum TrialOutcome<'a> {
     /// At least one copy returned 2xx with content.
     Won(Box<Winner>),
-    /// At least one copy started streaming successfully.
-    WonStreaming(Box<StreamWinner>),
+    /// At least one copy started streaming successfully. It has produced
+    /// content and nothing more: whether it wins is the walk's decision.
+    WonStreaming(Box<ReadyStream>),
     /// Every copy failed.
     Failed {
         /// The last error seen, for the `504` body.
@@ -879,6 +1050,8 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, CallError>> + Send +
 
 /// Why a stream's opening did not count as a win.
 enum StreamStartError {
+    /// No first token arrived inside the prefill budget.
+    Timeout(String),
     /// The byte stream failed partway through the read.
     Transport(String),
     /// A 2xx that carried no answer: nothing but comments and keep-alives, or
@@ -894,13 +1067,33 @@ enum StreamStartError {
 /// keep-alive comment or an error object all come back sooner than a real
 /// first token, so counting bytes would hand the race to whichever channel was
 /// quickest to say nothing.
-async fn read_stream_start(rest: &mut ByteStream) -> Result<Vec<Vec<u8>>, StreamStartError> {
+///
+/// `first_token` is the whole prefill budget, not a per-chunk gap. The
+/// channel has that long to get from the request to its first token; a
+/// channel that has not managed it by then has failed, and because nothing
+/// has reached the client yet it is an ordinary failed trial and the walk
+/// carries on without it. `stream_stall_timeout` governs the gaps after this,
+/// once the stream is running, and is applied by [`watch_for_stalls`].
+async fn read_stream_start(
+    rest: &mut ByteStream,
+    first_token: Duration,
+) -> Result<(Vec<Vec<u8>>, FrameCounter), StreamStartError> {
     let mut buffered: Vec<Vec<u8>> = Vec::new();
     let mut sse: Vec<u8> = Vec::new();
     let mut content = false;
+    let deadline = tokio::time::Instant::now() + first_token;
 
     loop {
-        match rest.next().await {
+        let next = match tokio::time::timeout_at(deadline, rest.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(StreamStartError::Timeout(format!(
+                    "no first token in {}s",
+                    first_token.as_secs()
+                )))
+            }
+        };
+        match next {
             Some(Ok(chunk)) => {
                 if chunk.is_empty() {
                     continue;
@@ -934,12 +1127,354 @@ async fn read_stream_start(rest: &mut ByteStream) -> Result<Vec<Vec<u8>>, Stream
             "stream carried no content".to_string(),
         ));
     }
-    Ok(buffered)
+    // The opening already holds tokens, so the count starts from what was read
+    // rather than from the next chunk.
+    let mut counter = FrameCounter::default();
+    counter.feed(&sse);
+    Ok((buffered, counter))
+}
+
+/// How much of a failed streamed call's body is read back for the reason, and
+/// how long that read may wait. The body is an error, not an answer, so a few
+/// kilobytes carry every message any provider sends; and a provider that opens
+/// a stream and then goes quiet must not hold the walk up behind it.
+const ERROR_BODY_BYTES: usize = 8 * 1024;
+const ERROR_BODY_WAIT: Duration = Duration::from_secs(2);
+
+/// Reads the opening of a failed streamed call's body, so the reason carries
+/// the provider's own message rather than a bare status code.
+///
+/// Both caps are deliberate. Whatever has arrived when either runs out is what
+/// gets reported, and nothing arriving at all simply gives the status on its
+/// own, which is what this path did before.
+async fn read_error_body(rest: &mut ByteStream) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + ERROR_BODY_WAIT;
+    let mut body: Vec<u8> = Vec::new();
+    while body.len() < ERROR_BODY_BYTES {
+        match tokio::time::timeout_at(deadline, rest.next()).await {
+            Ok(Some(Ok(chunk))) => body.extend_from_slice(&chunk),
+            // End of stream, a transport error, or the wait ran out.
+            _ => break,
+        }
+    }
+    body.truncate(ERROR_BODY_BYTES);
+    body
+}
+
+/// Counts the content-bearing `data:` frames a stream has produced, across
+/// chunk boundaries.
+///
+/// One content frame is one token: every provider here sends a delta per
+/// token. Counting frames is therefore the tokens-per-second measure, with no
+/// tokeniser and without decoding the stream twice.
+#[derive(Default)]
+struct FrameCounter {
+    /// Whatever the last chunk left after its final newline. A half-read frame
+    /// is counted when the rest of it arrives, never twice and never early.
+    tail: Vec<u8>,
+    /// Content frames seen so far.
+    frames: u32,
+}
+
+impl FrameCounter {
+    /// Takes the next raw chunk off the wire.
+    fn feed(&mut self, chunk: &[u8]) {
+        self.tail.extend_from_slice(chunk);
+        let Some(end) = self.tail.iter().rposition(|b| *b == b'\n') else {
+            return;
+        };
+        let whole: Vec<u8> = self.tail.drain(..=end).collect();
+        for line in whole.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            // ponytail: one copy and one JSON parse per frame, because the
+            // verdict reader works on bytes. It is the same reader the race
+            // uses to decide a stream is an answer, so a keep-alive comment
+            // and an error frame are not counted as tokens here either. Give
+            // `health` a line-level entry point if this ever shows up in a
+            // profile.
+            let mut line = line.to_vec();
+            line.push(b'\n');
+            if crate::health::stream_verdict(&line) == StreamVerdict::Content {
+                self.frames = self.frames.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// The body of the `tps` decision window, with nothing from the racer in it.
+///
+/// `first` is the stream that produced the first token anywhere, so `t0` is
+/// now and the window runs for `window` from here. Every live stream is
+/// buffered and nothing reaches the client. Trials that fail inside the window
+/// still owe their health move, so they are held like any other failure.
+async fn watch_window<'a, F>(
+    first: Box<ReadyStream>,
+    inflight: &mut FuturesUnordered<F>,
+    held: &mut Vec<PendingFailure<'a>>,
+    cancel: &CancellationToken,
+    window: Duration,
+) -> WindowOutcome
+where
+    F: std::future::Future<Output = TrialOutcome<'a>>,
+{
+    let deadline = tokio::time::Instant::now() + window;
+
+    let mut pumping = FuturesUnordered::new();
+    pumping.push(pump_until(*first, deadline));
+    let mut done: Vec<ReadyStream> = Vec::new();
+
+    // The window closes on its own, whatever the trials are doing. Without
+    // a timer of its own the walk would sit waiting on a channel still in
+    // prefill long after the second was up.
+    let window_closed = tokio::time::sleep_until(deadline);
+    tokio::pin!(window_closed);
+    let mut closed = false;
+
+    loop {
+        // Everything that was going to be buffered is buffered, and either
+        // the window is up or there is nothing left that could join it.
+        if pumping.is_empty() && (closed || inflight.is_empty()) {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = cancel.cancelled() => return WindowOutcome::ClientGone,
+
+            _ = &mut window_closed, if !closed => closed = true,
+
+            // No top-up inside the window: a channel started with under a
+            // second to run cannot plausibly out-token one already
+            // mid-answer. A trial that dies in here shrinks the set only
+            // until the window closes, because the caller tops back up to
+            // N before the walk goes on.
+            Some(outcome) = inflight.next(), if !inflight.is_empty() && !closed => {
+                match outcome {
+                    // A second channel got through prefill inside the
+                    // window, so it is judged alongside the first.
+                    TrialOutcome::WonStreaming(ready) => {
+                        pumping.push(pump_until(*ready, deadline));
+                    }
+                    TrialOutcome::Failed { pending: Some(pending), .. } => held.push(pending),
+                    // A channel answering proves the link is up whatever
+                    // the network test is still doing, and every trial in
+                    // a streamed walk streams, so a buffered reply cannot
+                    // reach here.
+                    _ => {}
+                }
+            }
+
+            Some(ready) = pumping.next() => done.push(ready),
+        }
+    }
+
+    match pick_fastest(done, window) {
+        Some(winner) => WindowOutcome::Winner(Box::new(winner)),
+        None => WindowOutcome::AllBroke,
+    }
+}
+
+/// How the `tps` decision window ended.
+enum WindowOutcome {
+    /// The fastest stream of the ones still live at the close of the window.
+    Winner(Box<ReadyStream>),
+    /// Every candidate broke before the window closed. Nothing reached the
+    /// client, so the walk carries on.
+    AllBroke,
+    /// The client hung up mid-window.
+    ClientGone,
+}
+
+/// Buffers everything `ready` produces until `deadline`, counting its tokens.
+///
+/// Nothing goes to the client while this runs. That is the whole point of
+/// `tps`: forwarding the first token would commit the router to a channel it
+/// has not finished judging.
+async fn pump_until(mut ready: ReadyStream, deadline: tokio::time::Instant) -> ReadyStream {
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return ready,
+            next = ready.rest.next() => match next {
+                Some(Ok(chunk)) => {
+                    ready.counter.feed(&chunk);
+                    ready.buffered.push(chunk);
+                }
+                // A stream that finished inside the window is a fast stream,
+                // and what it produced still counts. It is timed to here, not
+                // to the close of the window.
+                None => {
+                    ready.finished_at = Some(tokio::time::Instant::now());
+                    return ready;
+                }
+                // A stream that broke inside the window cannot win. Nothing
+                // reached the client, so it simply drops out.
+                Some(Err(_)) => {
+                    ready.broken = true;
+                    return ready;
+                }
+            },
+        }
+    }
+}
+
+/// The fastest stream still live at the close of the window.
+///
+/// `None` means every candidate broke. Equal speeds keep the first candidate,
+/// which is the one that was pumped longest, so a dead heat falls back to time
+/// to first token rather than a coin toss.
+fn pick_fastest(candidates: Vec<ReadyStream>, window: Duration) -> Option<ReadyStream> {
+    let now = tokio::time::Instant::now();
+    // A stream that got through prefill with 20ms of the window left has sent
+    // one token over 20ms, which reads as 50 tok/s off a sample of one. Half
+    // the window is the shortest stretch that says anything, so anything
+    // shorter is judged as if it had run that long. A genuinely fast late
+    // arrival still wins on the next request, when it starts the window.
+    let floor = (window / 2).max(Duration::from_millis(1));
+    candidates
+        .into_iter()
+        .filter(|candidate| !candidate.broken)
+        .fold(None, |best: Option<ReadyStream>, next| match best {
+            Some(best)
+                if best.tokens_per_second(now, floor) >= next.tokens_per_second(now, floor) =>
+            {
+                Some(best)
+            }
+            _ => Some(next),
+        })
+}
+
+/// How long a finished answer's socket is given after its terminal event
+/// before the stream ends itself.
+///
+/// The decoder keeps reading bytes past the terminal event, because a provider
+/// may still send a trailing frame: OpenAI's usage chunk arrives after
+/// `finish_reason`. Anthropic sends nothing after `message_stop`, so for that
+/// wire this is simply how long the router waits on a provider holding the
+/// body open for connection reuse.
+const TAIL_GRACE: Duration = Duration::from_secs(1);
+
+/// Puts the stall timer on a winning stream and reports the first failure.
+///
+/// No token for `stall` means the channel failed, and so does a transport
+/// error. Either way the client already holds part of this answer, so the
+/// stream ends here: `on_death` records the failure and nothing is spliced on
+/// behind it.
+///
+/// A token resets the timer, not a byte. A keep-alive comment such as
+/// OpenRouter's `: OPENROUTER PROCESSING` carries no token, so it holds the
+/// socket open without holding a dead channel open. The content verdict is the
+/// one the race already uses before a winner is picked: `FrameCounter` over
+/// `health::stream_verdict`.
+fn watch_for_stalls<S>(
+    bytes: S,
+    stall: Duration,
+    on_death: DeathHook,
+    finished: Arc<AtomicBool>,
+) -> impl Stream<Item = Result<Vec<u8>, wire::WireError>> + Send
+where
+    S: Stream<Item = Result<Vec<u8>, CallError>> + Send + 'static,
+{
+    async_stream::stream! {
+        futures::pin_mut!(bytes);
+        let mut counter = FrameCounter::default();
+        let mut deadline = tokio::time::Instant::now() + stall;
+        loop {
+            // The deadline moves with the last token, so each wait is for the
+            // time the channel has left, not a fresh `stall` per chunk. Once
+            // the answer is complete the wait shortens to the tail grace: all
+            // that is still owed is a trailing frame such as OpenAI's usage
+            // chunk, and the socket itself may linger as long as the provider
+            // likes.
+            let complete = finished.load(Ordering::Relaxed);
+            let wait_until = if complete {
+                deadline.min(tokio::time::Instant::now() + TAIL_GRACE)
+            } else {
+                deadline
+            };
+            match tokio::time::timeout_at(wait_until, bytes.next()).await {
+                // A complete answer on an open socket has not failed and is
+                // not waiting for a token, so the stream ends here: no failure
+                // written, no error sent to the client.
+                Err(_) if complete => return,
+                Err(_) => {
+                    on_death.fire();
+                    yield Err(wire::WireError::Stream(format!(
+                        "no token for {}s",
+                        stall.as_secs()
+                    )));
+                    return;
+                }
+                Ok(None) => return,
+                Ok(Some(Err(error))) => {
+                    on_death.fire();
+                    yield Err(wire::WireError::Stream(error.to_string()));
+                    return;
+                }
+                Ok(Some(Ok(chunk))) => {
+                    let before = counter.frames;
+                    counter.feed(&chunk);
+                    if counter.frames != before {
+                        deadline = tokio::time::Instant::now() + stall;
+                    }
+                    yield Ok(chunk);
+                }
+            }
+        }
+    }
+}
+
+/// The health move a dying stream owes, due once however many ways it dies.
+///
+/// A stream can die in two places: the byte stream errors or stalls, or the
+/// decoder reaches the end of a body that was cut part way through an answer.
+/// A truncated body closes cleanly, so only the decoder sees it. Both owe the
+/// same move and only the first counts, so the flag is shared rather than held
+/// by either watcher.
+#[derive(Clone)]
+struct DeathHook(Arc<Death>);
+
+struct Death {
+    fired: AtomicBool,
+    act: Box<dyn Fn() + Send + Sync>,
+}
+
+impl DeathHook {
+    fn new(act: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(Death {
+            fired: AtomicBool::new(false),
+            act: Box::new(act),
+        }))
+    }
+
+    fn fire(&self) {
+        if !self.0.fired.swap(true, Ordering::Relaxed) {
+            (self.0.act)();
+        }
+    }
+}
+
+/// Marks a channel whose stream died mid-answer, so it backs off like any
+/// other failure.
+///
+/// The channel is found again in the current snapshot rather than carried into
+/// the stream: the stream outlives the walk that started it, and the catalogue
+/// may have been rebuilt underneath in the meantime. A channel that is gone
+/// from the list has nothing left to back off.
+fn fail_mid_stream(health: &HealthTable, catalogue: &Catalogue, id: ChannelId) {
+    let snapshot = catalogue.snapshot();
+    if let Some(channel) = snapshot.iter().find(|channel| channel.id == id) {
+        write_failure(health, &snapshot, channel, None);
+    }
 }
 
 /// A streamed copy that has produced content, with whatever was read before
 /// it showed.
-struct ReadyStream {
+pub struct ReadyStream {
     channel_id: ChannelId,
     provider: String,
     model_id: String,
@@ -947,6 +1482,19 @@ struct ReadyStream {
     wire: crate::config::WireName,
     /// Everything read before the decision, replayed ahead of the rest.
     buffered: Vec<Vec<u8>>,
+    /// Tokens seen so far, which is how `tps` compares streams.
+    counter: FrameCounter,
+    /// When this stream produced its first token. Streams enter the window at
+    /// different moments, so each one's speed is measured over its own time
+    /// alive, not over the whole window.
+    content_at: tokio::time::Instant,
+    /// The stream failed inside the decision window, so it cannot win.
+    broken: bool,
+    /// When this stream stopped producing, if it stopped before the window
+    /// closed. A stream that finished early is not idle for the remainder of
+    /// the window: measuring it to the close would charge it for time it was
+    /// never given, and hand the window to a slower stream still running.
+    finished_at: Option<tokio::time::Instant>,
     elapsed: Duration,
     rest: Pin<Box<dyn Stream<Item = Result<Vec<u8>, CallError>> + Send + 'static>>,
     /// Holds the channel's in-flight count up until this stream is finished or
@@ -956,19 +1504,56 @@ struct ReadyStream {
 }
 
 impl ReadyStream {
+    /// This stream's tokens per second, over its own time alive.
+    ///
+    /// `floor` is the shortest stretch the caller will judge on, so a stream
+    /// that joined the window at the last moment cannot win it on a sample of
+    /// one token.
+    fn tokens_per_second(&self, now: tokio::time::Instant, floor: Duration) -> f64 {
+        // A stream that ended early is timed to its end, not to now: it was
+        // not idle afterwards, it was done.
+        let end = self.finished_at.unwrap_or(now);
+        let alive = end.saturating_duration_since(self.content_at).max(floor);
+        f64::from(self.counter.frames) / alive.as_secs_f64()
+    }
+
     /// Replays what was buffered, then the rest of the live stream, through the
     /// neutral decoder.
-    fn into_winner(self) -> Result<StreamWinner, String> {
+    ///
+    /// The stall timer rides on the stream itself, because this is the one
+    /// place every winning stream passes through. Once a chunk has gone to the
+    /// client the router is committed: a stall or a mid-stream error ends the
+    /// client request and backs the channel off, and no other channel is ever
+    /// spliced on.
+    fn into_winner(
+        self,
+        stall: Duration,
+        health: Arc<HealthTable>,
+        catalogue: Arc<Catalogue>,
+    ) -> Result<StreamWinner, String> {
         let open = self.open;
+        let channel_id = self.channel_id;
         let replayed = futures::stream::iter(self.buffered.into_iter().map(Ok)).chain(self.rest);
-        let bytes = replayed.map(move |item| {
+        let hook = DeathHook::new(move || fail_mid_stream(&health, &catalogue, channel_id));
+        let decoded = hook.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let complete = Arc::clone(&finished);
+        let bytes = watch_for_stalls(replayed, stall, hook, finished).map(move |item| {
             // The closure owns the guard, so it lives exactly as long as the
             // stream the client is reading.
             let _open = &open;
-            item.map_err(|e| wire::WireError::Stream(e.to_string()))
+            item
         });
+        // The decoder sits downstream of the stall watcher, and a body cut
+        // part way through an answer only fails there, so the same move is
+        // hooked on both.
         let chunks = wire::decode_stream(bytes, wire::format_for_provider(self.wire))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            // The terminal event only exists once the bytes are decoded, so
+            // the news that the answer is over travels back up to the stall
+            // timer from here.
+            .on_terminal(move || complete.store(true, Ordering::Relaxed))
+            .on_error(move || decoded.fire());
         Ok(StreamWinner {
             channel_id: self.channel_id,
             provider: self.provider,
@@ -1069,6 +1654,11 @@ pub fn best_for_cache<'a>(winner: &'a Winner, also_finished: &'a [Winner]) -> &'
         }
     })
 }
+
+/// The trials in flight. The futures are boxed so the top-up is one helper
+/// rather than a copy of the same push on every path that loses a trial.
+type Trials<'a> =
+    FuturesUnordered<Pin<Box<dyn std::future::Future<Output = TrialOutcome<'a>> + Send + 'a>>>;
 
 /// The ids already tried, which the next query excludes. Ids are hashes, not
 /// indices, so the set still works after the catalogue is rebuilt underneath.
@@ -1179,6 +1769,7 @@ mod tests {
             modalities_input: vec!["text".to_string()],
             intelligence: 100,
             intelligence_rank: 0,
+            created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
         }
@@ -1207,14 +1798,9 @@ mod tests {
     }
 
     /// A health table over a throwaway redb file. Removed on drop.
-    fn health_table() -> (HealthTable, std::path::PathBuf) {
-        use std::sync::atomic::AtomicU64;
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("llmrouter-race-test-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = redb::Database::create(dir.join("health.redb")).unwrap();
+    fn health_table() -> (HealthTable, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("a throwaway directory");
+        let db = redb::Database::create(dir.path().join("health.redb")).unwrap();
         let table = HealthTable::open(
             std::sync::Arc::new(db),
             Duration::from_secs(1),
@@ -1308,7 +1894,7 @@ mod tests {
     /// re-probes it and its model list is never refreshed.
     #[test]
     fn the_last_channel_on_a_pair_takes_the_pair_and_the_provider_down() {
-        let (health, dir) = health_table();
+        let (health, _dir) = health_table();
         let now = 1_000_000u64;
         let channels = vec![
             row("openrouter", "key-0", "model-a"),
@@ -1337,15 +1923,13 @@ mod tests {
         escalate_failure(&health, &channels, &channels[2], None, now);
         assert!(is_unhealthy(&health, &pair_one));
         assert!(is_unhealthy(&health, &provider));
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A pair already with the poller must not have its re-probe pushed out by
     /// every later channel failure on the same pair.
     #[test]
     fn a_pair_already_unhealthy_is_not_backed_off_again() {
-        let (health, dir) = health_table();
+        let (health, _dir) = health_table();
         let now = 1_000_000u64;
         let channels = vec![row("groq", "key-0", "model-a")];
         let pair = pair_key(&channels[0]);
@@ -1357,8 +1941,6 @@ mod tests {
         fail_channel(&health, &channels[0], now);
         escalate_failure(&health, &channels, &channels[0], None, now);
         assert_eq!(health.get(&pair).expect("pair still marked"), first);
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A local outage must not cost the channels anything. Every trial fired
@@ -1366,7 +1948,7 @@ mod tests {
     /// sit in a backoff caused by a fault that was never theirs.
     #[test]
     fn a_dead_link_drops_every_held_failure() {
-        let (health, dir) = health_table();
+        let (health, _dir) = health_table();
         let channels = vec![
             row("openrouter", "key-0", "model-a"),
             row("openrouter", "key-0", "model-b"),
@@ -1390,15 +1972,13 @@ mod tests {
         // The pair must not follow them down either, or the poller starts
         // re-probing a key that never failed.
         assert!(!is_unhealthy(&health, &pair_key(&channels[0])));
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The same failures with the link up are the channels' own, so they are
     /// written the moment the network test says so.
     #[test]
     fn a_live_link_writes_every_held_failure() {
-        let (health, dir) = health_table();
+        let (health, _dir) = health_table();
         let channels = vec![row("openrouter", "key-0", "model-a")];
         let mut held = vec![PendingFailure {
             channel: &channels[0],
@@ -1410,8 +1990,6 @@ mod tests {
         assert!(held.is_empty());
         assert_eq!(channels[0].health.retry_counter.load(Ordering::Relaxed), 1);
         assert!(channels[0].health.eligible_at.load(Ordering::Relaxed) > 0);
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn winner(intelligence: u16, model: &str) -> Winner {
@@ -1424,6 +2002,12 @@ mod tests {
             latency: Duration::from_millis(1),
         }
     }
+
+    /// `stream_stall_timeout`, the design's default.
+    const STALL: Duration = Duration::from_secs(60);
+
+    /// `hedge_window_ms`, the design's default.
+    const WINDOW: Duration = Duration::from_millis(1000);
 
     /// A channel's opening bytes, as a stream the reader can consume.
     fn sse_stream(frames: &[&str]) -> ByteStream {
@@ -1438,7 +2022,7 @@ mod tests {
     #[tokio::test]
     async fn an_sse_comment_alone_does_not_win() {
         let mut rest = sse_stream(&[": OPENROUTER PROCESSING\n\n"]);
-        let outcome = read_stream_start(&mut rest).await;
+        let outcome = read_stream_start(&mut rest, STALL).await;
         assert!(matches!(outcome, Err(StreamStartError::NotAnAnswer(_))));
     }
 
@@ -1450,10 +2034,30 @@ mod tests {
             ": OPENROUTER PROCESSING\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
         ]);
-        let Ok(buffered) = read_stream_start(&mut rest).await else {
+        let Ok((buffered, counter)) = read_stream_start(&mut rest, STALL).await else {
             panic!("a content frame should win");
         };
         assert_eq!(buffered.len(), 2);
+        // The comment is not a token; the delta is. The tps comparison starts
+        // from what the opening already carried.
+        assert_eq!(counter.frames, 1);
+    }
+
+    /// A channel that opens a stream and then says nothing has failed. Nothing
+    /// has reached the client, so it is an ordinary failed trial and the walk
+    /// carries on without it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_with_no_first_token_inside_the_prefill_budget_drops_out() {
+        let opening: ByteStream = Box::pin(
+            futures::stream::iter(vec![Ok(b": OPENROUTER PROCESSING\n\n".to_vec())])
+                .chain(futures::stream::pending()),
+        );
+        let mut rest = opening;
+        let outcome = read_stream_start(&mut rest, STALL).await;
+        match outcome {
+            Err(StreamStartError::Timeout(error)) => assert!(error.contains("no first token")),
+            _ => panic!("a stalled opening is a failed trial"),
+        }
     }
 
     /// Groq and OpenRouter both answer a streamed request with HTTP 200 and a
@@ -1463,7 +2067,7 @@ mod tests {
     async fn an_error_frame_in_a_two_hundred_does_not_win() {
         let mut rest =
             sse_stream(&["data: {\"error\":{\"code\":429,\"message\":\"rate limited\"}}\n\n"]);
-        let outcome = read_stream_start(&mut rest).await;
+        let outcome = read_stream_start(&mut rest, STALL).await;
         assert!(matches!(outcome, Err(StreamStartError::NotAnAnswer(_))));
     }
 
@@ -1474,33 +2078,560 @@ mod tests {
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n",
             "event: ping\ndata: {\"type\":\"ping\"}\n\n",
         ]);
-        let outcome = read_stream_start(&mut rest).await;
+        let outcome = read_stream_start(&mut rest, STALL).await;
         assert!(matches!(outcome, Err(StreamStartError::NotAnAnswer(_))));
     }
 
-    fn ready(elapsed_ms: u64) -> CopyWin {
-        CopyWin::Streamed(Box::new(ReadyStream {
-            channel_id: ChannelId(1),
+    /// Prefill is not a gap between tokens. A 1M token prompt is 16.7 minutes
+    /// of silence before the first token, so judging the opening of a stream
+    /// against `stream_stall_timeout` failed every long prompt on a channel
+    /// that was working perfectly well.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_token_gets_the_prefill_budget_not_the_stall_timer() {
+        let mut rest: ByteStream = Box::pin(async_stream::stream! {
+            tokio::time::sleep(STALL * 3).await;
+            yield Ok(token("hello"));
+        });
+        let outcome = read_stream_start(&mut rest, STALL * 10).await;
+        assert!(
+            outcome.is_ok(),
+            "a channel still in prefill has not stalled"
+        );
+    }
+
+    /// The prefill budget is one deadline over the whole opening, not a gap
+    /// allowed between chunks. OpenRouter sends `: OPENROUTER PROCESSING`
+    /// while it waits on the provider, and against a per-chunk timer those
+    /// comments reset the clock for ever: the trial never failed and never
+    /// produced an answer, and the walk sat behind it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_of_keepalives_still_runs_out_of_prefill_budget() {
+        let mut rest: ByteStream = Box::pin(async_stream::stream! {
+            loop {
+                tokio::time::sleep(STALL / 2).await;
+                yield Ok(b": OPENROUTER PROCESSING\n\n".to_vec());
+            }
+        });
+        let outcome = read_stream_start(&mut rest, STALL).await;
+        assert!(matches!(outcome, Err(StreamStartError::Timeout(_))));
+    }
+
+    /// The same stream against a prefill budget it genuinely misses is an
+    /// ordinary failed trial, so the deadline is still a deadline. It is a
+    /// timeout: `router_attempts_total{outcome="http_error"}` means a dead
+    /// key, and a provider sitting on a full GPU queue is not that.
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_that_misses_the_prefill_budget_fails_the_trial() {
+        let mut rest: ByteStream = Box::pin(futures::stream::pending());
+        let outcome = read_stream_start(&mut rest, STALL).await;
+        assert!(matches!(outcome, Err(StreamStartError::Timeout(_))));
+    }
+
+    /// A streamed call that comes back non-2xx carries the provider's own
+    /// message in its body. Reporting "status 429" alone hands an operator a
+    /// number and no reason, which is the fault the buffered path was already
+    /// fixed for.
+    #[tokio::test]
+    async fn a_failed_streamed_call_reports_the_providers_message() {
+        let mut rest: ByteStream = Box::pin(futures::stream::iter(vec![Ok(
+            br#"{"error":{"message":"insufficient quota"}}"#.to_vec(),
+        )]));
+        let read = read_error_body(&mut rest).await;
+        assert_eq!(
+            failure_reason(429, &read),
+            "status 429: insufficient quota".to_string()
+        );
+    }
+
+    /// A provider that opens a stream and then goes quiet must not hold the
+    /// walk up behind it, and an endless body must not be read whole.
+    #[tokio::test(start_paused = true)]
+    async fn the_error_body_read_is_capped_on_both_bytes_and_time() {
+        let mut rest: ByteStream = Box::pin(futures::stream::repeat_with(|| Ok(vec![b'x'; 1024])));
+        assert_eq!(read_error_body(&mut rest).await.len(), ERROR_BODY_BYTES);
+
+        let mut rest: ByteStream = Box::pin(futures::stream::pending());
+        let started = tokio::time::Instant::now();
+        assert!(read_error_body(&mut rest).await.is_empty());
+        assert!(started.elapsed() <= ERROR_BODY_WAIT);
+    }
+
+    /// A stream that finished inside the window was not idle for the rest of
+    /// it. Timing it to the close of the window charges it for time it was
+    /// never given and hands the race to a slower stream still running.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_stream_is_timed_to_when_it_finished() {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        // Thirty tokens over 600ms, then done: 50 tok/s.
+        let quick: ByteStream = Box::pin(async_stream::stream! {
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                yield Ok(token("x"));
+            }
+        });
+        // One token every 25ms for the whole window: 40 tok/s.
+        let steady = ticking(Duration::from_millis(25));
+
+        let (quick, steady) = tokio::join!(
+            pump_until(ready_with(1, 10, quick), deadline),
+            pump_until(ready_with(2, 10, steady), deadline),
+        );
+        // The one that sent fewer tokens sent them faster, which is the whole
+        // difference between the two ways of timing it.
+        assert!(quick.counter.frames < steady.counter.frames);
+
+        let winner = pick_fastest(vec![quick, steady], WINDOW).expect("a live stream wins");
+        assert_eq!(
+            winner.channel_id,
+            ChannelId(1),
+            "the finished stream was the faster one while it ran"
+        );
+    }
+
+    /// A channel that gets through prefill with a sliver of the window left
+    /// has sent one token over 20ms. That reads as 50 tok/s off a sample of
+    /// one, and without a floor it beats a stream measured over the full
+    /// second.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_arrival_cannot_win_the_window_on_one_token() {
+        let now = tokio::time::Instant::now();
+
+        // Through prefill at the start of the window, 20 tokens over the full
+        // second: 20 tok/s off a sample worth believing.
+        let mut steady = ready(10);
+        steady.content_at = now - WINDOW;
+        for _ in 0..20 {
+            steady.counter.feed(&token("x"));
+        }
+
+        // Through prefill with 20ms of the window left, one token: 50 tok/s
+        // off a sample of one, which is noise and not a measurement.
+        let mut late = ready_with(2, 980, Box::pin(futures::stream::empty()));
+        late.content_at = now - Duration::from_millis(20);
+        late.counter.feed(&token("x"));
+
+        let winner = pick_fastest(vec![steady, late], WINDOW).expect("a live stream wins");
+        assert_eq!(winner.channel_id, ChannelId(1));
+    }
+
+    /// One candidate stream, with whatever is left of it still to come.
+    fn ready_with(id: u64, elapsed_ms: u64, rest: ByteStream) -> ReadyStream {
+        ReadyStream {
+            channel_id: ChannelId(id),
             provider: "p".to_string(),
             model_id: "m".to_string(),
             intelligence: 0,
             wire: crate::config::WireName::OpenAi,
             buffered: Vec::new(),
+            counter: FrameCounter::default(),
+            content_at: tokio::time::Instant::now(),
+            broken: false,
+            finished_at: None,
             elapsed: Duration::from_millis(elapsed_ms),
-            rest: Box::pin(futures::stream::empty()),
+            rest,
             open: InFlight::open(&test_channel(), &Arc::new(AtomicU32::new(0))),
-        }))
+        }
+    }
+
+    fn ready(elapsed_ms: u64) -> ReadyStream {
+        ready_with(1, elapsed_ms, Box::pin(futures::stream::empty()))
+    }
+
+    /// One token frame, as a provider sends it.
+    fn token(text: &str) -> Vec<u8> {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n").into_bytes()
+    }
+
+    /// A stream emitting one token every `gap`, for ever.
+    fn ticking(gap: Duration) -> ByteStream {
+        Box::pin(async_stream::stream! {
+            loop {
+                tokio::time::sleep(gap).await;
+                yield Ok(token("x"));
+            }
+        })
     }
 
     /// The handler is the only place the latency histogram is written, so the
     /// stream winner has to carry its own upstream time out of the race.
-    #[test]
-    fn stream_winner_carries_the_time_to_first_bytes() {
-        let CopyWin::Streamed(ready) = ready(120) else {
-            panic!("expected a streamed copy");
-        };
-        let winner = ready.into_winner().expect("decoder built");
+    #[tokio::test]
+    async fn stream_winner_carries_the_time_to_first_bytes() {
+        let (health, _dir) = health_table();
+        let winner = ready(120)
+            .into_winner(STALL, Arc::new(health), Arc::new(Catalogue::new()))
+            .expect("decoder built");
         assert_eq!(winner.latency, Duration::from_millis(120));
+    }
+
+    /// The whole point of `tps`: nothing goes to the client while the window
+    /// is open, however much the stream has produced.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_leaves_the_stream_until_the_window_closes() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + WINDOW;
+        let candidate = pump_until(
+            ready_with(1, 10, ticking(Duration::from_millis(100))),
+            deadline,
+        )
+        .await;
+
+        assert!(
+            tokio::time::Instant::now() >= deadline,
+            "the window has to run its full length before anything is chosen"
+        );
+        // Every token read in the window is still held, ready to be flushed
+        // ahead of the rest of the stream.
+        assert_eq!(candidate.buffered.len(), candidate.counter.frames as usize);
+        assert!(candidate.counter.frames >= 9);
+    }
+
+    /// The point of the second of buffering: a 100 token/s stream beats a 10
+    /// token/s one, whichever of them got through prefill first.
+    #[tokio::test(start_paused = true)]
+    async fn the_fastest_stream_wins_the_window_not_the_first_one() {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        let slow = pump_until(
+            ready_with(1, 10, ticking(Duration::from_millis(100))),
+            deadline,
+        );
+        let fast = pump_until(
+            ready_with(2, 90, ticking(Duration::from_millis(10))),
+            deadline,
+        );
+        let (slow, fast) = tokio::join!(slow, fast);
+
+        assert!(slow.counter.frames < fast.counter.frames);
+        // The slow one is first in the list, so first-come cannot be what
+        // picks the winner here.
+        let winner = pick_fastest(vec![slow, fast], WINDOW).expect("a live stream wins");
+        assert_eq!(winner.channel_id, ChannelId(2));
+    }
+
+    /// A stream that breaks inside the window cannot win it. Nothing reached
+    /// the client, so it simply drops out and the others are judged.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_broke_inside_the_window_cannot_win() {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        let broken: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(token("x")),
+            Ok(token("y")),
+            Err(CallError::Transport("connection reset".to_string())),
+        ]));
+        let broken = pump_until(ready_with(1, 10, broken), deadline).await;
+        assert!(broken.broken);
+        assert!(pick_fastest(vec![broken], WINDOW).is_none());
+    }
+
+    /// Two streams at the same speed is a coin toss, so the first candidate
+    /// keeps it: that is time to first token, which is the only thing left to
+    /// separate them.
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_heat_keeps_the_earlier_stream() {
+        let empty: ByteStream = Box::pin(futures::stream::empty());
+        let mut first = ready_with(1, 10, empty);
+        let empty: ByteStream = Box::pin(futures::stream::empty());
+        let mut second = ready_with(2, 11, empty);
+        // The same tokens over the same time alive: nothing separates them
+        // but which one got there first.
+        for candidate in [&mut first, &mut second] {
+            candidate.counter.feed(&token("x"));
+            candidate.counter.feed(&token("y"));
+        }
+
+        let winner = pick_fastest(vec![first, second], WINDOW).expect("a live stream wins");
+        assert_eq!(winner.channel_id, ChannelId(1));
+    }
+
+    /// A stream that finishes inside the window is a fast stream, and every
+    /// token it sent still counts towards its rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_finished_inside_the_window_still_competes() {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        let short: ByteStream =
+            Box::pin(futures::stream::iter(vec![Ok(token("x")), Ok(token("y"))]));
+        let short = pump_until(ready_with(1, 10, short), deadline).await;
+        assert!(!short.broken);
+        assert_eq!(short.counter.frames, 2);
+        assert!(pick_fastest(vec![short], WINDOW).is_some());
+    }
+
+    /// The window closes on its own clock. A channel still in prefill when the
+    /// second is up must not hold the answer back: without the window's own
+    /// timer the walk sat waiting on that trial for as long as it took.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_closes_while_a_trial_is_still_in_prefill() {
+        let started = tokio::time::Instant::now();
+        let mut inflight: FuturesUnordered<
+            futures::future::BoxFuture<'static, TrialOutcome<'static>>,
+        > = FuturesUnordered::new();
+        // A channel that has sent its request and is still waiting on a first
+        // token.
+        inflight.push(Box::pin(futures::future::pending()));
+        let mut held: Vec<PendingFailure<'static>> = Vec::new();
+        let cancel = CancellationToken::new();
+
+        let outcome = watch_window(
+            Box::new(ready_with(1, 10, ticking(Duration::from_millis(100)))),
+            &mut inflight,
+            &mut held,
+            &cancel,
+            WINDOW,
+        )
+        .await;
+
+        assert!(matches!(outcome, WindowOutcome::Winner(_)));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= WINDOW, "the window runs its full second");
+        assert!(
+            elapsed < WINDOW * 2,
+            "and it does not wait on a trial still in prefill"
+        );
+    }
+
+    /// A client that hangs up mid-window takes everything with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_hanging_up_inside_the_window_ends_it() {
+        let mut inflight: FuturesUnordered<
+            futures::future::BoxFuture<'static, TrialOutcome<'static>>,
+        > = FuturesUnordered::new();
+        inflight.push(Box::pin(futures::future::pending()));
+        let mut held: Vec<PendingFailure<'static>> = Vec::new();
+        let cancel = CancellationToken::new();
+        let hang_up = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            hang_up.cancel();
+        });
+
+        let outcome = watch_window(
+            Box::new(ready_with(1, 10, ticking(Duration::from_millis(10)))),
+            &mut inflight,
+            &mut held,
+            &cancel,
+            WINDOW,
+        )
+        .await;
+
+        assert!(matches!(outcome, WindowOutcome::ClientGone));
+    }
+
+    /// A frame split across two chunks is one token, not two and not none.
+    #[test]
+    fn a_frame_split_across_chunks_is_counted_once() {
+        let frame = token("hello");
+        let (head, tail) = frame.split_at(20);
+        let mut counter = FrameCounter::default();
+        counter.feed(head);
+        assert_eq!(counter.frames, 0, "a half-read frame is not a token yet");
+        counter.feed(tail);
+        assert_eq!(counter.frames, 1);
+    }
+
+    /// Keep-alives and error frames are not tokens. Counting them would hand
+    /// the window to whichever channel was quickest to say nothing.
+    #[test]
+    fn comments_and_error_frames_are_not_tokens() {
+        let mut counter = FrameCounter::default();
+        counter.feed(b": OPENROUTER PROCESSING\n\n");
+        counter.feed(b"data: [DONE]\n\n");
+        counter.feed(b"data: {\"error\":{\"message\":\"rate limited\"}}\n\n");
+        assert_eq!(counter.frames, 0);
+        counter.feed(&token("x"));
+        assert_eq!(counter.frames, 1);
+    }
+
+    /// Once the client holds part of an answer the router is committed. A
+    /// stream that then stops producing tokens ends the client request, and
+    /// the channel backs off like any other failure. No second channel is
+    /// spliced onto it.
+    #[tokio::test(start_paused = true)]
+    async fn a_winning_stream_that_stalls_ends_and_backs_the_channel_off() {
+        let deaths = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&deaths);
+        let live: ByteStream =
+            Box::pin(futures::stream::iter(vec![Ok(token("x"))]).chain(futures::stream::pending()));
+        let watched = watch_for_stalls(
+            live,
+            STALL,
+            DeathHook::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(AtomicBool::new(false)),
+        );
+        futures::pin_mut!(watched);
+
+        assert!(watched.next().await.expect("the first token").is_ok());
+        assert_eq!(deaths.load(Ordering::Relaxed), 0);
+
+        let stalled = watched.next().await.expect("the stall shows up as an item");
+        assert!(stalled.is_err(), "a stalled stream ends the request");
+        assert_eq!(deaths.load(Ordering::Relaxed), 1);
+    }
+
+    /// A provider that closes the body part way through an answer ends the
+    /// byte stream cleanly, so the stall watcher sees nothing wrong. The
+    /// decoder is what notices, at the end, with no terminal event in sight,
+    /// and the channel must still back off for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_truncated_stream_backs_the_channel_off() {
+        let deaths = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&deaths);
+        let hook = DeathHook::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        // Half an answer, then a clean end of body: no `[DONE]`, no error.
+        let live: ByteStream = Box::pin(futures::stream::iter(vec![Ok(token("half"))]));
+        let bytes = watch_for_stalls(live, STALL, hook.clone(), Arc::new(AtomicBool::new(false)));
+        let chunks = wire::decode_stream(bytes, wire::Format::OpenAiChat)
+            .expect("the decoder starts")
+            .on_error(move || hook.fire());
+        let mut events = wire::encode_stream(chunks, wire::Format::OpenAiChat, None)
+            .expect("the encoder starts");
+
+        let mut failed = false;
+        while let Some(item) = events.next().await {
+            failed |= item.is_err();
+        }
+
+        assert!(failed, "the truncation reaches the client as an error");
+        assert_eq!(
+            deaths.load(Ordering::Relaxed),
+            1,
+            "and the channel is marked unhealthy exactly once"
+        );
+    }
+
+    /// A complete answer is not a stall, however long the socket stays open.
+    ///
+    /// Anthropic's wire has no `[DONE]`, so the decoder keeps reading bytes
+    /// after `message_stop`. A provider that holds the body open for
+    /// connection reuse used to earn a backed-off channel, an `event: error`
+    /// appended to an answer the client already had in full, and a lost cache
+    /// copy, sixty seconds after answering correctly.
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_answer_on_a_lingering_socket_ends_cleanly() {
+        let (health, _dir) = health_table();
+        let deaths = Arc::new(AtomicU32::new(0));
+        let body: ByteStream = Box::pin(
+            futures::stream::iter(anthropic_answer().into_iter().map(Ok))
+                .chain(futures::stream::pending()),
+        );
+        let mut ready = ready_with(1, 10, body);
+        ready.wire = crate::config::WireName::Anthropic;
+        let winner = ready
+            .into_winner(STALL, Arc::new(health), Arc::new(Catalogue::new()))
+            .expect("decoder built");
+        let mut events = wire::encode_stream(winner.chunks, wire::Format::AnthropicMessages, None)
+            .expect("the encoder starts");
+
+        let started = tokio::time::Instant::now();
+        let mut failed = false;
+        // Bounded, so a stream that never ends fails the test instead of
+        // hanging it.
+        tokio::time::timeout(STALL * 2, async {
+            while let Some(item) = events.next().await {
+                failed |= item.is_err();
+            }
+        })
+        .await
+        .expect("a finished answer ends its stream");
+
+        assert!(
+            !failed,
+            "a complete answer never reaches the client as an error"
+        );
+        assert_eq!(deaths.load(Ordering::Relaxed), 0);
+        assert!(
+            started.elapsed() < STALL,
+            "the stream ends on the tail grace, not on the stall timeout"
+        );
+    }
+
+    /// A whole Anthropic answer, frame by frame, ending in `message_stop`.
+    fn anthropic_answer() -> Vec<Vec<u8>> {
+        [
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"id": "msg_fake", "model": "m", "role": "assistant", "content": []}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hello"}
+            }),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1}
+            }),
+            serde_json::json!({"type": "message_stop"}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n").into_bytes())
+        .collect()
+    }
+
+    /// Keep-alive comments are not tokens, so they do not hold a dead channel
+    /// open. OpenRouter sends `: OPENROUTER PROCESSING` every few seconds while
+    /// its upstream hangs, and the client must still get the failure at the
+    /// stall timeout rather than sit on a part-written answer forever.
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_do_not_reset_the_stall_timer() {
+        let deaths = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&deaths);
+        let live: ByteStream = Box::pin(async_stream::stream! {
+            yield Ok(token("x"));
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                yield Ok(b": OPENROUTER PROCESSING\n\n".to_vec());
+            }
+        });
+        let watched = watch_for_stalls(
+            live,
+            STALL,
+            DeathHook::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(AtomicBool::new(false)),
+        );
+        futures::pin_mut!(watched);
+
+        assert!(watched.next().await.expect("the first token").is_ok());
+
+        // Every keep-alive between here and the timeout is forwarded, and none
+        // of them buys the channel more time.
+        // Bounded, so a timer that never fires fails the test instead of
+        // hanging it.
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(STALL * 5, async {
+            loop {
+                if watched.next().await.expect("an item").is_err() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the stalled stream ends the request");
+        assert_eq!(started.elapsed(), STALL, "the stall still fires at 60s");
+        assert_eq!(deaths.load(Ordering::Relaxed), 1);
+        assert!(watched.next().await.is_none(), "the stream ends there");
+    }
+
+    /// The backoff a dead stream owes is written against the live catalogue,
+    /// because the stream outlives the walk that started it.
+    #[test]
+    fn a_dead_stream_backs_its_channel_off() {
+        let (health, _dir) = health_table();
+        let catalogue = Catalogue::new();
+        let channel = row("groq", "key-0", "model-a");
+        let id = channel.id;
+        catalogue.replace(vec![channel]);
+
+        fail_mid_stream(&health, &catalogue, id);
+
+        let entry = health.get(&HealthKey::Channel(id)).expect("marked");
+        assert_eq!(entry.retry_counter, 1);
+        assert!(entry.eligible_at > 0);
     }
 
     #[test]
@@ -1640,8 +2771,9 @@ mod tests {
     /// arrives. If the guard dropped at the first frame, thirty open streams
     /// would read as idle, and the next `429` they caused would be taken for a
     /// real provider limit and park the best channel.
-    #[test]
-    fn a_streamed_copy_holds_its_count_until_the_stream_ends() {
+    #[tokio::test]
+    async fn a_streamed_copy_holds_its_count_until_the_stream_ends() {
+        let (health, _dir) = health_table();
         let channel = test_channel();
         let own = Arc::new(AtomicU32::new(0));
         let ready = ReadyStream {
@@ -1651,11 +2783,17 @@ mod tests {
             intelligence: 0,
             wire: crate::config::WireName::OpenAi,
             buffered: Vec::new(),
+            counter: FrameCounter::default(),
+            content_at: tokio::time::Instant::now(),
+            broken: false,
+            finished_at: None,
             elapsed: Duration::from_millis(1),
             rest: Box::pin(futures::stream::empty()),
             open: InFlight::open(&channel, &own),
         };
-        let winner = ready.into_winner().expect("decoder built");
+        let winner = ready
+            .into_winner(STALL, Arc::new(health), Arc::new(Catalogue::new()))
+            .expect("decoder built");
 
         assert_eq!(
             channel.health.in_flight.load(Ordering::Relaxed),
@@ -1686,6 +2824,7 @@ mod tests {
             modalities_input: vec!["text".to_string()],
             intelligence: 50,
             intelligence_rank: 1,
+            created: None,
             health: Default::default(),
             telemetry: Default::default(),
         }
