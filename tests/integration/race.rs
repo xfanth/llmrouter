@@ -325,6 +325,33 @@ async fn calls(server: &MockServer) -> usize {
         .len()
 }
 
+/// The same count, but waits for it to reach `want` first.
+///
+/// A losing channel call is torn down the moment the winner lands, and the
+/// race between that teardown and the mock recording the request is real: the
+/// router dispatched the call, but the bytes may not have been read off the
+/// socket yet. Reading the counter once makes the assertion a coin toss on a
+/// loaded machine, which is how this test failed only under `./ci.sh`.
+///
+/// Waiting does not weaken the assertion. A call that was never dispatched
+/// never arrives, so the count stays wrong and the test still fails, just
+/// `SETTLE` later.
+async fn calls_settling_at(server: &MockServer, want: usize) -> usize {
+    /// Long enough for a dispatched request to land on loopback under load,
+    /// short enough that a genuine failure is not slow to report.
+    const SETTLE: Duration = Duration::from_secs(2);
+    const STEP: Duration = Duration::from_millis(10);
+
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    loop {
+        let seen = calls(server).await;
+        if seen >= want || tokio::time::Instant::now() >= deadline {
+            return seen;
+        }
+        tokio::time::sleep(STEP).await;
+    }
+}
+
 /// A readable name for an outcome, so a failing match says what it got.
 fn name_of(outcome: &RaceOutcome) -> &'static str {
     match outcome {
@@ -385,7 +412,11 @@ async fn the_fastest_of_two_channels_wins_and_the_loser_is_cancelled() {
         elapsed < PROMPT,
         "the losing call must be cancelled, not waited on: the walk took {elapsed:?}"
     );
-    assert_eq!(calls(&slow).await, 1, "the loser really was called");
+    assert_eq!(
+        calls_settling_at(&slow, 1).await,
+        1,
+        "the loser really was called"
+    );
 
     let rows = harness.rows();
     let loser = row_for(&rows, slow_id);
@@ -451,9 +482,9 @@ async fn a_failed_channel_is_replaced_at_once_rather_than_at_the_end_of_a_wave()
         "the replacement must start beside the slow channel, not after it: \
          the walk took {elapsed:?}"
     );
-    assert_eq!(calls(&third).await, 1);
+    assert_eq!(calls_settling_at(&third, 1).await, 1);
     assert_eq!(
-        calls(&crawling).await,
+        calls_settling_at(&crawling, 1).await,
         1,
         "the slow channel stayed in flight throughout"
     );
@@ -502,7 +533,7 @@ async fn three_hedged_copies_failing_count_as_one_failure_against_the_channel() 
     }
 
     assert_eq!(
-        calls(&broken).await,
+        calls_settling_at(&broken, 1).await,
         3,
         "all three hedged copies really were sent"
     );
@@ -835,7 +866,7 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
         "the untried channel behind the broken one serves the request"
     );
     assert_eq!(
-        calls(&sound).await,
+        calls_settling_at(&sound, 1).await,
         1,
         "the replacement channel was actually called"
     );
