@@ -38,9 +38,13 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// How long the winning channel waits before answering, so that the failing
-/// channels' replies are already in hand when it does.
-const WINNER_DELAY: Duration = Duration::from_millis(150);
+/// How long the winning channel waits before answering. This is the margin the
+/// failing channels' whole round trip has to fit inside, not just their
+/// dispatch: the race cancels every other channel the moment one wins, and a
+/// cancelled trial moves no health, so a row only exists if the failing call
+/// was sent, answered and recorded before the winner replies. Matches
+/// LET_BOTH_CALLS_GO_OUT in tests/integration/race.rs.
+const WINNER_DELAY: Duration = Duration::from_millis(250);
 
 fn now_unix() -> u64 {
     SystemTime::now()

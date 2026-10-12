@@ -35,6 +35,16 @@ const TOO_SLOW: Duration = Duration::from_secs(10);
 /// Far below [`TOO_SLOW`] and far above anything loopback needs.
 const PROMPT: Duration = Duration::from_secs(3);
 
+/// How long a winning mock waits before it answers.
+///
+/// Without this the winner can answer before the loser's request has been
+/// written to its socket, and the race then cancels a call that never left the
+/// box. That is correct router behaviour, so a test asserting the loser was
+/// called has to give both calls time to go out first. Loopback dispatch is
+/// well under a millisecond, so this is a margin of hundreds of times, and it
+/// stays far below [`PROMPT`].
+const LET_BOTH_CALLS_GO_OUT: Duration = Duration::from_millis(250);
+
 /// One channel pointed at a wiremock server. `rank` fixes the order the
 /// catalogue scans in, so no test depends on the tie-break shuffle.
 fn channel(provider: &str, base_url: &str, rank: u32) -> Channel {
@@ -368,7 +378,12 @@ fn name_of(outcome: &RaceOutcome) -> &'static str {
 /// rather than wait for it: if it waited, this test would take ten seconds.
 #[tokio::test]
 async fn the_fastest_of_two_channels_wins_and_the_loser_is_cancelled() {
-    let fast = upstream(ResponseTemplate::new(200).set_body_json(reply("fast"))).await;
+    let fast = upstream(
+        ResponseTemplate::new(200)
+            .set_body_json(reply("fast"))
+            .set_delay(LET_BOTH_CALLS_GO_OUT),
+    )
+    .await;
     let slow = upstream(
         ResponseTemplate::new(200)
             .set_body_json(reply("slow"))
@@ -445,7 +460,16 @@ async fn a_failed_channel_is_replaced_at_once_rather_than_at_the_end_of_a_wave()
             .set_delay(TOO_SLOW),
     )
     .await;
-    let third = upstream(ResponseTemplate::new(200).set_body_json(reply("third"))).await;
+    // The winner waits long enough that the slow channel's request is certainly
+    // on the wire before the win cancels it. Without the delay the win can land
+    // before those bytes are written, and cancelling a call that has not gone
+    // out yet is correct router behaviour, so the mock would record nothing.
+    let third = upstream(
+        ResponseTemplate::new(200)
+            .set_body_json(reply("third"))
+            .set_delay(LET_BOTH_CALLS_GO_OUT),
+    )
+    .await;
 
     let dir = tempfile::tempdir().expect("a scratch directory");
     let third_channel = channel("third", &third.uri(), 2);
@@ -533,7 +557,7 @@ async fn three_hedged_copies_failing_count_as_one_failure_against_the_channel() 
     }
 
     assert_eq!(
-        calls_settling_at(&broken, 1).await,
+        calls_settling_at(&broken, 3).await,
         3,
         "all three hedged copies really were sent"
     );

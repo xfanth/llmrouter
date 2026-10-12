@@ -285,6 +285,14 @@ async fn completion_response(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // The clock starts here rather than inside the handler. Everything from
+    // this line on is latency the router adds, the admission gate included:
+    // on a host without `/proc` the gate forks `ps` to read RSS, which is
+    // slow enough to matter. A reading taken after the gate leaves that out
+    // of the router's half of `router_latency_seconds`, and that half exists
+    // to say what the router costs.
+    let started = Instant::now();
+
     // The gate runs before the body is parsed, because parsing is where the
     // memory goes.
     if let Admit::Reject {
@@ -337,6 +345,7 @@ async fn completion_response(
             parsed,
             raw_len,
             wants_stream,
+            started,
         )),
         wants_stream,
         interval,
@@ -561,14 +570,17 @@ fn sse_event(format: Format, value: &Value) -> Event {
 /// of the reply. The providers are asked for a stream whenever `streaming` is
 /// on in `router.yml`, whatever the client asked for, because the hedge
 /// strategy needs a stream to measure.
+///
+/// `started` is when the request reached the router. The caller takes it
+/// before the admission gate so that the gate counts as router overhead too.
 async fn handle_completion(
     state: Arc<AppState>,
     client_format: Format,
     body: Value,
     raw_len: usize,
     wants_stream: bool,
+    started: Instant,
 ) -> Served {
-    let started = Instant::now();
     let (_concurrency, concurrent) = Concurrency::open();
 
     let request = match crate::wire::decode_request(client_format, &body) {

@@ -67,6 +67,13 @@ step "coverage"
 cargo llvm-cov clean --workspace
 cargo llvm-cov --all-features --workspace --no-report \
     --lib --bins --test contract --test integration
+# macOS writes an AppleDouble `._` sidecar beside every file on an NFS or SMB
+# share. cargo-llvm-cov globs `*.profraw`, picks the sidecars up and
+# llvm-profdata then refuses the whole merge. Only bites when the target dir
+# sits in a checkout on a network share, which is what the runner does, so
+# clear them before the report rather than leaving a trap for anyone who
+# overrides CARGO_TARGET_DIR.
+find "$CARGO_TARGET_DIR" -name '._*.profraw' -delete 2>/dev/null || true
 cargo llvm-cov report --lcov --output-path "$LCOV_PATH"
 
 # The gate must not jump the summary table, so take its exit code by hand.

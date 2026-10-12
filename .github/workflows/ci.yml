@@ -43,6 +43,9 @@ jobs:
 
       - name: Coverage, with the 80/80 gate
         run: |
+          # Matches ci.sh. rust-cache restores target/ between runs, so
+          # profile data from an earlier run can survive and skew the figure.
+          cargo llvm-cov clean --workspace
           cargo llvm-cov --all-features --workspace --no-report \
             --lib --bins --test contract --test integration
           cargo llvm-cov report --lcov --output-path lcov.info

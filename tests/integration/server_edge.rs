@@ -10,7 +10,6 @@
 //! Keys in here are obvious fakes.
 
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,14 +66,13 @@ async fn net_test(link: Link) -> (NetTest, Vec<String>, Option<MockServer>) {
             (net, urls, Some(server))
         }
         Link::Down => {
-            // A loopback port with nothing listening on it, so both connects
-            // are refused at once and no packet leaves the machine.
-            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port is free");
-            let addr = listener.local_addr().expect("the socket has an address");
-            drop(listener);
+            // Port 1 needs root to bind, so nothing in the test run can ever
+            // listen on it and both connects are refused every time. An
+            // ephemeral port would go straight back into the pool on drop and
+            // a wiremock server started elsewhere in the run could claim it.
             let urls = vec![
-                format!("http://{addr}/generate_204"),
-                format!("http://{addr}/cdn-cgi/trace"),
+                "http://127.0.0.1:1/generate_204".to_string(),
+                "http://127.0.0.1:1/cdn-cgi/trace".to_string(),
             ];
             let net = NetTest::with_urls(client, NET_TEST_TIMEOUT, urls.clone());
             (net, urls, None)
@@ -187,9 +185,16 @@ impl Edge {
         }
     }
 
+    /// The real axum router. Building it is a per-request cost inside `call`,
+    /// so a test that times a request builds it once up front and starts its
+    /// clock after the build rather than around it.
+    fn service(&self) -> axum::Router {
+        llmrouter::server::router(Arc::clone(&self.state))
+    }
+
     /// Drives one request through the real axum router.
     async fn call(&self, request: Request<Body>) -> axum::response::Response {
-        llmrouter::server::router(Arc::clone(&self.state))
+        self.service()
             .oneshot(request)
             .await
             .expect("the router is infallible")
@@ -209,30 +214,12 @@ impl Edge {
 
     /// `POST /v1/chat/completions` with a JSON body.
     async fn post_chat(&self, body: &Value) -> axum::response::Response {
-        self.call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {FAKE_KEY}"))
-                .body(Body::from(serde_json::to_vec(body).expect("body encodes")))
-                .expect("the request builds"),
-        )
-        .await
+        self.call(chat_post(body)).await
     }
 
     /// `POST /v1/messages` with a JSON body, in Anthropic shape.
     async fn post_messages(&self, body: &Value) -> axum::response::Response {
-        self.call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header("content-type", "application/json")
-                .header("x-api-key", FAKE_KEY)
-                .body(Body::from(serde_json::to_vec(body).expect("body encodes")))
-                .expect("the request builds"),
-        )
-        .await
+        self.call(messages_post(body)).await
     }
 
     /// A `GET` on one of the probe routes.
@@ -245,6 +232,32 @@ impl Edge {
         )
         .await
     }
+}
+
+/// A `POST /v1/chat/completions` request with its body already serialised.
+/// Kept apart from `Edge::post_chat` so a timing test can build and encode the
+/// request before it starts its clock.
+fn chat_post(body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {FAKE_KEY}"))
+        .body(Body::from(serde_json::to_vec(body).expect("body encodes")))
+        .expect("the request builds")
+}
+
+/// A `POST /v1/messages` request in Anthropic shape, body already serialised.
+/// Same reason as `chat_post`: the encode happens before a timing test starts
+/// its clock.
+fn messages_post(body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .header("x-api-key", FAKE_KEY)
+        .body(Body::from(serde_json::to_vec(body).expect("body encodes")))
+        .expect("the request builds")
 }
 
 /// A router config with the race narrowed to something a test can count, the
@@ -923,9 +936,12 @@ async fn a_streamed_win_is_forwarded_to_the_client_and_teed_into_the_cache() {
     );
 
     // The tee folds the copy on a spawned task, so the entry lands a moment
-    // after the client's last frame.
+    // after the client's last frame. Wait on the entry appearing, not on a
+    // duration, with the same two second ceiling the race tests settled on: a
+    // loaded runner can take a while to schedule the task, fold the stream and
+    // commit the redb transaction.
     let cache = edge.state.cache.clone().expect("the cache is on");
-    for _ in 0..100 {
+    for _ in 0..200 {
         if cache.entry_count().expect("the cache counts") > 0 {
             break;
         }
@@ -1291,8 +1307,19 @@ async fn folding_a_stream_for_a_plain_client_is_counted_in_the_time_the_request_
     )
     .await;
 
+    // The clock goes around the handler and as little else as possible. The
+    // router build and the body encode are per-request work that happens
+    // outside the server's own span, so doing them here rather than inside the
+    // measured window keeps the unaccounted slice down to the tower plumbing.
+    // Otherwise a single scheduler preemption in that slice is enough to push
+    // the accounted share under the floor with nothing wrong in the router.
+    let service = edge.service();
+    let request = chat_post(&chat_request("fold timed", false));
     let started = Instant::now();
-    let response = edge.post_chat(&chat_request("fold timed", false)).await;
+    let response = service
+        .oneshot(request)
+        .await
+        .expect("the router is infallible");
     let wall = started.elapsed();
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -1344,14 +1371,21 @@ async fn encoding_a_large_reply_for_the_client_is_counted_as_router_overhead() {
 
     // Anthropic in, OpenAI upstream: the reply is genuinely rebuilt on the way
     // out rather than passed through.
+    //
+    // As in the fold test above, the router build and the body encode happen
+    // before the clock starts, so the measured window is the handler's own
+    // window plus the tower plumbing and nothing else.
+    let service = edge.service();
+    let request = messages_post(&json!({
+        "model": "auto",
+        "max_tokens": 16,
+        "messages": [{ "role": "user", "content": "encode timed" }],
+    }));
     let started = Instant::now();
-    let response = edge
-        .post_messages(&json!({
-            "model": "auto",
-            "max_tokens": 16,
-            "messages": [{ "role": "user", "content": "encode timed" }],
-        }))
-        .await;
+    let response = service
+        .oneshot(request)
+        .await
+        .expect("the router is infallible");
     let wall = started.elapsed();
     assert_eq!(response.status(), StatusCode::OK);
 

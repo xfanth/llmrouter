@@ -22,8 +22,40 @@ const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 /// a while on a cold runner.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Published by `docker-compose.ci.yml` on the loopback address only.
-const BASE: &str = "http://127.0.0.1:8080";
+/// `docker-compose.ci.yml` publishes a kernel-chosen port on the loopback
+/// address, so the base URL is read back from compose after `up` rather than
+/// pinned here. Pinning it raced anything else holding the fixed port.
+fn base_url() -> Result<String, String> {
+    let printed = Command::new("docker")
+        .current_dir(ROOT)
+        .args([
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "docker-compose.ci.yml",
+            "port",
+            "llmrouter",
+            "8080",
+        ])
+        .output()
+        .map_err(|error| format!("docker compose port failed: {error}"))?;
+    if !printed.status.success() {
+        return Err(format!(
+            "docker compose port failed: {}",
+            String::from_utf8_lossy(&printed.stderr).trim()
+        ));
+    }
+    let printed = String::from_utf8_lossy(&printed.stdout).trim().to_owned();
+    // Compose prints `address:port`, and the address may be `0.0.0.0` or an
+    // IPv6 form. Only the port is wanted, and the publish is loopback only.
+    let port = printed
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .filter(|port| port.parse::<u16>().is_ok())
+        .ok_or_else(|| format!("docker compose port printed {printed:?}"))?;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
 
 fn docker_available() -> bool {
     Command::new("docker")
@@ -73,7 +105,10 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
 
     let built = compose(&["up", "-d", "--build"]).success();
     let result = if built {
-        check_endpoints(&reqwest::Client::new()).await
+        match base_url() {
+            Ok(base) => check_endpoints(&reqwest::Client::new(), &base).await,
+            Err(reason) => Err(reason),
+        }
     } else {
         Err("docker compose up failed".to_owned())
     };
@@ -123,18 +158,18 @@ fn teardown_dumps_the_logs_before_it_destroys_the_stack() {
     assert_eq!(order.into_inner(), ["down"]);
 }
 
-async fn check_endpoints(client: &reqwest::Client) -> Result<(), String> {
-    wait_for_healthz(client).await?;
-    check_metrics(client).await?;
-    check_models(client).await
+async fn check_endpoints(client: &reqwest::Client, base: &str) -> Result<(), String> {
+    wait_for_healthz(client, base).await?;
+    check_metrics(client, base).await?;
+    check_models(client, base).await
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
 /// the server builds, not merely when the port accepts a connection.
-async fn wait_for_healthz(client: &reqwest::Client) -> Result<(), String> {
+async fn wait_for_healthz(client: &reqwest::Client, base: &str) -> Result<(), String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        let attempt = client.get(format!("{BASE}/healthz")).send().await;
+        let attempt = client.get(format!("{base}/healthz")).send().await;
         match attempt {
             Ok(reply) if reply.status().is_success() => {
                 let body: Value = reply
@@ -161,8 +196,8 @@ async fn wait_for_healthz(client: &reqwest::Client) -> Result<(), String> {
 
 /// Prometheus text, not JSON and not an empty body. Every metric is registered
 /// at zero on boot, so the names are there before any request has been served.
-async fn check_metrics(client: &reqwest::Client) -> Result<(), String> {
-    let reply = get(client, "/metrics").await?;
+async fn check_metrics(client: &reqwest::Client, base: &str) -> Result<(), String> {
+    let reply = get(client, base, "/metrics").await?;
     let content_type = reply
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -188,8 +223,8 @@ async fn check_metrics(client: &reqwest::Client) -> Result<(), String> {
 /// Valid JSON in the OpenAI list shape. The fixture config has no providers,
 /// so the rows are expected to be empty: the shape is the point, not the
 /// contents.
-async fn check_models(client: &reqwest::Client) -> Result<(), String> {
-    let body: Value = get(client, "/v1/models")
+async fn check_models(client: &reqwest::Client, base: &str) -> Result<(), String> {
+    let body: Value = get(client, base, "/v1/models")
         .await?
         .json()
         .await
@@ -204,9 +239,13 @@ async fn check_models(client: &reqwest::Client) -> Result<(), String> {
     Ok(())
 }
 
-async fn get(client: &reqwest::Client, path: &str) -> Result<reqwest::Response, String> {
+async fn get(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> Result<reqwest::Response, String> {
     let reply = client
-        .get(format!("{BASE}{path}"))
+        .get(format!("{base}{path}"))
         .send()
         .await
         .map_err(|error| format!("GET {path} failed: {error}"))?;
