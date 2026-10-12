@@ -128,7 +128,8 @@ pub struct StartupSummary {
     pub providers_reachable: usize,
     /// Provider/key pairs in the config, across the reachable providers.
     pub keys: usize,
-    /// Pairs whose keyed `/models` probe answered.
+    /// Pairs whose keyed `/models` probe returned 2xx. A pair that answered
+    /// with `401` is not one of these.
     pub keys_answered: usize,
     /// Channel rows the catalogue ended up with.
     pub channels: usize,
@@ -147,7 +148,7 @@ impl StartupSummary {
             ("providers", self.providers),
             ("providers reachable", self.providers_reachable),
             ("keys", self.keys),
-            ("keys answered", self.keys_answered),
+            ("keys with models", self.keys_answered),
             ("channels", self.channels),
             ("in backoff", self.in_backoff),
         ] {
@@ -237,7 +238,7 @@ mod tests {
 
         for expected in [
             "providers",
-            "keys answered",
+            "keys with models",
             "channels",
             "in backoff",
             "3336",

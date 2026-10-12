@@ -3,9 +3,14 @@
     python3 build_providers.py channels.csv providers.yaml
 
 Prints counts only, never key material.
+
+Both inputs, channels.csv and freellmapi-keys.csv, hold plaintext keys, so
+the script narrows each to 0600 before reading it and refuses to run if the
+filesystem will not keep that mode.
 """
 import csv
 import json
+import os
 import re
 import sys
 from collections import defaultdict
@@ -46,6 +51,16 @@ def name_for(url):
     return alias
 
 
+def owner_only(path):
+    """Narrow a key-holding file to 0600, or stop. A share mounted without
+    owner support can ignore chmod, so check the mode actually stuck."""
+    os.chmod(path, 0o600)
+    mode = os.stat(path).st_mode & 0o777
+    if mode & 0o077:
+        sys.exit(f"{path} holds keys but is {mode:o}, must be 600; refusing to run")
+
+
+owner_only(SRC)
 channels = defaultdict(lambda: {"keys": [], "models": set(), "priority": 0, "names": []})
 
 with open(SRC, newline="") as f:
@@ -70,6 +85,8 @@ with open(SRC, newline="") as f:
 EXTRA = "freellmapi-keys.csv"
 PLATFORM_TO_NAME = {"google": "gemini"}
 merged, orphans = 0, defaultdict(int)
+if os.path.exists(EXTRA):
+    owner_only(EXTRA)
 try:
     by_name = {name_for(u): c for u, c in channels.items()}
     for row in csv.DictReader(open(EXTRA, newline="")):
@@ -94,11 +111,20 @@ for url, c in sorted(channels.items(), key=lambda x: -x[1]["priority"]):
     lines.append(f"    base_url: {url}")
     lines.append(f"    priority: {c['priority']}   # from new-api, highest first")
     if c["models"]:
-        lines.append(f"    known_models: [{', '.join(sorted(c['models']))}]")
+        # JSON is a subset of YAML, so json.dumps gives correct quoting for
+        # free. Needed: a Cloudflare model id starts with '@', which is a
+        # reserved YAML character, and an unquoted one makes the whole file
+        # unparseable.
+        lines.append(f"    known_models: {json.dumps(sorted(c['models']))}")
     lines.append("    keys:")
-    lines.extend(f"      - {k}" for k in c["keys"])
+    lines.extend(f"      - {json.dumps(k)}" for k in c["keys"])
 
-with open(OUT, "w") as f:
+# The file holds every live key, so owner-only. Passing the mode to os.open
+# only applies when the file is new; fchmod narrows one a previous run left
+# wider, before a single key is written.
+fd = os.open(OUT, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.fchmod(fd, 0o600)
+with os.fdopen(fd, "w") as f:
     f.write("\n".join(lines) + "\n")
 
 print(f"channels: {len(channels)}   keys: {sum(len(c['keys']) for c in channels.values())}")

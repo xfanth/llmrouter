@@ -161,16 +161,23 @@ impl Harness {
 
     /// One client request's whole walk, on the buffered path.
     async fn race(&self) -> RaceOutcome {
+        self.race_filtered(ChannelFilter {
+            min_context: 0,
+            needs_tools: false,
+            named_model: None,
+        })
+        .await
+    }
+
+    /// The same walk against a filter the test chooses, so a test can leave a
+    /// channel eligible and still out of this request's reach.
+    async fn race_filtered(&self, filter: ChannelFilter) -> RaceOutcome {
         let body = PromptBody::Memory(Bytes::from_static(br#"{"messages":[]}"#));
         self.racer
             .run(
                 RaceInput {
                     outbound: Arc::new(body),
-                    filter: ChannelFilter {
-                        min_context: 0,
-                        needs_tools: false,
-                        named_model: None,
-                    },
+                    filter,
                     streaming: false,
                     named_model: None,
                 },
@@ -566,6 +573,59 @@ async fn a_failure_escalates_to_the_pair_and_then_to_the_provider() {
             provider: "groq".to_string(),
             key_id: "key-g".to_string(),
         }),
+        None
+    );
+}
+
+/// A `402` on one model is not a verdict on the key. Health is binary and
+/// failures are not classified by status, so the provider/key pair goes down
+/// only when every channel on it is unhealthy (DESIGN.md "The unit of health").
+///
+/// A free OpenRouter key gets `402` on a paid model while its free models
+/// carry on serving. Marking the pair would flap `/healthz` on every request
+/// and spend a keyed probe each poll on a key that was never dead.
+#[tokio::test]
+async fn a_402_on_one_model_leaves_the_pair_healthy_while_a_sibling_is_eligible() {
+    let dir = TempDir::new().expect("tempdir");
+    let broke = upstream_serving(rejected(402, "insufficient credits")).await;
+    let good = upstream_serving(good_reply()).await;
+
+    // One openrouter key carrying two channels. Only the first is asked for:
+    // the second takes no tools and this request needs them, so it is never
+    // tried and stays eligible throughout.
+    let asked = channel("openrouter", "key-a", "glm-5", &broke.uri(), 0);
+    let mut untried = channel("openrouter", "key-a", "kimi-k2", &good.uri(), 1);
+    untried.tool_call = false;
+    let alive = channel("groq", "key-g", "llama-4", &good.uri(), 2);
+    let (asked_id, untried_id, alive_id) = (asked.id, untried.id, alive.id);
+
+    let h = Harness::open(dir.path(), vec![asked, untried, alive]).await;
+    let outcome = h
+        .race_filtered(ChannelFilter {
+            min_context: 0,
+            needs_tools: true,
+            named_model: None,
+        })
+        .await;
+    assert_eq!(won(&outcome), alive_id);
+
+    assert_eq!(
+        h.channel_entry(asked_id)
+            .expect("the channel that took the 402 backed off")
+            .retry_counter,
+        1
+    );
+    assert_eq!(h.channel_entry(untried_id), None);
+    assert_eq!(
+        h.entry(&HealthKey::ProviderKey {
+            provider: "openrouter".to_string(),
+            key_id: "key-a".to_string(),
+        }),
+        None,
+        "a sibling channel on the key is still eligible, so the pair stays healthy"
+    );
+    assert_eq!(
+        h.entry(&HealthKey::Provider("openrouter".to_string())),
         None
     );
 }

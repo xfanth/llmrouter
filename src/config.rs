@@ -10,8 +10,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use regex::Regex;
+use secrecy::SecretString;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Everything the router reads off disk at boot. Read once; a change needs a
@@ -27,7 +30,8 @@ pub struct Config {
     /// `intelligence.yml`: the ranking, built from `models.csv`.
     pub intelligence: Vec<IntelligenceEntry>,
     /// `.env`: the environment variable name from `keys_env` to its keys.
-    pub keys: HashMap<String, Vec<String>>,
+    /// `Debug` prints each key as `[REDACTED]`.
+    pub keys: HashMap<String, Vec<SecretString>>,
     /// `model_capabilities.csv`: what each provider's models can do, keyed by
     /// lowercased `(provider, model_id)`. The catalogue joins every probed
     /// model against this to learn its context window and whether it accepts
@@ -40,7 +44,7 @@ impl Config {
     /// Reads all six files from `dir`. A missing optional file falls back to
     /// its defaults; a malformed one is an error.
     pub fn load(dir: &Path) -> crate::Result<Self> {
-        Ok(Self {
+        let config = Self {
             router: read_yaml(&dir.join("router.yml"))?.unwrap_or_default(),
             providers: read_list(&dir.join("providers.yml"))?,
             models: read_list(&dir.join("models.yml"))?,
@@ -50,7 +54,28 @@ impl Config {
                 .map(parse_env_file)
                 .unwrap_or_default(),
             capabilities: read_capabilities(&dir.join("model_capabilities.csv"))?,
-        })
+        };
+        // A provider whose `keys_env` names no `.env` variable gets no keyed
+        // probe and so no channels, with nothing else to say why. That is a
+        // typo or a missed `.env` line, so it fails the boot. A variable that
+        // is present but empty is a deliberate keyless entry: warn and go on.
+        for provider in &config.providers {
+            match config.keys.get(&provider.keys_env) {
+                None => {
+                    return Err(crate::RouterError::Config(format!(
+                        "providers.yml: provider {} names keys_env {}, which .env does not set",
+                        provider.name, provider.keys_env
+                    )));
+                }
+                Some(keys) if keys.is_empty() => tracing::warn!(
+                    provider = %provider.name,
+                    keys_env = %provider.keys_env,
+                    "provider has no keys in .env, so it serves no channels"
+                ),
+                Some(_) => {}
+            }
+        }
+        Ok(config)
     }
 
     /// What the capabilities file knows about one provider's model. `None`
@@ -62,7 +87,7 @@ impl Config {
     }
 
     /// The keys for one provider, resolved through its `keys_env` name.
-    pub fn keys_for(&self, provider: &Provider) -> &[String] {
+    pub fn keys_for(&self, provider: &Provider) -> &[SecretString] {
         self.keys
             .get(&provider.keys_env)
             .map_or(&[][..], Vec::as_slice)
@@ -73,28 +98,47 @@ impl Config {
     /// model scores 0 and sorts to the bottom. The caller logs the loose ones,
     /// so a wrong pairing is visible rather than silent.
     pub fn rank_of(&self, provider: &str, model_id: &str) -> (u16, u32, RankMatch) {
+        self.ranking_of(provider, model_id)
+            .map_or((0, u32::MAX, RankMatch::None), |(e, matched)| {
+                (e.intelligence, e.intelligence_rank, matched)
+            })
+    }
+
+    /// The `intelligence.yml` row a model id matches, and which pass found
+    /// it. `rank_of` is the score-only view of this.
+    pub fn ranking_of(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<(&IntelligenceEntry, RankMatch)> {
         // An explicit `ranks_as` in models.yml replaces the model id outright.
         // That is the hand correction for anything the automatic pass gets
         // wrong.
-        let target = self
+        let raw = self
             .models
             .iter()
             .find(|m| m.provider == provider && m.model_id == model_id)
             .and_then(|m| m.ranks_as.as_deref())
-            .map_or_else(|| normalise_model_name(model_id), normalise_model_name);
+            .unwrap_or(model_id);
+        let target = normalise_model_name(raw);
+
+        // A vendor prefix is not a loose match. `mistralai/mistral-large` is
+        // the model `mistral-large` with its vendor written in front, so the
+        // part after the last slash gets the same exact pass as the whole id.
+        // Without this, every prefixed id fell through to the suffix pass and
+        // asked an operator to check a pairing that was never in doubt.
+        let bare = raw
+            .rsplit_once('/')
+            .map(|(_, tail)| normalise_model_name(tail))
+            .filter(|t| !t.is_empty() && *t != target);
 
         // ponytail: linear scan over roughly 650 rows per lookup. Build a map
         // keyed on the normalised slug if catalogue build time ever shows up.
-        if let Some(entry) = self
-            .intelligence
-            .iter()
-            .find(|e| normalise_model_name(&e.slug) == target)
-        {
-            return (
-                entry.intelligence,
-                entry.intelligence_rank,
-                RankMatch::Exact,
-            );
+        if let Some(entry) = self.intelligence.iter().find(|e| {
+            let slug = normalise_model_name(&e.slug);
+            slug == target || bare.as_deref().is_some_and(|b| slug == b)
+        }) {
+            return Some((entry, RankMatch::Exact));
         }
 
         // Loose pass, for ids carrying a vendor prefix the slug does not:
@@ -109,13 +153,7 @@ impl Config {
                 (!slug.is_empty() && target.ends_with(&slug)).then_some((slug.len(), e))
             })
             .max_by_key(|(len, _)| *len)
-            .map_or((0, u32::MAX, RankMatch::None), |(_, e)| {
-                (
-                    e.intelligence,
-                    e.intelligence_rank,
-                    RankMatch::Loose(e.slug.clone()),
-                )
-            })
+            .map(|(_, e)| (e, RankMatch::Loose(e.slug.clone())))
     }
 }
 
@@ -229,7 +267,7 @@ pub enum HedgeStrategy {
 
 /// `router.yml` -> `health_poll`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct HealthPollConfig {
     /// Per probe, in either wave and in the poller.
     #[serde(with = "humantime_serde")]
@@ -258,7 +296,7 @@ impl Default for HealthPollConfig {
 
 /// `router.yml` -> `cache`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     /// Off means every client request goes upstream.
     pub enabled: bool,
@@ -295,7 +333,13 @@ impl Default for CacheConfig {
 
 /// One entry in `providers.yml`. It names its keys rather than holding them, so
 /// the file is safe to share.
+///
+/// Unknown keys are an error for the same reason as in `RouterConfig`: a
+/// mistyped field name is a setting the operator believes is doing something.
+/// It also catches a `keys:` list pasted in from the generator's source file,
+/// which would otherwise look accepted while the keys went nowhere.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provider {
     /// Short name used in logs, metrics and the channel id.
     pub name: String,
@@ -309,6 +353,17 @@ pub struct Provider {
     /// Path appended to `base_url` for the model list. Defaults to `/models`.
     #[serde(default = "default_models_path")]
     pub models_path: String,
+    /// Model ids to fall back on when the provider publishes no model list.
+    /// Used only when the probe gets a 404 or a 405 back, which is what a
+    /// provider whose listing endpoint does not exist answers. An auth
+    /// failure still fails, so a dead key never produces channels.
+    ///
+    /// Setting it is the mark that this provider has no listing endpoint, so
+    /// set it on nothing else: a 404 is also what a base URL missing its
+    /// version segment answers, and a list here would hide that.
+    /// `llmrouter-make-config` writes it for Cloudflare Workers AI only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// The wire format a provider speaks on the way out.
@@ -325,7 +380,12 @@ pub enum WireName {
 
 /// One entry in `models.yml`: a correction to what the catalogue worked out on
 /// its own.
+///
+/// Unknown keys are an error. This file is hand written, and a misspelt
+/// `limit_contex` that parses and applies nothing leaves the operator with a
+/// correction that is silently inert.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelOverride {
     /// Provider this override applies to.
     pub provider: String,
@@ -437,6 +497,20 @@ pub struct IntelligenceEntry {
     pub intelligence: u16,
     /// Precomputed rank. Lower is better; the channel list sorts on it.
     pub intelligence_rank: u32,
+    /// `models.csv`'s `release_date`, `YYYY-MM-DD`. `GET /v1/models` reports
+    /// it as `created` when the provider gives no date of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+}
+
+impl IntelligenceEntry {
+    /// `release_date` as unix seconds at midnight UTC. `None` when absent or
+    /// not a date.
+    pub fn released_unix(&self) -> Option<u64> {
+        let day = self.release_date.as_deref()?.trim();
+        let when = humantime::parse_rfc3339(&format!("{day}T00:00:00Z")).ok()?;
+        Some(when.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+    }
 }
 
 /// Parses a byte size: a bare integer, or an integer with a `KB`, `MB`, `GB`,
@@ -477,7 +551,7 @@ pub fn parse_byte_size(input: &str) -> std::result::Result<u64, String> {
 /// skipped rather than failing the whole file, and the error itself is never
 /// printed because it quotes the line, and the line holds key material. The
 /// count is warned about instead, so a dropped variable leaves a trail.
-pub fn parse_env_file(contents: &str) -> HashMap<String, Vec<String>> {
+pub fn parse_env_file(contents: &str) -> HashMap<String, Vec<SecretString>> {
     let mut dropped = 0_usize;
     let out = dotenvy::from_read_iter(contents.as_bytes())
         .filter_map(|entry| match entry {
@@ -486,7 +560,7 @@ pub fn parse_env_file(contents: &str) -> HashMap<String, Vec<String>> {
                     .split(',')
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
-                    .map(str::to_string)
+                    .map(SecretString::from)
                     .collect();
                 Some((name, values))
             }
@@ -509,15 +583,25 @@ pub fn parse_env_file(contents: &str) -> HashMap<String, Vec<String>> {
 /// dots, dashes, underscores and slashes flattened away.
 pub fn normalise_model_name(name: &str) -> String {
     let mut text = name.trim().to_ascii_lowercase();
+    // OpenRouter tags a variant of the same model with a trailing `:free`,
+    // `:beta`, `:thinking` and so on. The slug never carries it, so it goes
+    // before anything else. Letters only: a size tag such as `qwen3:32b` names
+    // a different model and keeps its place.
+    let variant = text.rsplit_once(':').filter(|(stem, tag)| {
+        !stem.is_empty() && !tag.is_empty() && tag.bytes().all(|b| b.is_ascii_lowercase())
+    });
+    if let Some(len) = variant.map(|(stem, _)| stem.len()) {
+        text.truncate(len);
+    }
     // The trailing date goes first. Once the separators are gone there is no
-    // separator left to recognise it by.
-    if text.len() > 9 && text.is_char_boundary(text.len() - 9) {
-        let (head, tail) = text.split_at(text.len() - 9);
-        let dated = matches!(tail.as_bytes()[0], b'-' | b'_' | b'@')
-            && tail[1..].bytes().all(|b| b.is_ascii_digit());
-        if dated {
-            text = head.to_string();
-        }
+    // separator left to recognise it by. `.+?` keeps a bare date, which is
+    // all there is, as the name rather than stripping it to nothing.
+    static DATE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(.+?)[-_@](?:\d{8}|\d{4}-\d{2}-\d{2}|\d{4}_\d{2}_\d{2}|\d{4}\.\d{2}\.\d{2})$")
+            .expect("the date pattern is a valid regex")
+    });
+    if let Some(stem) = DATE.captures(&text).map(|c| c[1].to_owned()) {
+        text = stem;
     }
     text.retain(|c| !matches!(c, '.' | '-' | '_' | '/'));
     text
@@ -572,18 +656,26 @@ fn read_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> crate::Result<Optio
 
 /// Parses a YAML file holding a list, written either as a bare sequence or
 /// wrapped under a single key (`providers:`, `models:`, `intelligence:`).
+///
+/// The wrapper is unwrapped as a value first and the sequence deserialised on
+/// its own, rather than matching both shapes through an untagged enum. An
+/// untagged enum reports only "data did not match any variant", which hides
+/// which field in which entry was wrong.
 fn read_list<T: serde::de::DeserializeOwned>(path: &Path) -> crate::Result<Vec<T>> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Shape<T> {
-        Bare(Vec<T>),
-        Wrapped(HashMap<String, Vec<T>>),
-    }
-    Ok(match read_yaml::<Shape<T>>(path)? {
-        None => Vec::new(),
-        Some(Shape::Bare(items)) => items,
-        Some(Shape::Wrapped(map)) => map.into_values().flatten().collect(),
-    })
+    let Some(value) = read_yaml::<serde_yaml::Value>(path)? else {
+        return Ok(Vec::new());
+    };
+    let items = match value {
+        serde_yaml::Value::Null => return Ok(Vec::new()),
+        serde_yaml::Value::Mapping(map) => serde_yaml::Value::Sequence(
+            map.into_iter()
+                .flat_map(|(_, v)| v.as_sequence().cloned().unwrap_or_else(|| vec![v]))
+                .collect(),
+        ),
+        other => other,
+    };
+    serde_yaml::from_value(items)
+        .map_err(|e| crate::RouterError::Config(format!("{}: {e}", path.display())))
 }
 
 fn default_listen() -> SocketAddr {
@@ -597,12 +689,14 @@ fn default_models_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     fn entry(slug: &str, intelligence: u16, rank: u32) -> IntelligenceEntry {
         IntelligenceEntry {
             slug: slug.to_string(),
             intelligence,
             intelligence_rank: rank,
+            release_date: None,
         }
     }
 
@@ -712,15 +806,21 @@ mod tests {
              IN_QUOTES=\"jjj,kkk#notacomment\"\n\
              no_equals_sign\n",
         );
-        assert_eq!(parsed["GEMINI_KEYS"], vec!["aaa", "bbb", "ccc"]);
-        assert_eq!(parsed["OPENROUTER_KEYS"], vec!["ddd", "eee"]);
-        assert_eq!(parsed["QUOTED"], vec!["fff"]);
+        let exposed = |keys: &[SecretString]| -> Vec<String> {
+            keys.iter().map(|k| k.expose_secret().to_string()).collect()
+        };
+        assert_eq!(exposed(&parsed["GEMINI_KEYS"]), vec!["aaa", "bbb", "ccc"]);
+        assert_eq!(exposed(&parsed["OPENROUTER_KEYS"]), vec!["ddd", "eee"]);
+        assert_eq!(exposed(&parsed["QUOTED"]), vec!["fff"]);
         assert!(parsed["EMPTY"].is_empty());
-        assert_eq!(parsed["TRAILING"], vec!["ggg"]);
+        assert_eq!(exposed(&parsed["TRAILING"]), vec!["ggg"]);
         // An inline comment is shell syntax, not key material.
-        assert_eq!(parsed["COMMENTED"], vec!["hhh", "iii"]);
+        assert_eq!(exposed(&parsed["COMMENTED"]), vec!["hhh", "iii"]);
         // A `#` inside quotes is part of the value.
-        assert_eq!(parsed["IN_QUOTES"], vec!["jjj", "kkk#notacomment"]);
+        assert_eq!(
+            exposed(&parsed["IN_QUOTES"]),
+            vec!["jjj", "kkk#notacomment"]
+        );
         // A line that is not an assignment is skipped, not fatal.
         assert!(!parsed.contains_key("no_equals_sign"));
     }
@@ -739,6 +839,17 @@ mod tests {
         assert_eq!(normalise_model_name("GPT_5.5-High"), "gpt55high");
         // Eight digits that are part of the name, not a date, keep their place.
         assert_eq!(normalise_model_name("model-1234567"), "model1234567");
+        // OpenAI dates its ids with dashes, as OpenRouter passes them on.
+        assert_eq!(
+            normalise_model_name("openai/gpt-4o-2024-11-20"),
+            "openaigpt4o"
+        );
+        assert_eq!(normalise_model_name("gpt-4o-mini-2024-07-18"), "gpt4omini");
+        // Underscored and dotted dates are dates too, not part of the name.
+        assert_eq!(normalise_model_name("model-2024_10_22"), "model");
+        assert_eq!(normalise_model_name("model-2024.10.22"), "model");
+        // A bare date has nothing before it to keep, so it stays the name.
+        assert_eq!(normalise_model_name("-20241022"), "20241022");
     }
 
     #[test]
@@ -750,12 +861,42 @@ mod tests {
         );
     }
 
+    /// A vendor prefix is bookkeeping, not ambiguity. Stripping it leaves an
+    /// exact slug, so the pairing is certain and must not ask an operator to
+    /// check it.
     #[test]
-    fn rank_matches_a_vendor_prefixed_id_loosely() {
+    fn rank_matches_a_vendor_prefixed_id_exactly() {
         let cfg = config_with(vec![entry("claude-fable-5-1", 53, 1)], Vec::new());
         assert_eq!(
             cfg.rank_of("openrouter", "anthropic/claude-fable-5.1"),
-            (53, 1, RankMatch::Loose("claude-fable-5-1".to_string()))
+            (53, 1, RankMatch::Exact)
+        );
+    }
+
+    /// A free OpenRouter key can only call the `:free` variants, so they must
+    /// rank the same as the model they are a variant of.
+    #[test]
+    fn rank_ignores_an_openrouter_variant_tag() {
+        let cfg = config_with(
+            vec![entry("nvidia/nemotron-3-ultra-550b-a55b", 60, 3)],
+            Vec::new(),
+        );
+        assert_eq!(
+            cfg.rank_of("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+            (60, 3, RankMatch::Exact)
+        );
+        assert_eq!(normalise_model_name("model:beta"), "model");
+        assert_eq!(normalise_model_name("qwen3:32b"), "qwen3:32b");
+    }
+
+    /// Stripping the vendor prefix must not drag a shorter row in: the bare
+    /// name has to match a slug outright, the same as any other exact match.
+    #[test]
+    fn stripping_the_vendor_prefix_still_needs_a_whole_slug() {
+        let cfg = config_with(vec![entry("flash", 10, 50)], Vec::new());
+        assert_eq!(
+            cfg.rank_of("gemini", "google/gemini-3.7-flash"),
+            (10, 50, RankMatch::Loose("flash".to_string()))
         );
     }
 
@@ -797,12 +938,12 @@ mod tests {
     #[test]
     fn rank_prefers_the_longest_loose_match() {
         let cfg = config_with(
-            vec![entry("flash", 10, 50), entry("gemini-3.7-flash", 40, 10)],
+            vec![entry("coder", 10, 50), entry("max-coder", 40, 10)],
             Vec::new(),
         );
         assert_eq!(
-            cfg.rank_of("gemini", "google/gemini-3.7-flash"),
-            (40, 10, RankMatch::Loose("gemini-3.7-flash".to_string()))
+            cfg.rank_of("qwen", "qwen3-max-coder"),
+            (40, 10, RankMatch::Loose("max-coder".to_string()))
         );
     }
 
@@ -830,18 +971,31 @@ mod tests {
     }
 
     #[test]
+    fn debug_never_prints_a_key_from_the_env_file() {
+        let mut cfg = config_with(Vec::new(), Vec::new());
+        cfg.keys = parse_env_file("GEMINI_KEYS=sk-live-do-not-print\n");
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("do-not-print"), "{printed}");
+        assert!(printed.contains("REDACTED"), "{printed}");
+    }
+
+    #[test]
     fn keys_for_is_empty_when_the_variable_is_absent() {
         let mut cfg = config_with(Vec::new(), Vec::new());
         cfg.keys
-            .insert("GEMINI_KEYS".to_string(), vec!["aaa".to_string()]);
+            .insert("GEMINI_KEYS".to_string(), vec!["aaa".into()]);
         let provider = |keys_env: &str| Provider {
             name: "gemini".to_string(),
             wire: WireName::OpenAi,
             base_url: "https://example.invalid".to_string(),
             keys_env: keys_env.to_string(),
             models_path: default_models_path(),
+            models: Vec::new(),
         };
-        assert_eq!(cfg.keys_for(&provider("GEMINI_KEYS")), ["aaa"]);
+        assert_eq!(
+            cfg.keys_for(&provider("GEMINI_KEYS"))[0].expose_secret(),
+            "aaa"
+        );
         assert!(cfg.keys_for(&provider("MISSING_KEYS")).is_empty());
     }
 
@@ -951,7 +1105,7 @@ cache:
     fn the_backoff_cap_is_reached_at_failure_23() {
         let cap = RouterConfig::default().health_poll.backoff_max.as_secs();
         let base = RouterConfig::default().health_poll.retry_base.as_secs();
-        let wait = |counter: u32| (base << (counter - 1)).min(cap);
+        let wait = |counter: u32| crate::health::wait_seconds(counter, base, cap);
         assert!(wait(22) < cap);
         assert_eq!(wait(23), cap);
         assert_eq!(wait(12), 2048);
@@ -1059,5 +1213,124 @@ cache:
             Config::load(dir).is_err(),
             "malformed router.yml is an error"
         );
+    }
+
+    /// A typo inside `health_poll:` or `cache:` is an error, same as a typo at
+    /// the top level. `make-config` tells the operator router.yml is theirs to
+    /// hand edit, so a misspelt key there must not be swallowed.
+    #[test]
+    fn a_misspelt_key_in_a_nested_router_yml_block_is_an_error() {
+        let err = serde_yaml::from_str::<RouterConfig>("cache:\n  max_byte: 5GB\n")
+            .expect_err("a misspelt cache key is rejected");
+        assert!(err.to_string().contains("max_byte"), "{err}");
+
+        let err = serde_yaml::from_str::<RouterConfig>("health_poll:\n  backoff_ma: 1h\n")
+            .expect_err("a misspelt health_poll key is rejected");
+        assert!(err.to_string().contains("backoff_ma"), "{err}");
+
+        // The correctly spelt keys still load.
+        let cfg: RouterConfig =
+            serde_yaml::from_str("cache:\n  max_bytes: 5GB\nhealth_poll:\n  backoff_max: 1h\n")
+                .expect("the real field names parse");
+        assert_eq!(cfg.cache.max_bytes, 5_000_000_000);
+        assert_eq!(cfg.health_poll.backoff_max, Duration::from_secs(3600));
+    }
+
+    /// `models.yml` is the operator's hand correction surface, and
+    /// `providers.yml` is hand edited too. A misspelt field in either must
+    /// fail the boot rather than load as an override that does nothing.
+    #[test]
+    fn a_misspelt_field_in_models_yml_or_providers_yml_is_an_error() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let dir = tmp.path();
+
+        std::fs::write(
+            dir.join("models.yml"),
+            "models:\n  - provider: zai\n    model_id: glm-5.3\n    limit_contex: 200000\n",
+        )
+        .unwrap();
+        let err = Config::load(dir).expect_err("a misspelt models.yml field is rejected");
+        assert!(err.to_string().contains("limit_contex"), "{err}");
+
+        // The right spelling loads and carries the value.
+        std::fs::write(
+            dir.join("models.yml"),
+            "models:\n  - provider: zai\n    model_id: glm-5.3\n    limit_context: 200000\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load(dir).expect("the real field name loads").models[0].limit_context,
+            Some(200_000)
+        );
+
+        // A `keys:` list pasted in from the generator's source file is an
+        // error, not a provider whose keys quietly went nowhere.
+        std::fs::write(
+            dir.join("providers.yml"),
+            "providers:\n  - name: zai\n    wire: openai\n    base_url: https://example.invalid\n    keys_env: ZAI_KEYS\n    keys: []\n",
+        )
+        .unwrap();
+        let err = Config::load(dir).expect_err("a stray providers.yml field is rejected");
+        assert!(err.to_string().contains("keys"), "{err}");
+    }
+
+    /// A `keys_env` that names no `.env` variable used to load cleanly and
+    /// then drop the provider from every race without a word. It fails the
+    /// boot now, naming the provider and the variable. A variable that is
+    /// present but empty is a keyless entry and still loads.
+    #[test]
+    fn a_keys_env_missing_from_dot_env_is_an_error() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let dir = tmp.path();
+        std::fs::write(
+            dir.join("providers.yml"),
+            "providers:\n  - name: deepseek\n    wire: openai\n    base_url: https://example.invalid\n    keys_env: DEEPSEEK_KEY\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".env"), "DEEPSEEK_KEYS=aaa\n").unwrap();
+        let err = Config::load(dir).expect_err("an unset keys_env is rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deepseek") && msg.contains("DEEPSEEK_KEY,"),
+            "{msg}"
+        );
+
+        std::fs::write(dir.join(".env"), "DEEPSEEK_KEY=\n").unwrap();
+        let cfg = Config::load(dir).expect("an empty variable is a keyless provider");
+        assert!(cfg.keys_for(&cfg.providers[0]).is_empty());
+    }
+
+    /// The deploy contract has to name every file `Config::load` reads. An
+    /// operator who provisions `/config` by hand from DESIGN.md and leaves
+    /// `model_capabilities.csv` behind gets a silently wider race: every
+    /// channel falls back to its default context window and tool-call flag.
+    #[test]
+    fn design_md_names_every_config_file() {
+        let design = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("DESIGN.md"),
+        )
+        .expect("DESIGN.md sits at the crate root");
+        let volume_row = design
+            .lines()
+            .find(|line| line.contains("| `/config` | read-only |"))
+            .expect("the volume table lists /config");
+        let config_table = design
+            .split_once("\n## Config\n")
+            .expect("DESIGN.md has a Config section")
+            .1;
+        for file in [
+            "router.yml",
+            "providers.yml",
+            "models.yml",
+            "intelligence.yml",
+            ".env",
+            "model_capabilities.csv",
+        ] {
+            assert!(volume_row.contains(file), "volume table omits {file}");
+            assert!(
+                config_table.contains(&format!("| `{file}` |")),
+                "the Config file table omits {file}"
+            );
+        }
     }
 }

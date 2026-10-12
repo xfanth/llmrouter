@@ -151,6 +151,21 @@ impl HealthTable {
         retry_after_secs: Option<u64>,
         now_unix: u64,
     ) -> HealthEntry {
+        self.record_failure_then(key, retry_after_secs, now_unix, |_| {})
+    }
+
+    /// `record_failure`, running `mirror` on the new entry before the entry's
+    /// lock is let go. A caller copying the entry somewhere else (a channel
+    /// row) does it here, so a success landing at the same moment cannot slip
+    /// between the table write and the copy and leave the two disagreeing.
+    /// `mirror` must not touch this table: it runs under the shard lock.
+    pub fn record_failure_then(
+        &self,
+        key: &HealthKey,
+        retry_after_secs: Option<u64>,
+        now_unix: u64,
+        mirror: impl FnOnce(&HealthEntry),
+    ) -> HealthEntry {
         let mut entry = self
             .entries
             .entry(key.clone())
@@ -167,6 +182,7 @@ impl HealthTable {
             self.backoff_max.as_secs(),
         );
         entry.eligible_at = now_unix.saturating_add(wait);
+        mirror(&entry);
         *entry
     }
 
@@ -174,6 +190,20 @@ impl HealthTable {
     /// the configured base again.
     pub fn record_success(&self, key: &HealthKey) {
         self.entries.remove(key);
+    }
+
+    /// `record_success`, running `mirror` while the entry's lock is held, for
+    /// the same reason as `record_failure_then`. The lock is taken even when
+    /// there is no entry, so a failure cannot write one between the removal
+    /// and the copy. `mirror` must not touch this table.
+    pub fn record_success_then(&self, key: &HealthKey, mirror: impl FnOnce()) {
+        match self.entries.entry(key.clone()) {
+            dashmap::Entry::Occupied(entry) => {
+                mirror();
+                entry.remove();
+            }
+            dashmap::Entry::Vacant(_guard) => mirror(),
+        }
     }
 
     /// Every entry that is still in backoff, for `/healthz`.
@@ -215,6 +245,20 @@ impl HealthTable {
         Ok(())
     }
 
+    /// [`HealthTable::flush`] on the blocking pool, with the failure logged.
+    ///
+    /// The flush deletes and rebuilds the table inside a redb write
+    /// transaction, and redb allows one writer at a time, so run inline it
+    /// parks a tokio worker for as long as the cache writer holds the file.
+    async fn flush_off_thread(self: &Arc<Self>, what: &str) {
+        let table = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || table.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "{what}"),
+            Err(e) => tracing::warn!(error = %e, "{what}"),
+        }
+    }
+
     /// Flushes every `interval` until `shutdown` fires, then flushes once more.
     pub async fn flush_loop(
         self: Arc<Self>,
@@ -230,16 +274,12 @@ impl HealthTable {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(e) = self.flush() {
-                        tracing::warn!(error = %e, "health flush failed");
-                    }
+                    self.flush_off_thread("health flush failed").await;
                 }
                 _ = shutdown.cancelled() => break,
             }
         }
-        if let Err(e) = self.flush() {
-            tracing::warn!(error = %e, "final health flush failed");
-        }
+        self.flush_off_thread("final health flush failed").await;
     }
 }
 
@@ -318,21 +358,32 @@ pub fn stream_verdict(sse: &[u8]) -> StreamVerdict {
         let Some(payload) = line.strip_prefix("data:") else {
             continue;
         };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
-            continue;
-        };
-        if json.get("error").is_some_and(|e| !e.is_null()) {
-            return StreamVerdict::Failed;
-        }
-        if stream_event_has_content(&json) {
-            verdict = StreamVerdict::Content;
+        match event_verdict(payload) {
+            StreamVerdict::Failed => return StreamVerdict::Failed,
+            StreamVerdict::Content => verdict = StreamVerdict::Content,
+            StreamVerdict::Pending => {}
         }
     }
     verdict
+}
+
+/// The verdict on one decoded event's `data` payload. `[DONE]`, an empty
+/// payload or anything that is not JSON says nothing either way.
+pub fn event_verdict(data: &str) -> StreamVerdict {
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return StreamVerdict::Pending;
+    }
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+        return StreamVerdict::Pending;
+    };
+    if json.get("error").is_some_and(|e| !e.is_null()) {
+        StreamVerdict::Failed
+    } else if stream_event_has_content(&json) {
+        StreamVerdict::Content
+    } else {
+        StreamVerdict::Pending
+    }
 }
 
 /// One decoded event carries something the client would call an answer.
@@ -632,6 +683,43 @@ mod tests {
         assert_eq!(t.record_failure(&k, None, 0).eligible_at, 30);
     }
 
+    /// The mirror is what keeps a channel row in step with the table, so it
+    /// must run while the entry is still locked. If the lock were let go
+    /// first, a success and a failure on the same channel could interleave
+    /// and leave the row and the table disagreeing.
+    #[test]
+    fn the_mirror_runs_while_the_entry_is_still_locked() {
+        let (t, _d) = table(HOUR);
+        let k = provider("groq");
+
+        let mut ran = false;
+        let e = t.record_failure_then(&k, None, 0, |entry| {
+            assert_eq!(entry.retry_counter, 1);
+            assert!(t.entries.try_get(&k).is_locked(), "failure mirror unlocked");
+            ran = true;
+        });
+        assert!(ran);
+        assert_eq!(e.retry_counter, 1);
+
+        // Present entry: locked, and still there until the mirror is done.
+        let mut ran = false;
+        t.record_success_then(&k, || {
+            assert!(t.entries.try_get(&k).is_locked(), "success mirror unlocked");
+            ran = true;
+        });
+        assert!(ran);
+        assert_eq!(t.get(&k), None);
+
+        // Absent entry: still locked, so a failure cannot slip in.
+        let mut ran = false;
+        t.record_success_then(&k, || {
+            assert!(t.entries.try_get(&k).is_locked(), "vacant mirror unlocked");
+            ran = true;
+        });
+        assert!(ran);
+        assert_eq!(t.get(&k), None);
+    }
+
     #[test]
     fn a_zero_configured_base_still_backs_off_one_second() {
         let (t, _d) = table_with_base(0, HOUR);
@@ -776,23 +864,34 @@ mod tests {
 
         let db = Arc::new(Database::create(&path).unwrap());
         let t = Arc::new(
-            HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap(),
+            HealthTable::open(
+                Arc::clone(&db),
+                Duration::from_secs(1),
+                Duration::from_secs(HOUR),
+            )
+            .unwrap(),
         );
         t.record_failure(&k, None, 500);
 
         let shutdown = tokio_util::sync::CancellationToken::new();
         let loop_task = tokio::spawn(Arc::clone(&t).flush_loop(Duration::ZERO, shutdown.clone()));
         tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Read redb before cancelling. The loop always flushes once more on
+        // shutdown, so a read after cancel would pass even if no periodic
+        // tick ever fired, and a crash between ticks would then lose every
+        // backoff written since boot.
+        let reopened =
+            HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+        assert_eq!(
+            reopened.get(&k).map(|e| e.eligible_at),
+            Some(501),
+            "a periodic flush reached redb before shutdown"
+        );
+
         shutdown.cancel();
         loop_task
             .await
             .expect("the flush loop survives a zero interval");
-
-        // And the row really reached redb.
-        drop(t);
-        let db = Arc::new(Database::create(&path).unwrap());
-        let reopened =
-            HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
-        assert_eq!(reopened.get(&k).unwrap().eligible_at, 501);
     }
 }

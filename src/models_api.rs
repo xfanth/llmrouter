@@ -46,7 +46,8 @@ pub struct ModelRow {
     /// Which provider serves it, or `router` for the `auto` row.
     pub owned_by: String,
     /// Unix seconds: the provider's own value for this model where it
-    /// published one, else the router's boot time.
+    /// published one, else the release date in models.csv, else the router's
+    /// boot time.
     pub created: u64,
 
     /// The general intelligence score. Higher is better. 0 when unranked.

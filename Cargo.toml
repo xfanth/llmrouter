@@ -10,15 +10,11 @@ license = "MIT"
 # Runtime
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = "0.1"
 futures = "0.3"
 async-stream = "0.3"
 
 # HTTP server
 axum = { version = "0.8", features = ["json", "macros"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace"] }
-hyper = "1.6"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = [
@@ -40,10 +36,15 @@ humantime = "2"
 # `Retry-After` dates: all three forms RFC 9110 requires. Already in the tree
 # under hyper.
 httpdate = "1"
+# Trailing-date stripping in model names. Already in the tree.
+regex = "1"
 
 # Storage
 redb = "2.6"
 blake3 = "1.5"
+# Provider keys: `Debug` prints `[REDACTED]`, so a stray `?channel` or
+# `dbg!(config)` cannot leak one.
+secrecy = "0.10"
 
 # State
 arc-swap = "1.7"
@@ -54,6 +55,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Typed `Authorization: Bearer` parsing, case-insensitive scheme name.
+headers = "0.4"
 
 # Misc
 anyhow = "1"
@@ -68,6 +72,24 @@ comfy-table = "8.0.0"
 time = { version = "0.3.41", default-features = false, features = ["std", "formatting"] }
 # `.env` parsing: `export `, quoting, escapes and inline comments.
 dotenvy = "0.15.7"
+# Arguments for the `llmrouter-make-config` bin.
+clap = { version = "4.5.51", features = ["derive", "env"] }
+# Prompt spill files: random name, O_EXCL, mode 0600, deleted on drop.
+tempfile = "3.27.0"
+# Server-sent-event framing for the tokens-per-second count: CRLF, multi-line
+# `data:` fields and events split across chunks.
+eventsource-stream = "0.2.3"
+
+# `src/main.rs` is the router. `src/bin/make-config.rs` builds the config
+# directory the router reads, named in full so the installed binary says what
+# it belongs to.
+[[bin]]
+name = "llmrouter"
+path = "src/main.rs"
+
+[[bin]]
+name = "llmrouter-make-config"
+path = "src/bin/make-config.rs"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
@@ -81,10 +103,13 @@ tower = { version = "0.5", features = ["util"] }
 insta = { version = "1.49.0", features = ["json"] }
 # Table-driven cases.
 rstest = "0.26.1"
-# Throwaway directories for redb and the spill files.
-tempfile = "3.27.0"
 # Mocked upstream providers, instead of a hand-rolled mock server.
 wiremock = "0.6.5"
+# Log capture in tests. One global subscriber, because a scoped `with_default`
+# one races parallel tests for the callsite interest cache and misses events.
+tracing-test = "0.2.6"
+# Reads a Prometheus scrape into samples, so a test compares exact values.
+prometheus-parse = "0.2.5"
 
 [profile.release]
 opt-level = 3

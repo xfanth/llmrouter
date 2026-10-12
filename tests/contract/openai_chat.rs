@@ -169,7 +169,7 @@ fn stop_sequences_reach_an_openai_provider(#[case] from: Format, #[case] body: V
 /// model, so the client is told the router's name, not the upstream's.
 #[test]
 fn a_plain_text_answer_is_handed_back_whole() {
-    let encoded = inbound(&json!({
+    let mut encoded = inbound(&json!({
         "id": "chatcmpl-abc123",
         "object": "chat.completion",
         "created": 1_700_000_000u64,
@@ -190,6 +190,15 @@ fn a_plain_text_answer_is_handed_back_whole() {
         "the client is told the model it asked the router for"
     );
 
+    // `created` is stamped with the clock on the way out, so the snapshot
+    // cannot pin it. Check it is a real reading, then blank it. The router
+    // filling it at all is covered by a unit test in src/wire.rs.
+    assert!(
+        encoded["created"].as_u64().expect("created is a number") > 1_735_689_600,
+        "the reply carries a real timestamp, got {}",
+        encoded["created"]
+    );
+    encoded["created"] = json!("[created]");
     insta::assert_json_snapshot!("response_text", encoded);
 }
 
@@ -198,7 +207,7 @@ fn a_plain_text_answer_is_handed_back_whole() {
 /// that parses it, so pin both the type and the contents.
 #[test]
 fn a_tool_call_answer_keeps_its_arguments_as_a_json_string() {
-    let encoded = inbound(&json!({
+    let mut encoded = inbound(&json!({
         "id": "chatcmpl-tool1",
         "object": "chat.completion",
         "created": 1_700_000_000u64,
@@ -237,6 +246,14 @@ fn a_tool_call_answer_keeps_its_arguments_as_a_json_string() {
     assert_eq!(parsed, json!({ "path": "/etc/hosts", "limit": 10 }));
     assert_eq!(encoded["choices"][0]["finish_reason"], "tool_calls");
 
+    // `created` is stamped with the clock on the way out, so the snapshot
+    // cannot pin it.
+    assert!(
+        encoded["created"].as_u64().expect("created is a number") > 1_735_689_600,
+        "the reply carries a real timestamp, got {}",
+        encoded["created"]
+    );
+    encoded["created"] = json!("[created]");
     insta::assert_json_snapshot!("response_tool_call", encoded);
 }
 

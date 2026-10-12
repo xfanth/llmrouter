@@ -19,9 +19,9 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,7 @@ use futures::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::admission::{Admission, Admit};
 use crate::cache::{Cache, CacheEntry};
@@ -56,9 +57,6 @@ const CONTEXT_MARGIN_PERCENT: u64 = 5;
 /// times service time, and a channel call runs for minutes, so it climbs well
 /// past any request-per-second figure.
 static CONCURRENT: AtomicUsize = AtomicUsize::new(0);
-
-/// Makes a spill file name unique within this process.
-static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Counts one client request for as long as it is in the handler.
 struct Concurrency;
@@ -91,8 +89,8 @@ impl Drop for Concurrency {
 pub enum PromptBody {
     /// Held in RAM for the life of the race.
     Memory(Bytes),
-    /// Written to a scratch file, deleted on drop.
-    Spilled(PathBuf),
+    /// Written to a scratch file: random name, mode 0600, deleted on drop.
+    Spilled(tempfile::TempPath),
 }
 
 impl PromptBody {
@@ -103,16 +101,31 @@ impl PromptBody {
         if concurrent <= config.spill_above_concurrent {
             return Self::Memory(bytes);
         }
-        let name = format!(
-            "{}-{}.body",
-            std::process::id(),
-            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = config.spill_path.join(name);
-        match tokio::fs::write(&path, &bytes).await {
-            Ok(()) => Self::Spilled(path),
+        // tempfile opens with O_EXCL at 0600 under a random name, so another
+        // user on the share can neither guess the path nor read the prompt.
+        let dir = config.spill_path.clone();
+        let spill = bytes.clone();
+        // The whole write runs as one blocking task that owns the file and
+        // returns the guard. A blocking task cannot be cancelled, so if the
+        // client hangs up mid-write the task still finishes, and its result,
+        // the guard, is dropped with it and deletes the file. Writing through
+        // the open handle also means the path is never reopened after the
+        // guard may already have unlinked it.
+        let written = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut file = tempfile::NamedTempFile::new_in(&dir)?;
+            file.write_all(&spill)?;
+            Ok::<_, std::io::Error>(Self::Spilled(file.into_temp_path()))
+        })
+        .await;
+        match written {
+            Ok(Ok(body)) => body,
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, path = %config.spill_path.display(), "outbound body could not spill");
+                Self::Memory(bytes)
+            }
             Err(err) => {
-                tracing::warn!(error = %err, path = %path.display(), "outbound body could not spill");
+                tracing::warn!(error = %err, path = %config.spill_path.display(), "outbound body spill task failed");
                 Self::Memory(bytes)
             }
         }
@@ -123,7 +136,7 @@ impl PromptBody {
     pub async fn load(&self) -> std::io::Result<Bytes> {
         match self {
             Self::Memory(bytes) => Ok(bytes.clone()),
-            Self::Spilled(path) => tokio::fs::read(path).await.map(Bytes::from),
+            Self::Spilled(path) => tokio::fs::read(&**path).await.map(Bytes::from),
         }
     }
 
@@ -132,18 +145,6 @@ impl PromptBody {
         match self {
             Self::Memory(_) => None,
             Self::Spilled(path) => Some(path),
-        }
-    }
-}
-
-impl Drop for PromptBody {
-    fn drop(&mut self) {
-        // The client has its answer, so the scratch file goes now rather than
-        // waiting for a sweeper. An unlink is cheap enough to do inline.
-        if let Self::Spilled(path) = self {
-            if let Err(err) = std::fs::remove_file(&path) {
-                tracing::warn!(error = %err, path = %path.display(), "spilled body could not be removed");
-            }
         }
     }
 }
@@ -285,6 +286,23 @@ async fn completion_response(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // DESIGN.md "What it records" allows one info line per request, and
+    // "Client authentication" wants the client key prefix on it. The prefix
+    // rides on a span rather than a line of its own, so every "served" line,
+    // whichever exit writes it, says which client sent the request. The work
+    // future is instrumented as well, because once the keepalive commits the
+    // status line it is polled by the response body, outside this function.
+    let span = tracing::info_span!(
+        "request",
+        client_key = %client_key_prefix(headers),
+        format = ?client_format,
+        bytes = body.len(),
+    );
+    respond(state, client_format, body).instrument(span).await
+}
+
+/// The body of [`completion_response`], run inside its request span.
+async fn respond(state: Arc<AppState>, client_format: Format, body: axum::body::Bytes) -> Response {
     // The clock starts here rather than inside the handler. Everything from
     // this line on is latency the router adds, the admission gate included:
     // on a host without `/proc` the gate forks `ps` to read RSS, which is
@@ -307,15 +325,8 @@ async fn completion_response(
             high_water,
             retry_after_secs: retry_after.as_secs().max(1),
         }
-        .into_response();
+        .served(started);
     }
-
-    tracing::info!(
-        client_key = %client_key_prefix(headers),
-        format = ?client_format,
-        bytes = body.len(),
-        "request"
-    );
 
     let raw_len = body.len();
     let parsed: Value = match serde_json::from_slice(&body) {
@@ -324,7 +335,7 @@ async fn completion_response(
             return ApiError::BadRequest {
                 reason: format!("body is not valid JSON: {err}"),
             }
-            .into_response()
+            .served(started)
         }
     };
     drop(body);
@@ -339,14 +350,10 @@ async fn completion_response(
     let interval = state.config.router.keepalive_interval;
 
     with_keepalive(
-        Box::pin(handle_completion(
-            state,
-            client_format,
-            parsed,
-            raw_len,
-            wants_stream,
-            started,
-        )),
+        Box::pin(
+            handle_completion(state, client_format, parsed, raw_len, wants_stream, started)
+                .in_current_span(),
+        ),
         wants_stream,
         interval,
     )
@@ -590,7 +597,7 @@ async fn handle_completion(
                 ApiError::BadRequest {
                     reason: err.to_string(),
                 }
-                .into_response(),
+                .served(started),
             )
         }
     };
@@ -642,7 +649,7 @@ async fn handle_completion(
         if let Some(outcome) = error.outcome() {
             state.metrics.record_request(outcome);
         }
-        return Served::Whole(error.into_response());
+        return Served::Whole(error.served(started));
     }
 
     // Encoded once and shared. Below the spill threshold it stays in RAM and
@@ -656,29 +663,48 @@ async fn handle_completion(
                 ApiError::BadRequest {
                     reason: err.to_string(),
                 }
-                .into_response(),
+                .served(started),
             )
         }
     };
     drop(request);
 
     // Dropping this future, which is what axum does when the client goes
-    // away, fires the token and tears down every channel call.
+    // away, fires the token and tears down every channel call. The walk runs
+    // as its own task so it is still polled after that: it has to see the
+    // token, settle the failures it already holds and log the hang-up. Were
+    // it awaited in place, it would be dropped with the handler and none of
+    // that would ever run.
     let cancel = CancellationToken::new();
     let guard = cancel.clone().drop_guard();
-
-    let outcome = state
-        .racer
-        .run(
-            RaceInput {
-                outbound,
-                filter,
-                streaming,
-                named_model: named_model.clone(),
-            },
-            cancel,
-        )
-        .await;
+    let racer = Arc::clone(&state.racer);
+    let input = RaceInput {
+        outbound,
+        filter,
+        streaming,
+        named_model: named_model.clone(),
+    };
+    let race = tokio::spawn(
+        async move {
+            let outcome = racer.run(input, cancel).await;
+            if matches!(outcome, RaceOutcome::ClientGone) {
+                tracing::info!(
+                    outcome = "client_gone",
+                    ms = started.elapsed().as_millis() as u64,
+                    "served"
+                );
+            }
+            outcome
+        }
+        // A spawned task does not inherit the request span, so it is handed on
+        // and the hang-up line still names the client.
+        .instrument(tracing::Span::current()),
+    );
+    // The task is never aborted, so the only error is a panic, passed on as
+    // if the walk had run in place.
+    let outcome = race
+        .await
+        .unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()));
     // The winning stream is not held by this token: it moved out of its trial
     // before the race cancelled the losers.
     drop(guard);
@@ -691,7 +717,7 @@ async fn handle_completion(
         } => {
             if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
                 let best = crate::race::best_for_cache(&winner, &also_finished);
-                write_cache(cache, key, best, crate::cache::StreamEnd::Complete, now);
+                write_cache(cache, key, best, crate::cache::StreamEnd::Complete, now).await;
             }
             drop(also_finished);
 
@@ -721,7 +747,7 @@ async fn handle_completion(
                         attempts,
                         last_error: Some("could not translate the reply".to_string()),
                     }
-                    .into_response(),
+                    .served(started),
                 );
             };
 
@@ -757,9 +783,15 @@ async fn handle_completion(
                 intelligence,
                 chunks,
                 latency,
+                first_token_at,
             } = *winner;
             let served = named_model.clone().unwrap_or_else(|| model_id.clone());
 
+            // A streaming client has the winning response at its first token.
+            // A plain client only has it once the fold is done, so the plain
+            // path below adds the time the provider spent generating after
+            // that first token: it is upstream time, not time the router added.
+            let mut upstream = latency;
             let reply = if wants_stream {
                 // Forwarded as it arrives, with a copy taken on the way past.
                 // The copy only lands once the stream has run to the end, so a
@@ -794,7 +826,8 @@ async fn handle_completion(
                                     &winner,
                                     crate::cache::StreamEnd::Complete,
                                     now,
-                                );
+                                )
+                                .await;
                             }
                             Err(err) => {
                                 tracing::warn!(error = %err, "a streamed answer could not be folded for the cache");
@@ -809,7 +842,9 @@ async fn handle_completion(
                 // The client wants one piece, so the stream is folded into one
                 // here. That is the only place the whole answer exists, so it
                 // is also the only streamed path that can feed the cache.
-                match crate::wire::aggregate_stream(chunks).await {
+                let folded = crate::wire::aggregate_stream(chunks).await;
+                upstream += first_token_at.elapsed();
+                match folded {
                     Ok(response) => {
                         let winner = crate::race::Winner {
                             channel_id,
@@ -826,7 +861,8 @@ async fn handle_completion(
                                 &winner,
                                 crate::cache::StreamEnd::Complete,
                                 now,
-                            );
+                            )
+                            .await;
                         }
                         crate::wire::encode_response(&winner.response, client_format, Some(&served))
                             .map(|value| Served::Whole(axum::Json(value).into_response()))
@@ -845,7 +881,7 @@ async fn handle_completion(
                 Ok(reply) => {
                     state
                         .metrics
-                        .record_latency(latency, total.saturating_sub(latency));
+                        .record_latency(upstream, total.saturating_sub(upstream));
                     state.metrics.record_request(Outcome::Success);
                     tracing::info!(
                         outcome = "success",
@@ -867,7 +903,7 @@ async fn handle_completion(
                             attempts,
                             last_error: Some(error),
                         }
-                        .into_response(),
+                        .served(started),
                     )
                 }
             }
@@ -903,14 +939,12 @@ async fn handle_completion(
             )
         }
 
-        RaceOutcome::ClientGone => {
-            tracing::debug!("client went away");
-            Served::Whole(
-                StatusCode::from_u16(499)
-                    .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
-                    .into_response(),
-            )
-        }
+        // Logged by the walk's task, which outlives the handler.
+        RaceOutcome::ClientGone => Served::Whole(
+            StatusCode::from_u16(499)
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                .into_response(),
+        ),
     }
 }
 
@@ -1059,8 +1093,8 @@ fn cache_body(response: &crate::wire::NeutralResponse) -> serde_json::Result<Vec
 /// `end` says how the answer arrived. A buffered winner is always
 /// [`StreamEnd::Complete`]; a folded stream is only complete because the fold
 /// succeeded, and [`Cache::put_stream`] is where that rule is enforced.
-fn write_cache(
-    cache: &Cache,
+async fn write_cache(
+    cache: &Arc<Cache>,
     key: crate::cache::CacheKey,
     best: &crate::race::Winner,
     end: crate::cache::StreamEnd,
@@ -1082,7 +1116,10 @@ fn write_cache(
         provider: best.provider.clone(),
         body,
     };
-    if let Err(err) = cache.put_stream(key, entry, end, now) {
+    if let Err(err) = Arc::clone(cache)
+        .put_stream_off_thread(key, entry, end, now)
+        .await
+    {
         tracing::warn!(error = %err, "cache write failed");
     }
 }
@@ -1097,12 +1134,16 @@ fn min_context(prompt_tokens: u32, output_tokens: u32) -> u32 {
 /// The first 6 characters of the client's key, for telling two tools apart in
 /// the log. The value is never checked and never forwarded.
 fn client_key_prefix(headers: &HeaderMap) -> String {
+    use headers::{authorization::Bearer, Authorization, HeaderMapExt};
+    // The scheme name is case-insensitive (RFC 9110 section 11.1), which the
+    // typed parser handles. Anything else falls back to the raw header.
+    let bearer = headers.typed_get::<Authorization<Bearer>>();
     let raw = headers
         .get(header::AUTHORIZATION)
         .or_else(|| headers.get("x-api-key"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    let value = raw.strip_prefix("Bearer ").unwrap_or(raw).trim();
+    let value = bearer.as_ref().map_or(raw, |auth| auth.token()).trim();
     if value.is_empty() {
         return "none".to_string();
     }
@@ -1218,6 +1259,19 @@ impl ApiError {
             ApiError::NoChannel { .. } => Some(Outcome::NoChannel),
             ApiError::UnknownModel { .. } | ApiError::BadRequest { .. } => None,
         }
+    }
+
+    /// The response for a request that ends here, with the one info line per
+    /// request that DESIGN.md "What it records" asks for. `started` is when
+    /// the request reached the router.
+    fn served(self, started: Instant) -> Response {
+        tracing::info!(
+            outcome = self.tag(),
+            status = self.status().as_u16(),
+            ms = started.elapsed().as_millis() as u64,
+            "served"
+        );
+        self.into_response()
     }
 
     /// The numbers specific to this code.
@@ -1462,6 +1516,17 @@ mod tests {
             .expect("above the threshold it spills")
             .to_path_buf();
         assert!(path.is_file(), "the body is on disk, not in RAM");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "only the router can read a spilled prompt");
+        }
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !name.starts_with(&format!("{}-", std::process::id())),
+            "the name is random, not pid plus a counter"
+        );
         // A fallback channel call, twenty minutes later, still gets the prompt.
         assert_eq!(body.load().await.unwrap(), prompt);
 
@@ -1469,6 +1534,34 @@ mod tests {
         assert!(
             !path.exists(),
             "the scratch file goes when the client has its answer"
+        );
+    }
+
+    #[test]
+    fn a_client_hanging_up_mid_spill_leaves_no_scratch_file() {
+        let dir = spill_dir("hangup");
+        let config = RouterConfig {
+            spill_above_concurrent: 100,
+            spill_path: dir.path().to_path_buf(),
+            ..RouterConfig::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let prompt = Bytes::from(vec![b'x'; 4 * 1024 * 1024]);
+            let mut spill = Box::pin(PromptBody::new(prompt, 101, &config));
+            // One poll starts the write on the blocking pool, then the handler
+            // future is dropped, as axum does when the client disconnects.
+            assert!(futures::poll!(spill.as_mut()).is_pending());
+        });
+        // Dropping the runtime waits for the blocking pool to finish, so any
+        // write still in flight has landed by now.
+        drop(runtime);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "an abandoned spill must not leave the prompt on disk"
         );
     }
 
@@ -1994,6 +2087,12 @@ mod tests {
         headers.insert(header::AUTHORIZATION, "Bearer ab".parse().unwrap());
         assert_eq!(client_key_prefix(&headers), "ab");
 
+        // The scheme name is case-insensitive, so a lower-case one is still
+        // stripped and the key itself is logged.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "bearer sk-lower".parse().unwrap());
+        assert_eq!(client_key_prefix(&headers), "sk-low");
+
         assert_eq!(client_key_prefix(&HeaderMap::new()), "none");
     }
 
@@ -2179,11 +2278,9 @@ mod tests {
     /// window. Without the limit turned off in [`router`], the `Bytes`
     /// extractor refuses this request with a bare plain-text 413, the handler
     /// never runs, and nothing is counted on `/metrics`.
-    #[tokio::test]
-    async fn a_body_above_two_mebibytes_reaches_the_handler() {
-        use tower::ServiceExt;
-
-        let dir = spill_dir("body-limit");
+    /// A router with no providers, so the catalogue stays cold. `dir` holds
+    /// its scratch store and spill files.
+    fn bare_state(dir: &tempfile::TempDir) -> Arc<AppState> {
         let config = Config {
             router: RouterConfig {
                 spill_path: dir.path().to_path_buf(),
@@ -2222,7 +2319,7 @@ mod tests {
             net,
             Arc::clone(&metrics),
         ));
-        let state = Arc::new(AppState {
+        Arc::new(AppState {
             // u64::MAX, so the RSS gate admits whatever this machine is using.
             admission: Admission::new(u64::MAX, std::time::Duration::from_secs(30)),
             config,
@@ -2232,7 +2329,97 @@ mod tests {
             racer,
             metrics,
             started_at: Instant::now(),
+        })
+    }
+
+    /// DESIGN.md "What it records": one info line per request with its
+    /// outcome. A request turned away before the race used to leave nothing
+    /// in the log to say how it ended.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_request_rejected_before_the_race_still_logs_its_outcome() {
+        use tower::ServiceExt;
+
+        let dir = spill_dir("outcome-line");
+        let mut statuses = Vec::new();
+        for body in [
+            "not json".to_string(),
+            json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]})
+                .to_string(),
+        ] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("the request builds");
+            let response = router(bare_state(&dir))
+                .oneshot(request)
+                .await
+                .expect("the router answers");
+            statuses.push(response.status());
+        }
+
+        assert_eq!(
+            statuses,
+            vec![StatusCode::BAD_REQUEST, StatusCode::GATEWAY_TIMEOUT],
+            "a bad body is a 400 and a cold catalogue is a 504"
+        );
+        // tracing-test installs one global subscriber, so the capture does not
+        // race other tests for the callsite interest cache the way a scoped
+        // `with_default` subscriber did.
+        for outcome in ["bad_request", "no_channel"] {
+            logs_assert(|lines: &[&str]| {
+                lines
+                    .iter()
+                    .any(|line| {
+                        line.contains(" INFO ")
+                            && line.contains("served")
+                            && line.contains(&format!("outcome=\"{outcome}\""))
+                    })
+                    .then_some(())
+                    .ok_or_else(|| format!("no info outcome line for {outcome}: {lines:?}"))
+            });
+        }
+    }
+
+    /// DESIGN.md "What it records": one info line per request, and the client
+    /// key prefix from "Client authentication" on that same line, so the
+    /// prefix can be matched to its outcome under concurrency.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_request_writes_one_info_line_carrying_the_client_key() {
+        use tower::ServiceExt;
+
+        let dir = spill_dir("one-line");
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-api-key", "sk-onelinetest")
+            .body(axum::body::Body::from("not json"))
+            .expect("the request builds");
+        let response = router(bare_state(&dir))
+            .oneshot(request)
+            .await
+            .expect("the router answers");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        logs_assert(|lines: &[&str]| {
+            let info: Vec<&&str> = lines.iter().filter(|l| l.contains(" INFO ")).collect();
+            match info.as_slice() {
+                [line] if line.contains("served") && line.contains("sk-one") => Ok(()),
+                _ => Err(format!("want one info line with outcome and key: {info:?}")),
+            }
         });
+    }
+
+    #[tokio::test]
+    async fn a_body_above_two_mebibytes_reaches_the_handler() {
+        use tower::ServiceExt;
+
+        let dir = spill_dir("body-limit");
+        let state = bare_state(&dir);
 
         // Three MiB, past the 2 MiB default and short of the 3.8MB working
         // size. Deliberately not JSON: reaching the parser is the whole point,

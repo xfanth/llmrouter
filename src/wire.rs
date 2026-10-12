@@ -85,11 +85,30 @@ impl ChunkStream {
     /// nothing wrong. The decoder is the first thing that knows: it reaches
     /// the end with no terminal event and fails here. This is the hook that
     /// carries that back to the caller.
+    ///
+    /// A provider can also report a failure inside an otherwise healthy
+    /// stream, as an error frame part way through an answer. The decoder
+    /// normalises that into a `StreamError` chunk and yields it as an `Ok`
+    /// item, so it never reaches the failing branch. It is still the channel
+    /// failing mid-answer, so it fires the hook too, and so does a frame the
+    /// decoder could not read at all.
     pub fn on_error(self, on_error: impl Fn() + Send + 'static) -> Self {
-        Self(Box::pin(futures::TryStreamExt::inspect_err(
-            self.0,
-            move |_| on_error(),
-        )))
+        Self(Box::pin(self.0.map(move |item| {
+            let failed = match &item {
+                Err(_) => true,
+                Ok(event) => event.normalized().iter().any(|chunk| {
+                    matches!(
+                        chunk,
+                        switchyard_protocol::stream::LlmResponseChunk::StreamError { .. }
+                            | switchyard_protocol::stream::LlmResponseChunk::DecodeError { .. }
+                    )
+                }),
+            };
+            if failed {
+                on_error();
+            }
+            item
+        })))
     }
     /// Calls `on_terminal` once the answer's terminal chunk has gone past,
     /// passing every item through untouched.
@@ -118,15 +137,49 @@ impl ChunkStream {
 
 /// A stream of wire-format event objects, ready for the server to frame as
 /// server-sent events.
-pub struct EventStream(switchyard_translation::RawEventStream);
+pub struct EventStream {
+    inner: switchyard_translation::RawEventStream,
+    /// One timestamp for the whole stream, so every chunk of an answer carries
+    /// the same `created`, as the OpenAI shape expects.
+    created: u64,
+}
 
 impl EventStream {
     /// Pulls the next event, or `None` at the end of the stream.
     pub async fn next(&mut self) -> Option<std::result::Result<Value, WireError>> {
-        self.0
-            .next()
-            .await
-            .map(|item| item.map_err(|error| WireError::Stream(error.to_string())))
+        let created = self.created;
+        self.inner.next().await.map(|item| {
+            item.map_err(|error| WireError::Stream(error.to_string()))
+                .map(|mut event| {
+                    stamp_created(&mut event, created);
+                    event
+                })
+        })
+    }
+}
+
+/// Seconds since the unix epoch, saturating at zero before 1970.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Fills the OpenAI `created` field when the translation crate left it at
+/// zero.
+///
+/// `switchyard-translation` hard-codes `"created": 0` on every OpenAI-shaped
+/// body it builds, buffered and streaming alike, because the neutral response
+/// has no equivalent field and the Anthropic shape never needed one. A strict
+/// OpenAI client parses that as 1 January 1970, so the router stamps the real
+/// time on the way out. A non-zero value the crate did produce is left alone.
+fn stamp_created(body: &mut Value, created: u64) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if object.get("created") == Some(&Value::from(0)) {
+        object.insert("created".to_owned(), Value::from(created));
     }
 }
 
@@ -201,8 +254,11 @@ pub fn encode_response(
     format: Format,
     served_model: Option<&str>,
 ) -> std::result::Result<Value, WireError> {
-    switchyard_translation::encode_aggregated_response(response, format.into(), served_model)
-        .map_err(|error| WireError::Translation(error.to_string()))
+    let mut body =
+        switchyard_translation::encode_aggregated_response(response, format.into(), served_model)
+            .map_err(|error| WireError::Translation(error.to_string()))?;
+    stamp_created(&mut body, now_unix());
+    Ok(body)
 }
 
 /// Edge out, streaming: a channel's raw server-sent-event bytes become neutral
@@ -231,7 +287,10 @@ pub fn encode_stream(
     served_model: Option<String>,
 ) -> std::result::Result<EventStream, WireError> {
     switchyard_translation::encode_stream(chunks.0, target.into(), served_model)
-        .map(EventStream)
+        .map(|inner| EventStream {
+            inner,
+            created: now_unix(),
+        })
         .map_err(|error| WireError::Stream(error.to_string()))
 }
 
@@ -382,42 +441,10 @@ pub fn canonical_bytes(request: &NeutralRequest) -> std::result::Result<Vec<u8>,
         });
     }
 
-    let mut out = Vec::new();
-    write_canonical(&value, &mut out).map_err(|error| WireError::Translation(error.to_string()))?;
-    Ok(out)
-}
-
-/// Writes a value with every object key sorted and no whitespace. Scalars go
-/// through `serde_json`, which gives one fixed number format.
-fn write_canonical(value: &Value, out: &mut Vec<u8>) -> std::result::Result<(), serde_json::Error> {
-    match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push(b'{');
-            for (index, key) in keys.into_iter().enumerate() {
-                if index > 0 {
-                    out.push(b',');
-                }
-                serde_json::to_writer(&mut *out, key)?;
-                out.push(b':');
-                write_canonical(&map[key], out)?;
-            }
-            out.push(b'}');
-        }
-        Value::Array(items) => {
-            out.push(b'[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push(b',');
-                }
-                write_canonical(item, out)?;
-            }
-            out.push(b']');
-        }
-        scalar => serde_json::to_writer(&mut *out, scalar)?,
-    }
-    Ok(())
+    // serde_json has preserve_order on in this build, so sort every nested
+    // object explicitly before writing.
+    value.sort_all_objects();
+    serde_json::to_vec(&value).map_err(|error| WireError::Translation(error.to_string()))
 }
 
 /// True when the request carries tool definitions. Claude Code always does, and
@@ -495,6 +522,59 @@ mod tests {
         let out = encode_response(&folded, Format::OpenAiChat, Some("served"))
             .expect("the folded answer translates");
         assert_eq!(out["choices"][0]["message"]["content"], "hello world");
+    }
+
+    /// The translation crate hard-codes `"created": 0` on the OpenAI shape, so
+    /// the router has to stamp the real time on the way out. A client that
+    /// parses the field as a date would otherwise read 1 January 1970.
+    #[tokio::test]
+    async fn an_openai_reply_carries_a_real_created_timestamp() {
+        let provider_reply = serde_json::json!({
+            "id": "1",
+            "model": "upstream",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello world"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+        let response =
+            decode_response(&provider_reply, Format::OpenAiChat).expect("the reply decodes");
+
+        // Anything after the start of 2025 proves it is a clock reading and not
+        // the crate's zero.
+        let floor = 1_735_689_600;
+        let buffered = encode_response(&response, Format::OpenAiChat, Some("served"))
+            .expect("the answer translates");
+        assert!(
+            buffered["created"].as_u64().expect("created is a number") > floor,
+            "the buffered reply carries a real timestamp, got {}",
+            buffered["created"]
+        );
+
+        let mut events = encode_stream(
+            stream_of(response),
+            Format::OpenAiChat,
+            Some("served".to_owned()),
+        )
+        .expect("the stream translates");
+        let mut stamps = Vec::new();
+        while let Some(event) = events.next().await {
+            let event = event.expect("every event is good");
+            if let Some(created) = event.get("created").and_then(Value::as_u64) {
+                stamps.push(created);
+            }
+        }
+        assert!(!stamps.is_empty(), "the stream carries created fields");
+        assert!(
+            stamps.iter().all(|at| *at > floor),
+            "every chunk carries a real timestamp, got {stamps:?}"
+        );
+        assert!(
+            stamps.windows(2).all(|pair| pair[0] == pair[1]),
+            "one timestamp for the whole stream, got {stamps:?}"
+        );
     }
 
     /// A stream the client abandons part way must leave nothing behind: a
@@ -618,13 +698,19 @@ mod tests {
 
     #[test]
     fn canonical_bytes_sort_keys_and_drop_whitespace() {
-        let value = serde_json::json!({"b": 1, "a": {"d": [3, 2], "c": null}});
-        let mut out = Vec::new();
-        write_canonical(&value, &mut out).unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            r#"{"a":{"c":null,"d":[3,2]},"b":1}"#
+        // A nested object inserted out of order, deep inside the request, must
+        // come out with every key sorted and no whitespace.
+        let mut request = NeutralRequest::default();
+        request.extensions.fields.insert(
+            "logit_bias".into(),
+            serde_json::json!({"b": 1, "a": {"d": [3, {"y": 0, "x": 0}], "c": null}}),
         );
+        let text = String::from_utf8(canonical_bytes(&request).unwrap()).unwrap();
+        assert!(
+            text.contains(r#""logit_bias":{"a":{"c":null,"d":[3,{"x":0,"y":0}]},"b":1}"#),
+            "{text}"
+        );
+        assert!(!text.contains(char::is_whitespace), "{text}");
     }
 
     #[test]

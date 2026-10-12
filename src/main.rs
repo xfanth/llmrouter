@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         config_dir = %dir.display(),
         providers = config.providers.len(),
         ranked_models = config.intelligence.len(),
+        capabilities = config.capabilities.len(),
         "config loaded"
     );
 
@@ -170,7 +171,7 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
     }))
 }
 
-/// Where the five config files live. `LLMROUTER_CONFIG_DIR`, or `/config`.
+/// Where the six config files live. `LLMROUTER_CONFIG_DIR`, or `/config`.
 fn config_dir() -> PathBuf {
     std::env::var_os("LLMROUTER_CONFIG_DIR").map_or_else(|| PathBuf::from("/config"), PathBuf::from)
 }

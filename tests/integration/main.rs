@@ -4,6 +4,7 @@
 //! See tests/README.md. Each module drives the real router over a real socket
 //! against wiremock upstreams, with tempfile handing out a throwaway directory.
 
+mod build_providers;
 mod cache;
 mod health;
 mod race;
@@ -26,6 +27,45 @@ pub fn test_metrics() -> std::sync::Arc<llmrouter::Metrics> {
 /// module". Same guard as the one the smoke tier keeps on `.dockerignore`,
 /// widened to the sources. ci.sh checks this too; it lives here as well so a
 /// plain `cargo test` catches it.
+/// The deploy directories sit inside the main checkout: on the TrueNAS host
+/// `/mnt/shuttle/share/app-data/llmrouter` is the working tree, so the live
+/// config is `config/` and the `/data` mount is `data/`. `.gitignore` is the
+/// only thing keeping the live keys in `config/.env` and the client prompts
+/// in `data/spill/` out of git. This pins those rules so nobody can delete
+/// them as clutter. `--no-index` checks the rules alone, tracked or not.
+#[test]
+fn deploy_directories_inside_the_checkout_are_ignored() {
+    let paths = [
+        "config/.env",
+        "config/providers.yml",
+        "config/models.yml",
+        "config/router.yml",
+        "config/intelligence.yml",
+        "config/model_capabilities.csv",
+        "data/cache.redb",
+        "data/spill/prompt.json",
+    ];
+    let output = std::process::Command::new("git")
+        .args(["check-ignore", "--no-index", "--"])
+        .args(paths)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("git must be on PATH");
+
+    let ignored = String::from_utf8_lossy(&output.stdout);
+    let ignored: Vec<&str> = ignored.lines().collect();
+    let exposed: Vec<&str> = paths
+        .iter()
+        .copied()
+        .filter(|p| !ignored.contains(p))
+        .collect();
+    assert!(
+        exposed.is_empty(),
+        "these deploy paths sit inside the checkout and .gitignore no longer \
+         covers them, so git would see live keys or client prompts: {exposed:?}"
+    );
+}
+
 #[test]
 fn every_source_file_is_tracked_by_git() {
     let output = std::process::Command::new("git")

@@ -104,6 +104,9 @@ pub struct StreamWinner {
     pub chunks: ChunkStream,
     /// Wall clock of the winning channel call up to its first bytes.
     pub latency: Duration,
+    /// When the first token arrived. Everything from here until the answer is
+    /// whole is the provider generating, not the router working.
+    pub first_token_at: tokio::time::Instant,
 }
 
 /// How the race ended.
@@ -242,7 +245,7 @@ impl Racer {
 
                 _ = cancel.cancelled() => {
                     race_cancel.cancel();
-                    return RaceOutcome::ClientGone;
+                    return self.client_gone(net_check.as_mut(), net_done, &mut held).await;
                 }
 
                 link = &mut net_check, if !net_done => {
@@ -311,14 +314,16 @@ impl Racer {
                         // Nothing goes to the client until the window closes.
                         HedgeStrategy::Tps => {
                             match self
-                                .stream_window(ready, &mut inflight, &mut held, &cancel)
+                                .stream_window(ready, &snapshot, &mut inflight, &mut held, &cancel)
                                 .await
                             {
                                 WindowOutcome::Winner(winner) => Some(winner),
                                 WindowOutcome::AllBroke => None,
                                 WindowOutcome::ClientGone => {
                                     race_cancel.cancel();
-                                    return RaceOutcome::ClientGone;
+                                    return self
+                                        .client_gone(net_check.as_mut(), net_done, &mut held)
+                                        .await;
                                 }
                             }
                         }
@@ -331,6 +336,11 @@ impl Racer {
                         // through to the exhausted check below.
                         last_error =
                             Some("every stream broke inside the decision window".to_string());
+                        // The broken streams are held as failures like any
+                        // other, so once the link is known to be up they land.
+                        if link_up {
+                            self.apply_held(&mut held);
+                        }
                         // The dead channels are replaced here, which also
                         // covers the trials that died inside the window: the
                         // set goes back to N whatever the window cost it.
@@ -350,17 +360,19 @@ impl Racer {
                         }
                         continue;
                     };
-                    // Dropping the losing trials tears their sockets down; the
-                    // winner's stream has already moved out of its trial.
-                    race_cancel.cancel();
-                    // Trials that had already failed before the token fired
-                    // are real channel failures, not cancellations, and they
-                    // are owed the same backoff as on the buffered path. The
-                    // set is drained without waiting, so the stream is not
-                    // held up by trials still in flight.
-                    hold_finished_failures(&mut inflight, &mut held);
-                    // A channel streamed bytes, so the link is up.
-                    self.apply_held(&mut held);
+                    // The success is written only now the stream has been
+                    // judged. Writing it at the first token would clear the
+                    // backoff of a channel that then broke inside the window.
+                    if let Some(channel) = snapshot.iter().find(|c| c.id == picked.channel_id) {
+                        self.apply_success(channel);
+                    }
+                    concede_to_stream(
+                        &race_cancel,
+                        &mut inflight,
+                        &mut held,
+                        &self.health,
+                        &self.catalogue,
+                    );
                     match self.winner_from(*picked) {
                         Ok(winner) => {
                             return RaceOutcome::Streamed {
@@ -505,40 +517,22 @@ impl Racer {
         }
 
         let mut failures: Vec<CopyFailure> = Vec::new();
-
-        loop {
-            // The select is biased on cancellation, so a copy that finished
-            // just before the token fired would never be polled. Handle the
-            // cancellation after the select, once the borrow of `running` has
-            // ended, so those copies can still be collected.
-            let (cancelled, next) = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => (true, None),
-                next = running.next() => (false, next),
-            };
-
-            if cancelled {
-                // A copy that already returned is paid for either way, and may
-                // come from a smarter model than whatever won the race.
-                if let Some(win) = finished_now(&mut running).into_iter().flatten().next() {
-                    return self.trial_won(channel, win);
-                }
-                self.metrics
-                    .record_attempt(channel.id, AttemptOutcome::Cancelled);
+        let raced = first_copy(&mut running, &cancel, |failure| {
+            note_failure(channel, &failure);
+            failures.push(failure);
+        })
+        .await;
+        match raced {
+            CopyRace::Won(win) => return self.trial_won(channel, win),
+            CopyRace::Cancelled => {
+                self.metrics.record_attempt(
+                    &channel.provider,
+                    &channel.model_id,
+                    AttemptOutcome::Cancelled,
+                );
                 return TrialOutcome::Cancelled;
             }
-
-            match next {
-                // The first copy home wins outright. A buffered reply is
-                // complete, so there is nothing a later copy could buy that
-                // waiting longer does not cost more of.
-                Some(Ok(win)) => return self.trial_won(channel, win),
-                Some(Err(failure)) => {
-                    note_failure(channel, &failure);
-                    failures.push(failure);
-                }
-                None => break,
-            }
+            CopyRace::AllFailed => {}
         }
 
         // Every copy failed, which is one failure against health, not M. The
@@ -546,7 +540,7 @@ impl Racer {
         // the network test has answered, nobody knows whether the fault is the
         // channel's or the local link's.
         let self_inflicted = !failures.is_empty() && failures.iter().all(|f| f.self_inflicted);
-        let retry_after_secs = failures.iter().filter_map(|f| f.retry_after_secs).max();
+        let retry_after_secs = longest_retry_after(&failures);
         TrialOutcome::Failed {
             error: failures
                 .last()
@@ -572,6 +566,7 @@ impl Racer {
     async fn stream_window<'a, F>(
         &self,
         first: Box<ReadyStream>,
+        channels: &'a [Channel],
         inflight: &mut FuturesUnordered<F>,
         held: &mut Vec<PendingFailure<'a>>,
         cancel: &CancellationToken,
@@ -580,7 +575,7 @@ impl Racer {
         F: std::future::Future<Output = TrialOutcome<'a>>,
     {
         let window = Duration::from_millis(self.config.router.hedge_window_ms);
-        watch_window(first, inflight, held, cancel, window).await
+        watch_window(first, channels, inflight, held, cancel, window).await
     }
 
     /// Turns the picked stream into the winner the server forwards, with the
@@ -596,14 +591,35 @@ impl Racer {
     /// Writes every health move held back while the link state was unknown.
     /// Only called once something has proven the link is up.
     fn apply_held(&self, held: &mut Vec<PendingFailure<'_>>) {
-        settle_held(&self.health, &self.catalogue.snapshot(), held, false);
+        settle_held(&self.health, &self.catalogue, held, false);
     }
 
     /// Settles the held moves against how the walk ended: a dead link drops
     /// them, anything else writes them.
     fn settle_held(&self, held: &mut Vec<PendingFailure<'_>>, outcome: &RaceOutcome) {
         let link_down = matches!(outcome, RaceOutcome::NoNetwork { .. });
-        settle_held(&self.health, &self.catalogue.snapshot(), held, link_down);
+        settle_held(&self.health, &self.catalogue, held, link_down);
+    }
+
+    /// The client went away. The calls are already cancelled, but the trials
+    /// that failed before that are real channel failures and still owe their
+    /// backoff. The client leaving says nothing about the link, so the held
+    /// moves are settled exactly as any other ending settles them: at once
+    /// when the test has answered, or once it does. The test carries its own
+    /// 2 second timeout, so this cannot hang.
+    async fn client_gone<F>(
+        &self,
+        net_check: Pin<&mut F>,
+        net_done: bool,
+        held: &mut Vec<PendingFailure<'_>>,
+    ) -> RaceOutcome
+    where
+        F: std::future::Future<Output = LinkState>,
+    {
+        let link_down =
+            !held.is_empty() && !net_done && matches!(net_check.await, LinkState::Down { .. });
+        settle_held(&self.health, &self.catalogue, held, link_down);
+        RaceOutcome::ClientGone
     }
 
     /// One buffered copy of a channel call.
@@ -635,8 +651,11 @@ impl Racer {
             // The router caused this one. Fail the call, keep the channel's
             // counters where they are.
             channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .record_attempt(channel.id, AttemptOutcome::HttpError);
+            self.metrics.record_attempt(
+                &channel.provider,
+                &channel.model_id,
+                AttemptOutcome::HttpError,
+            );
             return Err(CopyFailure {
                 error: "429 caused by this router's own concurrency".to_string(),
                 retry_after_secs: None,
@@ -646,8 +665,11 @@ impl Racer {
 
         if !crate::health::is_healthy_response(call.status, &call.body) {
             channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .record_attempt(channel.id, AttemptOutcome::HttpError);
+            self.metrics.record_attempt(
+                &channel.provider,
+                &channel.model_id,
+                AttemptOutcome::HttpError,
+            );
             return Err(CopyFailure {
                 error: failure_reason(call.status, &call.body),
                 retry_after_secs: call.retry_after_secs,
@@ -660,8 +682,11 @@ impl Racer {
             Ok(value) => value,
             Err(error) => {
                 channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .record_attempt(channel.id, AttemptOutcome::HttpError);
+                self.metrics.record_attempt(
+                    &channel.provider,
+                    &channel.model_id,
+                    AttemptOutcome::HttpError,
+                );
                 return Err(CopyFailure {
                     error: format!("unparseable body: {error}"),
                     retry_after_secs: call.retry_after_secs,
@@ -673,8 +698,11 @@ impl Racer {
             Ok(response) => response,
             Err(error) => {
                 channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                self.metrics
-                    .record_attempt(channel.id, AttemptOutcome::HttpError);
+                self.metrics.record_attempt(
+                    &channel.provider,
+                    &channel.model_id,
+                    AttemptOutcome::HttpError,
+                );
                 return Err(CopyFailure {
                     error: format!("undecodable body: {error}"),
                     retry_after_secs: call.retry_after_secs,
@@ -683,8 +711,11 @@ impl Racer {
             }
         };
 
-        self.metrics
-            .record_attempt(channel.id, AttemptOutcome::Success);
+        self.metrics.record_attempt(
+            &channel.provider,
+            &channel.model_id,
+            AttemptOutcome::Success,
+        );
         Ok(CopyWin::Buffered(Box::new(Winner {
             channel_id: channel.id,
             provider: channel.provider.to_string(),
@@ -723,8 +754,11 @@ impl Racer {
             )
         {
             channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .record_attempt(channel.id, AttemptOutcome::HttpError);
+            self.metrics.record_attempt(
+                &channel.provider,
+                &channel.model_id,
+                AttemptOutcome::HttpError,
+            );
             return Err(CopyFailure {
                 error: "429 caused by this router's own concurrency".to_string(),
                 retry_after_secs: None,
@@ -736,8 +770,11 @@ impl Racer {
 
         if !(200..300).contains(&call.status) {
             channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .record_attempt(channel.id, AttemptOutcome::HttpError);
+            self.metrics.record_attempt(
+                &channel.provider,
+                &channel.model_id,
+                AttemptOutcome::HttpError,
+            );
             // A bare "status 429" tells an operator nothing about which of a
             // provider's half dozen 429s this was. The body does, and on this
             // path it arrives as a stream rather than as bytes, so it has to
@@ -777,7 +814,7 @@ impl Racer {
                             (AttemptOutcome::HttpError, error, call.retry_after_secs)
                         }
                     };
-                    self.metrics.record_attempt(channel.id, outcome);
+                    self.metrics.record_attempt(&channel.provider, &channel.model_id, outcome);
                     return Err(CopyFailure {
                         error,
                         retry_after_secs,
@@ -786,8 +823,11 @@ impl Racer {
                 }
             };
 
-        self.metrics
-            .record_attempt(channel.id, AttemptOutcome::Success);
+        self.metrics.record_attempt(
+            &channel.provider,
+            &channel.model_id,
+            AttemptOutcome::Success,
+        );
         Ok(CopyWin::Streamed(Box::new(ReadyStream {
             channel_id: channel.id,
             provider: channel.provider.to_string(),
@@ -805,12 +845,15 @@ impl Racer {
         })))
     }
 
-    /// Turns a winning copy into a trial outcome, resetting the channel's
-    /// health first. Any copy succeeding makes the channel healthy.
+    /// Turns a winning copy into a trial outcome. A whole reply makes the
+    /// channel healthy at once; a stream only once the walk picks it, because
+    /// it can still break inside the decision window.
     fn trial_won<'a>(&self, channel: &'a Channel, win: CopyWin) -> TrialOutcome<'a> {
-        self.apply_success(channel);
         match win {
-            CopyWin::Buffered(winner) => TrialOutcome::Won(winner),
+            CopyWin::Buffered(winner) => {
+                self.apply_success(channel);
+                TrialOutcome::Won(winner)
+            }
             // The stream is handed over as it stands. Which strategy judges it,
             // and when it is decoded, is the walk's business, not the trial's.
             CopyWin::Streamed(ready) => TrialOutcome::WonStreaming(ready),
@@ -825,7 +868,8 @@ impl Racer {
             CallError::Cancelled => AttemptOutcome::Cancelled,
             CallError::Transport(_) => AttemptOutcome::HttpError,
         };
-        self.metrics.record_attempt(channel.id, outcome);
+        self.metrics
+            .record_attempt(&channel.provider, &channel.model_id, outcome);
         CopyFailure {
             error: error.to_string(),
             retry_after_secs: None,
@@ -836,29 +880,32 @@ impl Racer {
     /// Records one failed trial and mirrors the result onto the channel row, so
     /// the next query sees the backoff without waiting for anything else.
     fn apply_failure(&self, channel: &Channel, retry_after_secs: Option<u64>) {
-        write_failure(
-            &self.health,
-            &self.catalogue.snapshot(),
-            channel,
-            retry_after_secs,
-        );
+        write_failure(&self.health, &self.catalogue, channel, retry_after_secs);
     }
 
     /// Records a successful trial and clears the channel row's backoff.
     fn apply_success(&self, channel: &Channel) {
         channel.telemetry.successes.fetch_add(1, Ordering::Relaxed);
-        self.health.record_success(&HealthKey::Channel(channel.id));
+        // Onto the live row, not the walk's own snapshot: a rebuild part way
+        // through the walk leaves that row orphaned, and clearing the backoff
+        // on it would leave the channel in backoff for everybody else. The row
+        // is cleared under the table entry's lock, so a failure on the same
+        // channel lands wholly before or wholly after, never in between.
+        let _rows = self.catalogue.hold_rows();
+        let snapshot = self.catalogue.snapshot();
+        let row = current_row(&snapshot, channel);
+        let base = self.health.retry_base_secs();
+        self.health
+            .record_success_then(&HealthKey::Channel(channel.id), || {
+                row.health.retry_counter.store(0, Ordering::Relaxed);
+                row.health.retry_base_secs.store(base, Ordering::Relaxed);
+                row.health.eligible_at.store(0, Ordering::Relaxed);
+            });
         // A channel answering proves its pair and its provider are alive, so
         // whatever an earlier escalation wrote above the channel clears too.
         self.health.record_success(&pair_key(channel));
         self.health
             .record_success(&HealthKey::Provider(channel.provider.to_string()));
-        channel.health.retry_counter.store(0, Ordering::Relaxed);
-        channel
-            .health
-            .retry_base_secs
-            .store(self.health.retry_base_secs(), Ordering::Relaxed);
-        channel.health.eligible_at.store(0, Ordering::Relaxed);
     }
 }
 
@@ -883,6 +930,15 @@ fn note_failure(channel: &Channel, failure: &CopyFailure) {
     );
 }
 
+/// The backoff base for a channel whose copies all failed.
+///
+/// DESIGN.md: the longest `Retry-After` among the M copies sets the base. The
+/// shortest would send the walk straight back into a provider that is still
+/// refusing, so the maximum is the only safe pick.
+fn longest_retry_after(failures: &[CopyFailure]) -> Option<u64> {
+    failures.iter().filter_map(|f| f.retry_after_secs).max()
+}
+
 /// The health key for the provider/key pair a channel belongs to.
 fn pair_key(channel: &Channel) -> HealthKey {
     HealthKey::ProviderKey {
@@ -905,39 +961,68 @@ fn is_unhealthy(health: &HealthTable, key: &HealthKey) -> bool {
 /// means a channel really did fail, so the moves are written.
 fn settle_held(
     health: &HealthTable,
-    channels: &[Channel],
+    catalogue: &Catalogue,
     held: &mut Vec<PendingFailure<'_>>,
     link_down: bool,
 ) {
     for pending in held.drain(..) {
         if !link_down {
-            write_failure(health, channels, pending.channel, pending.retry_after_secs);
+            write_failure(health, catalogue, pending.channel, pending.retry_after_secs);
         }
     }
+}
+
+/// The row for this channel in the current catalogue, falling back to the one
+/// handed in when the channel has gone from the list.
+///
+/// `Catalogue::replace` builds brand-new rows, so health written onto a row
+/// from an older snapshot is never read again. `catalogue::query` decides
+/// eligibility from the row atomics alone, so the write has to land on the row
+/// the next query will actually scan.
+fn current_row<'a>(channels: &'a [Channel], channel: &'a Channel) -> &'a Channel {
+    channels
+        .iter()
+        .find(|row| row.id == channel.id)
+        .unwrap_or(channel)
 }
 
 /// Records one failed trial and mirrors the result onto the channel row, so the
 /// next query sees the backoff without waiting for anything else.
 fn write_failure(
     health: &HealthTable,
-    channels: &[Channel],
+    catalogue: &Catalogue,
     channel: &Channel,
     retry_after_secs: Option<u64>,
 ) {
     let now = now_unix();
-    let entry = health.record_failure(&HealthKey::Channel(channel.id), retry_after_secs, now);
-    channel
-        .health
-        .retry_counter
-        .store(entry.retry_counter, Ordering::Relaxed);
-    channel
-        .health
-        .retry_base_secs
-        .store(entry.retry_base_secs, Ordering::Relaxed);
-    channel
-        .health
-        .eligible_at
-        .store(entry.eligible_at, Ordering::Relaxed);
+    // The snapshot is loaded under the rebuild lock: loaded before it, a
+    // rebuild could swap new rows in between the load and the write below,
+    // and the write would land on an orphan.
+    let _rows = catalogue.hold_rows();
+    let snapshot = catalogue.snapshot();
+    let channels = snapshot.as_slice();
+    // Onto the live row, not whatever snapshot the caller is holding. A walk
+    // runs for minutes and the poller may have rebuilt the catalogue under it,
+    // in which case the caller's row is an orphan nothing queries any more.
+    // The copy runs under the table entry's lock, so a success on the same
+    // channel cannot land between the table write and the row write.
+    let row = current_row(channels, channel);
+    health.record_failure_then(
+        &HealthKey::Channel(channel.id),
+        retry_after_secs,
+        now,
+        |entry| {
+            row.health
+                .retry_counter
+                .store(entry.retry_counter, Ordering::Relaxed);
+            row.health
+                .retry_base_secs
+                .store(entry.retry_base_secs, Ordering::Relaxed);
+            row.health
+                .eligible_at
+                .store(entry.eligible_at, Ordering::Relaxed);
+        },
+    );
     escalate_failure(health, channels, channel, retry_after_secs, now);
 }
 
@@ -963,6 +1048,10 @@ fn escalate_failure(
         // out for a fault the poller is the one meant to clear.
         return;
     }
+    // Health is binary and failures are not classified by status: a `402` or
+    // a `403` is as often about one model as about the key, so the pair goes
+    // down only when no channel on it is callable (DESIGN.md "The unit of
+    // health"). A dead key is caught by its keyed probe, not here.
     let pair_alive = channels
         .iter()
         .any(|c| c.provider == failed.provider && c.key_id == failed.key_id && c.eligible(now));
@@ -1167,36 +1256,42 @@ async fn read_error_body(rest: &mut ByteStream) -> Vec<u8> {
 /// One content frame is one token: every provider here sends a delta per
 /// token. Counting frames is therefore the tokens-per-second measure, with no
 /// tokeniser and without decoding the stream twice.
-#[derive(Default)]
 struct FrameCounter {
-    /// Whatever the last chunk left after its final newline. A half-read frame
-    /// is counted when the rest of it arrives, never twice and never early.
-    tail: Vec<u8>,
+    /// Raw chunks go in here and come out of `events` as whole events.
+    wire: futures::channel::mpsc::UnboundedSender<Result<Vec<u8>, std::convert::Infallible>>,
+    /// The SSE decoder. It holds a half-read event until the rest arrives, so
+    /// an event is counted once and never early, and the `data:` lines of one
+    /// event are joined before anything parses them.
+    events: eventsource_stream::EventStream<
+        futures::channel::mpsc::UnboundedReceiver<Result<Vec<u8>, std::convert::Infallible>>,
+    >,
     /// Content frames seen so far.
     frames: u32,
+}
+
+impl Default for FrameCounter {
+    fn default() -> Self {
+        let (wire, rx) = futures::channel::mpsc::unbounded();
+        Self {
+            wire,
+            events: eventsource_stream::EventStream::new(rx),
+            frames: 0,
+        }
+    }
 }
 
 impl FrameCounter {
     /// Takes the next raw chunk off the wire.
     fn feed(&mut self, chunk: &[u8]) {
-        self.tail.extend_from_slice(chunk);
-        let Some(end) = self.tail.iter().rposition(|b| *b == b'\n') else {
-            return;
-        };
-        let whole: Vec<u8> = self.tail.drain(..=end).collect();
-        for line in whole.split(|b| *b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            // ponytail: one copy and one JSON parse per frame, because the
-            // verdict reader works on bytes. It is the same reader the race
-            // uses to decide a stream is an answer, so a keep-alive comment
-            // and an error frame are not counted as tokens here either. Give
-            // `health` a line-level entry point if this ever shows up in a
-            // profile.
-            let mut line = line.to_vec();
-            line.push(b'\n');
-            if crate::health::stream_verdict(&line) == StreamVerdict::Content {
+        // The receiver lives in `self`, so the send cannot fail.
+        let _ = self.wire.unbounded_send(Ok(chunk.to_vec()));
+        // Drain every event the chunk completed. Pending means the decoder
+        // wants more bytes; the sender is never closed, so it never ends.
+        while let Some(Some(event)) = self.events.next().now_or_never() {
+            let Ok(event) = event else { continue };
+            // The same reader the race uses to decide a stream is an answer,
+            // so keep-alives and error events are not tokens here either.
+            if crate::health::event_verdict(&event.data) == StreamVerdict::Content {
                 self.frames = self.frames.saturating_add(1);
             }
         }
@@ -1211,6 +1306,7 @@ impl FrameCounter {
 /// still owe their health move, so they are held like any other failure.
 async fn watch_window<'a, F>(
     first: Box<ReadyStream>,
+    channels: &'a [Channel],
     inflight: &mut FuturesUnordered<F>,
     held: &mut Vec<PendingFailure<'a>>,
     cancel: &CancellationToken,
@@ -1268,6 +1364,17 @@ where
             }
 
             Some(ready) = pumping.next() => done.push(ready),
+        }
+    }
+
+    // A stream that broke in here is an ordinary failed trial, so it owes the
+    // same health move as one that failed in prefill.
+    for ready in done.iter().filter(|ready| ready.broken) {
+        if let Some(channel) = channels.iter().find(|c| c.id == ready.channel_id) {
+            held.push(PendingFailure {
+                channel,
+                retry_after_secs: None,
+            });
         }
     }
 
@@ -1468,7 +1575,7 @@ impl DeathHook {
 fn fail_mid_stream(health: &HealthTable, catalogue: &Catalogue, id: ChannelId) {
     let snapshot = catalogue.snapshot();
     if let Some(channel) = snapshot.iter().find(|channel| channel.id == id) {
-        write_failure(health, &snapshot, channel, None);
+        write_failure(health, catalogue, channel, None);
     }
 }
 
@@ -1561,6 +1668,7 @@ impl ReadyStream {
             intelligence: self.intelligence,
             chunks,
             latency: self.elapsed,
+            first_token_at: self.content_at,
         })
     }
 }
@@ -1621,16 +1729,75 @@ fn finished_now<F: std::future::Future>(running: &mut FuturesUnordered<F>) -> Ve
     done
 }
 
-/// Takes the health moves owed by trials that had already failed before the
-/// cancellation landed. Those are genuine channel failures, so they are owed
-/// the same backoff as on the buffered path. The set is polled once, so trials
-/// still in flight are left where they are and the caller is not held up.
-fn hold_finished_failures<'a, F>(
+/// How a trial's copies came out.
+#[derive(Debug, PartialEq)]
+enum CopyRace<T> {
+    /// A copy answered, possibly in the same instant the token fired.
+    Won(T),
+    /// The token fired and no copy had answered.
+    Cancelled,
+    /// Every copy failed. Each failure went to the caller's callback.
+    AllFailed,
+}
+
+/// Runs a trial's copies until one answers, all fail, or `cancel` fires.
+///
+/// The select is biased on cancellation, so a copy that finished just before
+/// the token fired would never be polled. The cancellation is handled after
+/// the select, once the borrow of `running` has ended, so that copy is still
+/// collected: it is paid for either way, and may come from a smarter model
+/// than whatever won the race.
+async fn first_copy<T, E, F>(
+    running: &mut FuturesUnordered<F>,
+    cancel: &CancellationToken,
+    mut failed: impl FnMut(E),
+) -> CopyRace<T>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    loop {
+        let (cancelled, next) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => (true, None),
+            next = running.next() => (false, next),
+        };
+
+        if cancelled {
+            return match finished_now(running).into_iter().flatten().next() {
+                Some(win) => CopyRace::Won(win),
+                None => CopyRace::Cancelled,
+            };
+        }
+
+        match next {
+            // The first copy home wins outright. A buffered reply is
+            // complete, so there is nothing a later copy could buy that
+            // waiting longer does not cost more of.
+            Some(Ok(win)) => return CopyRace::Won(win),
+            Some(Err(failure)) => failed(failure),
+            None => return CopyRace::AllFailed,
+        }
+    }
+}
+
+/// Everything a streaming win owes the trials it beat.
+///
+/// The losers are cancelled; dropping them tears their sockets down, and the
+/// winner's stream has already moved out of its trial. A trial that had
+/// already failed before the token fired is a real channel failure, not a
+/// cancellation, so it is owed the same backoff as on the buffered path. The
+/// set is polled once, so the stream is not held up by trials still in flight.
+/// A channel streamed bytes, so the link is up and every held move is written.
+fn concede_to_stream<'a, F>(
+    race_cancel: &CancellationToken,
     running: &mut FuturesUnordered<F>,
     held: &mut Vec<PendingFailure<'a>>,
+    health: &HealthTable,
+    catalogue: &Catalogue,
 ) where
     F: std::future::Future<Output = TrialOutcome<'a>>,
 {
+    race_cancel.cancel();
     for rest in finished_now(running) {
         if let TrialOutcome::Failed {
             pending: Some(pending),
@@ -1640,6 +1807,7 @@ fn hold_finished_failures<'a, F>(
             held.push(pending);
         }
     }
+    settle_held(health, catalogue, held, false);
 }
 
 /// Of every channel call that finished before cancellation, the one from the
@@ -1845,11 +2013,30 @@ mod tests {
             TrialOutcome::Cancelled
         }));
 
+        let (health, _dir) = health_table();
+        let race_cancel = CancellationToken::new();
         let mut held = Vec::new();
-        hold_finished_failures(&mut inflight, &mut held);
+        concede_to_stream(
+            &race_cancel,
+            &mut inflight,
+            &mut held,
+            &health,
+            &Catalogue::new(),
+        );
 
-        assert_eq!(held.len(), 1, "the 401 that landed first is owed a backoff");
-        assert_eq!(held[0].channel.id, failed.id);
+        assert!(race_cancel.is_cancelled(), "the losers are cancelled");
+        assert!(held.is_empty(), "every held move is written");
+        assert!(
+            failed.health.eligible_at.load(Ordering::Relaxed) > 0,
+            "the 401 that landed first puts the channel into backoff"
+        );
+        assert_eq!(
+            health
+                .get(&HealthKey::Channel(failed.id))
+                .map(|e| e.retry_counter),
+            Some(1),
+            "and the health row records the failure"
+        );
     }
 
     /// The channel calls can all fail in milliseconds while the two network
@@ -1961,7 +2148,7 @@ mod tests {
             })
             .collect();
 
-        settle_held(&health, &channels, &mut held, true);
+        settle_held(&health, &Catalogue::new(), &mut held, true);
 
         assert!(held.is_empty(), "the held moves are spent either way");
         for channel in &channels {
@@ -1979,17 +2166,74 @@ mod tests {
     #[test]
     fn a_live_link_writes_every_held_failure() {
         let (health, _dir) = health_table();
-        let channels = vec![row("openrouter", "key-0", "model-a")];
+        let channels = [row("openrouter", "key-0", "model-a")];
         let mut held = vec![PendingFailure {
             channel: &channels[0],
             retry_after_secs: None,
         }];
 
-        settle_held(&health, &channels, &mut held, false);
+        settle_held(&health, &Catalogue::new(), &mut held, false);
 
         assert!(held.is_empty());
         assert_eq!(channels[0].health.retry_counter.load(Ordering::Relaxed), 1);
         assert!(channels[0].health.eligible_at.load(Ordering::Relaxed) > 0);
+    }
+
+    /// A walk holds its snapshot for its whole life, and the poller can
+    /// rebuild the catalogue underneath it. The backoff has to land on the row
+    /// the next query will scan, not on the orphan the walk is still carrying.
+    #[test]
+    fn a_failure_after_a_rebuild_backs_off_the_live_row() {
+        let (health, _dir) = health_table();
+        let stale = row("chutes", "key-0", "model-a");
+        // What `Catalogue::replace` produces: a brand-new row, same id, health
+        // atomics re-seeded from the health table.
+        let catalogue = Catalogue::new();
+        catalogue.replace(vec![row("chutes", "key-0", "model-a")]);
+        let live = catalogue.snapshot();
+        assert_eq!(stale.id, live[0].id);
+
+        write_failure(&health, &catalogue, &stale, Some(3_600));
+
+        assert!(
+            live[0].health.eligible_at.load(Ordering::Relaxed) > 0,
+            "the live row carries the backoff"
+        );
+        assert_eq!(live[0].health.retry_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stale.health.eligible_at.load(Ordering::Relaxed),
+            0,
+            "nothing is written onto the orphan"
+        );
+    }
+
+    /// A rebuild reads the health table, builds new rows, then swaps them
+    /// in. A failure written between the read and the swap must not land on
+    /// the outgoing row and leave the new one looking healthy.
+    #[test]
+    fn a_failure_during_a_rebuild_reaches_the_new_row() {
+        let (health, _dir) = health_table();
+        let catalogue = Catalogue::new();
+        catalogue.replace(vec![row("chutes", "key-0", "model-a")]);
+        let walk = catalogue.snapshot();
+
+        std::thread::scope(|scope| {
+            catalogue.replace_with(|| {
+                // The rebuild has read a healthy entry. A race now fails the
+                // channel while the new rows are still being built.
+                let fresh = row("chutes", "key-0", "model-a");
+                scope.spawn(|| write_failure(&health, &catalogue, &walk[0], None));
+                std::thread::sleep(Duration::from_millis(100));
+                vec![fresh]
+            });
+        });
+
+        let live = catalogue.snapshot();
+        assert_eq!(live[0].health.retry_counter.load(Ordering::Relaxed), 1);
+        assert!(
+            live[0].health.eligible_at.load(Ordering::Relaxed) > 0,
+            "the row the next query scans carries the backoff"
+        );
     }
 
     fn winner(intelligence: u16, model: &str) -> Winner {
@@ -2372,6 +2616,7 @@ mod tests {
 
         let outcome = watch_window(
             Box::new(ready_with(1, 10, ticking(Duration::from_millis(100)))),
+            &[],
             &mut inflight,
             &mut held,
             &cancel,
@@ -2405,6 +2650,7 @@ mod tests {
 
         let outcome = watch_window(
             Box::new(ready_with(1, 10, ticking(Duration::from_millis(10)))),
+            &[],
             &mut inflight,
             &mut held,
             &cancel,
@@ -2424,6 +2670,15 @@ mod tests {
         counter.feed(head);
         assert_eq!(counter.frames, 0, "a half-read frame is not a token yet");
         counter.feed(tail);
+        assert_eq!(counter.frames, 1);
+    }
+
+    /// One event whose JSON is split over two `data:` lines, with CRLF line
+    /// ends, is one token. Neither line parses on its own.
+    #[test]
+    fn a_multi_line_data_event_is_one_token() {
+        let mut counter = FrameCounter::default();
+        counter.feed(b"data: {\"choices\":[{\"delta\":\r\ndata: {\"content\":\"hi\"}}]}\r\n\r\n");
         assert_eq!(counter.frames, 1);
     }
 
@@ -2468,37 +2723,65 @@ mod tests {
         assert_eq!(deaths.load(Ordering::Relaxed), 1);
     }
 
+    /// Drives `rest` through `ReadyStream::into_winner`, the production path,
+    /// to the end, and returns whether the client saw an error and the health
+    /// entry the router wrote for the channel, if any.
+    async fn run_winner_to_end(rest: ByteStream) -> (bool, Option<crate::health::HealthEntry>) {
+        let (health, _dir) = health_table();
+        let health = Arc::new(health);
+        let catalogue = Arc::new(Catalogue::new());
+        let channel = row("groq", "key-0", "model-a");
+        let id = channel.id;
+        catalogue.replace(vec![channel]);
+        let mut ready = ready_with(0, 1, rest);
+        ready.channel_id = id;
+        let winner = ready
+            .into_winner(STALL, Arc::clone(&health), catalogue)
+            .expect("decoder built");
+        let mut events = wire::encode_stream(winner.chunks, wire::Format::OpenAiChat, None)
+            .expect("the encoder starts");
+        let mut failed = false;
+        while let Some(item) = events.next().await {
+            failed |= item.is_err();
+        }
+        (failed, health.get(&HealthKey::Channel(id)))
+    }
+
+    /// A provider can report a failure inside an otherwise healthy stream: an
+    /// error frame part way through an answer, after some content has already
+    /// gone to the client. The byte stream is fine and the body ends cleanly,
+    /// so neither the stall watcher nor a transport error sees it, but the
+    /// channel has still failed mid-answer and must back off for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_mid_stream_error_frame_backs_the_channel_off() {
+        // Some content, then the provider says its quota is gone, then a
+        // clean end of body.
+        let live: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(token("hello")),
+            Ok(b"data: {\"error\":{\"message\":\"quota exhausted\"}}\n\n".to_vec()),
+        ]));
+        let (failed, entry) = run_winner_to_end(live).await;
+
+        assert!(failed, "the error frame reaches the client as an error");
+        let entry = entry.expect("the channel is marked unhealthy");
+        assert_eq!(entry.retry_counter, 1, "exactly once");
+        assert!(entry.eligible_at > 0);
+    }
+
     /// A provider that closes the body part way through an answer ends the
     /// byte stream cleanly, so the stall watcher sees nothing wrong. The
     /// decoder is what notices, at the end, with no terminal event in sight,
     /// and the channel must still back off for it.
     #[tokio::test(start_paused = true)]
     async fn a_truncated_stream_backs_the_channel_off() {
-        let deaths = Arc::new(AtomicU32::new(0));
-        let counted = Arc::clone(&deaths);
-        let hook = DeathHook::new(move || {
-            counted.fetch_add(1, Ordering::Relaxed);
-        });
         // Half an answer, then a clean end of body: no `[DONE]`, no error.
         let live: ByteStream = Box::pin(futures::stream::iter(vec![Ok(token("half"))]));
-        let bytes = watch_for_stalls(live, STALL, hook.clone(), Arc::new(AtomicBool::new(false)));
-        let chunks = wire::decode_stream(bytes, wire::Format::OpenAiChat)
-            .expect("the decoder starts")
-            .on_error(move || hook.fire());
-        let mut events = wire::encode_stream(chunks, wire::Format::OpenAiChat, None)
-            .expect("the encoder starts");
-
-        let mut failed = false;
-        while let Some(item) = events.next().await {
-            failed |= item.is_err();
-        }
+        let (failed, entry) = run_winner_to_end(live).await;
 
         assert!(failed, "the truncation reaches the client as an error");
-        assert_eq!(
-            deaths.load(Ordering::Relaxed),
-            1,
-            "and the channel is marked unhealthy exactly once"
-        );
+        let entry = entry.expect("the channel is marked unhealthy");
+        assert_eq!(entry.retry_counter, 1, "exactly once");
+        assert!(entry.eligible_at > 0);
     }
 
     /// A complete answer is not a stall, however long the socket stays open.
@@ -2511,15 +2794,23 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_complete_answer_on_a_lingering_socket_ends_cleanly() {
         let (health, _dir) = health_table();
-        let deaths = Arc::new(AtomicU32::new(0));
+        let health = Arc::new(health);
+        // The channel must be in the live catalogue, or a wrongful death
+        // would find nothing to back off and the health check below would
+        // pass however the stream ended.
+        let catalogue = Arc::new(Catalogue::new());
+        let channel = row("anthropic", "key-0", "model-a");
+        let id = channel.id;
+        catalogue.replace(vec![channel]);
         let body: ByteStream = Box::pin(
             futures::stream::iter(anthropic_answer().into_iter().map(Ok))
                 .chain(futures::stream::pending()),
         );
-        let mut ready = ready_with(1, 10, body);
+        let mut ready = ready_with(0, 10, body);
+        ready.channel_id = id;
         ready.wire = crate::config::WireName::Anthropic;
         let winner = ready
-            .into_winner(STALL, Arc::new(health), Arc::new(Catalogue::new()))
+            .into_winner(STALL, Arc::clone(&health), catalogue)
             .expect("decoder built");
         let mut events = wire::encode_stream(winner.chunks, wire::Format::AnthropicMessages, None)
             .expect("the encoder starts");
@@ -2540,7 +2831,10 @@ mod tests {
             !failed,
             "a complete answer never reaches the client as an error"
         );
-        assert_eq!(deaths.load(Ordering::Relaxed), 0);
+        assert!(
+            health.get(&HealthKey::Channel(id)).is_none(),
+            "a complete answer never backs its channel off"
+        );
         assert!(
             started.elapsed() < STALL,
             "the stream ends on the tail grace, not on the stall timeout"
@@ -2662,28 +2956,51 @@ mod tests {
         assert!(!is_self_inflicted(0, 1));
     }
 
+    /// A copy that answered in the same instant the token fired is already
+    /// paid for, so the trial returns it rather than reporting a cancellation.
+    /// Without the drain after the biased select it would be thrown away.
     #[tokio::test]
     async fn a_copy_that_finished_before_cancellation_is_still_collected() {
-        // Mirrors the trial loop: the select is biased on cancellation, so a
-        // copy that is already ready would never be polled without the
-        // post-select drain.
         let cancel = CancellationToken::new();
-        let mut running: FuturesUnordered<futures::future::BoxFuture<'static, u32>> =
+        let mut running: FuturesUnordered<futures::future::BoxFuture<'static, Result<u32, ()>>> =
             FuturesUnordered::new();
-        running.push(Box::pin(async { 7u32 }));
-        running.push(Box::pin(futures::future::pending::<u32>()));
+        running.push(Box::pin(futures::future::pending()));
+        running.push(Box::pin(async { Ok(7u32) }));
         cancel.cancel();
 
-        let (cancelled, next) = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => (true, None),
-            next = running.next() => (false, next),
-        };
-        assert!(cancelled, "the biased branch wins, so nothing is polled");
-        assert!(next.is_none());
+        let raced = first_copy(&mut running, &cancel, |_: ()| {}).await;
+        assert_eq!(raced, CopyRace::Won(7));
+    }
 
-        // Without the drain the finished copy is thrown away.
-        assert_eq!(finished_now(&mut running), vec![7u32]);
+    /// With nothing answered, a fired token is a cancellation, and a copy
+    /// that failed is not mistaken for a win.
+    #[tokio::test]
+    async fn a_trial_with_nothing_answered_is_cancelled() {
+        let cancel = CancellationToken::new();
+        let mut running: FuturesUnordered<futures::future::BoxFuture<'static, Result<u32, ()>>> =
+            FuturesUnordered::new();
+        running.push(Box::pin(futures::future::pending()));
+        running.push(Box::pin(async { Err(()) }));
+        cancel.cancel();
+
+        let raced = first_copy(&mut running, &cancel, |_: ()| {}).await;
+        assert_eq!(raced, CopyRace::Cancelled);
+    }
+
+    /// Every copy failing is one outcome, and each failure reaches the caller.
+    #[tokio::test]
+    async fn a_trial_whose_copies_all_fail_reports_each_failure() {
+        let cancel = CancellationToken::new();
+        let mut running: FuturesUnordered<futures::future::BoxFuture<'static, Result<u32, u8>>> =
+            FuturesUnordered::new();
+        running.push(Box::pin(async { Err(1) }));
+        running.push(Box::pin(async { Err(2) }));
+
+        let mut seen = Vec::new();
+        let raced = first_copy(&mut running, &cancel, |e| seen.push(e)).await;
+        assert_eq!(raced, CopyRace::AllFailed);
+        seen.sort();
+        assert_eq!(seen, vec![1, 2]);
     }
 
     #[test]
@@ -2706,51 +3023,24 @@ mod tests {
         assert_eq!(best_for_cache(&fastest, &others).model_id, "fast");
     }
 
-    #[test]
-    fn the_longest_retry_after_among_the_copies_sets_the_base() {
-        let failures = [
-            CopyFailure {
-                error: "429".to_string(),
-                retry_after_secs: Some(30),
-                self_inflicted: false,
-            },
-            CopyFailure {
-                error: "429".to_string(),
-                retry_after_secs: None,
-                self_inflicted: false,
-            },
-            CopyFailure {
-                error: "429".to_string(),
-                retry_after_secs: Some(120),
-                self_inflicted: false,
-            },
-        ];
-        let longest = failures.iter().filter_map(|f| f.retry_after_secs).max();
-        assert_eq!(longest, Some(120));
+    fn copy_failure(retry_after_secs: Option<u64>) -> CopyFailure {
+        CopyFailure {
+            error: "429".to_string(),
+            retry_after_secs,
+            self_inflicted: false,
+        }
     }
 
     #[test]
-    fn health_moves_only_when_a_failure_was_not_self_inflicted() {
-        let all_ours = [CopyFailure {
-            error: "429".to_string(),
-            retry_after_secs: None,
-            self_inflicted: true,
-        }];
-        assert!(all_ours.iter().all(|f| f.self_inflicted));
-
-        let mixed = [
-            CopyFailure {
-                error: "429".to_string(),
-                retry_after_secs: None,
-                self_inflicted: true,
-            },
-            CopyFailure {
-                error: "500".to_string(),
-                retry_after_secs: None,
-                self_inflicted: false,
-            },
+    fn the_longest_retry_after_among_the_copies_sets_the_base() {
+        let failures = [
+            copy_failure(Some(30)),
+            copy_failure(None),
+            copy_failure(Some(120)),
         ];
-        assert!(!mixed.iter().all(|f| f.self_inflicted));
+        assert_eq!(longest_retry_after(&failures), Some(120));
+        assert_eq!(longest_retry_after(&[copy_failure(None)]), None);
+        assert_eq!(longest_retry_after(&[]), None);
     }
 
     #[test]

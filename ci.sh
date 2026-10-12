@@ -53,6 +53,12 @@ test_result="pass"
 
 step "smoke tier"
 if docker info >/dev/null 2>&1; then
+    # macOS leaves an AppleDouble `._` sidecar beside every file it edits on an
+    # NFS or SMB share. BuildKit reads extended attributes on everything it
+    # walks, the share refuses that on a sidecar, and the image build dies
+    # before .dockerignore is consulted. They are git-ignored and never exist
+    # on the runner, so sweep them first.
+    find . -name '._*' -type f -not -path './.git/*' -delete 2>/dev/null || true
     cargo test --test smoke -- --nocapture
     smoke_result="pass"
 else

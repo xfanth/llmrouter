@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use secrecy::{ExposeSecret, SecretString};
+
 use crate::catalogue::{Catalogue, Channel, ChannelHealth, ChannelId};
 use crate::config::{Config, Provider, RankMatch, WireName};
 use crate::health::{parse_retry_after, HealthEntry, HealthKey, HealthTable};
@@ -154,8 +156,9 @@ impl Prober {
     }
 
     /// Wave 1 then wave 2, everything inside a wave at once. Swaps the
-    /// catalogue when it finishes. Runs in the background; nothing waits on it.
-    pub async fn run_startup_waves(&self) {
+    /// catalogue when it finishes. Runs in the background; nothing waits on
+    /// it. Returns the summary it logged, which the tests read.
+    pub async fn run_startup_waves(&self) -> crate::logging::StartupSummary {
         // Wave 1: every provider at once, no key.
         let bar = crate::logging::bar(self.config.providers.len() as u64, "wave 1 reachability");
         let wave_one = futures::future::join_all(self.config.providers.iter().map(|p| {
@@ -188,7 +191,7 @@ impl Prober {
 
         // Wave 2: one probe per provider/key pair on the reachable providers,
         // all at once.
-        let pairs: Vec<(&Provider, usize, &String)> = reachable
+        let pairs: Vec<(&Provider, usize, &SecretString)> = reachable
             .iter()
             .flat_map(|p| {
                 self.config
@@ -203,7 +206,7 @@ impl Prober {
         let wave_two = futures::future::join_all(pairs.into_iter().map(|(p, i, k)| {
             let bar = bar.clone();
             async move {
-                let outcome = self.probe_models(p, k).await;
+                let outcome = self.probe_models(p, k.expose_secret()).await;
                 bar.inc(1);
                 (p, i, outcome)
             }
@@ -218,7 +221,9 @@ impl Prober {
             ..Default::default()
         };
         for (provider, index, outcome) in wave_two {
-            if outcome.alive {
+            // A 401 answers, so counting `alive` here would report a dead key
+            // as a working one. Only a 2xx means the pair fetched its models.
+            if outcome.succeeded() {
                 summary.keys_answered += 1;
             }
             self.apply_keyed_outcome(provider, index, outcome);
@@ -229,6 +234,7 @@ impl Prober {
         summary.in_backoff = self.health.in_backoff(now_unix()).len();
         tracing::info!(channels = summary.channels, "startup waves finished");
         tracing::info!("startup summary\n{}", summary.table());
+        summary
     }
 
     /// Keyless reachability probe of one provider.
@@ -254,8 +260,15 @@ impl Prober {
     ) -> Vec<Channel> {
         let base_url: Arc<str> = Arc::from(provider.base_url.trim_end_matches('/'));
         let provider_name: Arc<str> = Arc::from(provider.name.as_str());
+        let pair_eligible_at = self
+            .health
+            .get(&HealthKey::ProviderKey {
+                provider: provider.name.clone(),
+                key_id: key_id.to_string(),
+            })
+            .filter(|e| e.retry_counter > 0)
+            .map_or(0, |e| e.eligible_at);
         let key_id: Arc<str> = Arc::from(key_id);
-        let key: Arc<str> = Arc::from(key);
 
         models
             .iter()
@@ -273,13 +286,21 @@ impl Prober {
                 // provider's own list is the fallback, per DESIGN.md step 3.
                 let caps = self.config.capability(&provider.name, &model.id);
 
-                let (intelligence, intelligence_rank, matched) =
-                    self.config.rank_of(&provider.name, &model.id);
-                if let RankMatch::Loose(slug) = matched {
+                let ranking = self.config.ranking_of(&provider.name, &model.id);
+                let (intelligence, intelligence_rank) =
+                    ranking.as_ref().map_or((0, u32::MAX), |(e, _)| {
+                        (e.intelligence, e.intelligence_rank)
+                    });
+                // The provider's own date first, else the release date in
+                // models.csv, per DESIGN.md "Where each field comes from".
+                let created = model
+                    .created
+                    .or_else(|| ranking.as_ref().and_then(|(e, _)| e.released_unix()));
+                if let Some((_, RankMatch::Loose(slug))) = ranking {
                     self.log_loose_rank(&provider.name, &model.id, &slug, intelligence);
                 }
 
-                let id = ChannelId::new(&provider.name, &key, &model.id);
+                let id = ChannelId::new(&provider.name, key, &model.id);
 
                 // A channel that was already known to be dead keeps its
                 // backoff across a rebuild and across a restart.
@@ -287,13 +308,15 @@ impl Prober {
                     .health
                     .get(&HealthKey::Channel(id))
                     .unwrap_or_else(|| HealthEntry::new(self.health.retry_base_secs()));
+                // A pair in backoff holds every channel on it back too.
+                let eligible_at = known.eligible_at.max(pair_eligible_at);
 
                 Channel {
                     id,
                     provider: provider_name.clone(),
                     model_id: Arc::from(model.id.as_str()),
                     key_id: key_id.clone(),
-                    key: key.clone(),
+                    key: SecretString::from(key),
                     base_url: base_url.clone(),
                     wire: provider.wire,
                     limit_context: over
@@ -325,12 +348,12 @@ impl Prober {
                         .unwrap_or_else(|| vec!["text".to_string()]),
                     intelligence,
                     intelligence_rank,
-                    created: model.created,
+                    created,
                     health: ChannelHealth {
                         enabled: AtomicBool::new(true),
                         retry_counter: AtomicU32::new(known.retry_counter),
                         retry_base_secs: AtomicU64::new(known.retry_base_secs),
-                        eligible_at: AtomicU64::new(known.eligible_at),
+                        eligible_at: AtomicU64::new(eligible_at),
                         // A rebuild carries the live count over from the row
                         // this one replaces, so starting at zero is right.
                         in_flight: Arc::new(AtomicU32::new(0)),
@@ -417,7 +440,7 @@ impl Prober {
         for (index, key) in self.config.keys_for(provider).iter().enumerate() {
             let pair = HealthKey::ProviderKey {
                 provider: provider.name.clone(),
-                key_id: key_id(provider, index),
+                key_id: key_id(&provider.name, key.expose_secret()),
             };
 
             if !force {
@@ -433,7 +456,7 @@ impl Prober {
                 }
             }
 
-            let outcome = self.probe_models(provider, key).await;
+            let outcome = self.probe_models(provider, key.expose_secret()).await;
             changed |= self.apply_keyed_outcome(provider, index, outcome);
         }
 
@@ -448,7 +471,7 @@ impl Prober {
         index: usize,
         outcome: ProbeOutcome,
     ) -> bool {
-        let key_id = key_id(provider, index);
+        let key_id = self.pair_id(provider, index);
         let pair = HealthKey::ProviderKey {
             provider: provider.name.clone(),
             key_id: key_id.clone(),
@@ -464,15 +487,20 @@ impl Prober {
             self.health
                 .record_failure(&pair, outcome.retry_after_secs, now_unix());
             self.escalate_provider(provider, outcome.retry_after_secs);
-            // Drop its channels: the pair cannot serve them.
+            // Keep the last model list. DESIGN.md: never filter GET /v1/models
+            // by health, so the pair's models stay listed with `healthy: 0`.
+            // The rebuild folds the pair's backoff into each row, which keeps
+            // the race off them until the pair is eligible again.
             return self
                 .seen
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(&(provider.name.clone(), key_id))
-                .is_some();
+                .contains_key(&(provider.name.clone(), key_id));
         }
 
+        // A pair coming out of backoff needs a rebuild even with the same
+        // list, to clear the backoff the last rebuild folded into its rows.
+        let was_down = self.health.get(&pair).is_some_and(|e| e.retry_counter > 0);
         self.health.record_success(&pair);
         // A key answering proves the provider is alive, so an escalation that
         // marked the provider down because every key was down clears with it.
@@ -483,7 +511,7 @@ impl Prober {
         match slot {
             std::collections::hash_map::Entry::Occupied(mut held) => {
                 if *held.get() == outcome.models {
-                    return false;
+                    return was_down;
                 }
                 held.insert(outcome.models);
                 true
@@ -531,13 +559,21 @@ impl Prober {
         every_key_down(&self.config, &self.health, &provider.name)
     }
 
+    /// The label of the key at `index` in this provider's `keys_env` list.
+    fn pair_id(&self, provider: &Provider, index: usize) -> String {
+        key_id(
+            &provider.name,
+            self.config.keys_for(provider)[index].expose_secret(),
+        )
+    }
+
     /// True when this pair has been probed successfully at least once, which
     /// means it returned at least one model: an empty list is a failed probe.
     fn has_model_list(&self, provider: &Provider, index: usize) -> bool {
         self.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&(provider.name.clone(), key_id(provider, index)))
+            .contains_key(&(provider.name.clone(), self.pair_id(provider, index)))
     }
 
     /// Rebuilds the whole channel list from every model list held and swaps it
@@ -554,22 +590,30 @@ impl Prober {
             .sum();
         let bar = show_progress.then(|| crate::logging::bar(pairs as u64, "catalogue build"));
 
-        let mut channels = Vec::new();
-        {
+        // Built inside the catalogue's rebuild lock: a race writing health
+        // between the reads in `build_channels` and the swap would otherwise
+        // land on a row about to be orphaned.
+        self.catalogue.replace_with(|| {
+            let mut channels = Vec::new();
             let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
             for provider in &self.config.providers {
-                for (index, key) in self.config.keys_for(provider).iter().enumerate() {
-                    let id = key_id(provider, index);
+                for key in self.config.keys_for(provider) {
+                    let id = key_id(&provider.name, key.expose_secret());
                     if let Some(models) = seen.get(&(provider.name.clone(), id.clone())) {
-                        channels.extend(self.build_channels(provider, &id, key, models));
+                        channels.extend(self.build_channels(
+                            provider,
+                            &id,
+                            key.expose_secret(),
+                            models,
+                        ));
                     }
                     if let Some(bar) = &bar {
                         bar.inc(1);
                     }
                 }
             }
-        }
-        self.catalogue.replace(channels);
+            channels
+        });
         if let Some(bar) = bar {
             bar.finish_and_clear();
         }
@@ -605,12 +649,7 @@ impl Prober {
             .timeout(self.config.router.health_poll.probe_timeout);
 
         if let Some(key) = key {
-            request = match provider.wire {
-                WireName::OpenAi => request.header("authorization", format!("Bearer {key}")),
-                WireName::Anthropic => request
-                    .header("x-api-key", key)
-                    .header("anthropic-version", ANTHROPIC_VERSION),
-            };
+            request = authorise(request, provider, key);
         }
 
         let response = match request.send().await {
@@ -627,6 +666,42 @@ impl Prober {
             .and_then(|v| parse_retry_after(v, SystemTime::now()));
 
         if !status.is_success() {
+            // A provider with no model-listing endpoint answers 404 or 405.
+            // Cloudflare Workers AI is one: its OpenAI-compatible path takes
+            // POST only. Its models are listed in `providers.yml` instead, and
+            // the pair counts as healthy. Any other status, 401 included,
+            // still fails, so a dead key never produces channels.
+            if matches!(status.as_u16(), 404 | 405) && !provider.models.is_empty() {
+                // A base URL missing its version segment answers 404 here too,
+                // and then every chat call 404s while the router calls the
+                // provider healthy. The configured list cannot tell the two
+                // apart, so say loudly which URL answered what: that line is
+                // what the `BASE_URL_FIXUPS` list in `src/bin/make-config.rs`
+                // is maintained from.
+                tracing::warn!(
+                    provider = %provider.name,
+                    status = status.as_u16(),
+                    url = %models_url(provider),
+                    models = provider.models.len(),
+                    "no model list at this URL, falling back to the configured \
+                     models: check the base URL has its version segment"
+                );
+                return ProbeOutcome {
+                    alive: true,
+                    models: provider
+                        .models
+                        .iter()
+                        .map(|id| ProbedModel {
+                            id: id.clone(),
+                            limit_context: None,
+                            limit_output: None,
+                            created: None,
+                        })
+                        .collect(),
+                    retry_after_secs,
+                    error: None,
+                };
+            }
             // The host answered, so it is reachable. The keyed probe still
             // treats this as a failure, through `error`.
             return ProbeOutcome {
@@ -639,7 +714,18 @@ impl Prober {
 
         match response.json::<serde_json::Value>().await {
             Ok(body) => {
-                let models = parse_model_list(&body);
+                let mut models = parse_model_list(&body);
+                // DESIGN.md filter check 3, "the key can reach the model".
+                // OpenRouter's list is not scoped to the key: a free key sees
+                // all 417 models and can call only the zero-priced ones. The
+                // paid rest would answer 402 on every call, so a free key
+                // never gets channels for them.
+                if let Some(key) = key {
+                    let paid = paid_model_ids(&body);
+                    if !paid.is_empty() && self.is_free_tier(provider, key).await {
+                        models.retain(|m| !paid.contains(&m.id));
+                    }
+                }
                 // DESIGN.md: no list, no channels. A 2xx that yields zero
                 // models is a failure, so the pair goes into backoff and the
                 // poller retries it. Counted as a success it would keep an
@@ -665,16 +751,85 @@ impl Prober {
     }
 }
 
-/// Parses an OpenAI-shaped or Anthropic-shaped `/models` body into model rows.
-pub fn parse_model_list(body: &serde_json::Value) -> Vec<ProbedModel> {
-    let rows = body
-        .get("data")
+/// Adds the key to a request in the provider's own auth header.
+fn authorise(
+    request: reqwest::RequestBuilder,
+    provider: &Provider,
+    key: &str,
+) -> reqwest::RequestBuilder {
+    match provider.wire {
+        WireName::OpenAi => request.header("authorization", format!("Bearer {key}")),
+        WireName::Anthropic => request
+            .header("x-api-key", key)
+            .header("anthropic-version", ANTHROPIC_VERSION),
+    }
+}
+
+impl Prober {
+    /// True when the provider says this key is on its free tier, through
+    /// OpenRouter's `GET /key` (`data.is_free_tier`). Asked only of a provider
+    /// whose model list carries prices. Any failure reads as "not free", which
+    /// keeps every model: live traffic still learns the dead ones.
+    async fn is_free_tier(&self, provider: &Provider, key: &str) -> bool {
+        let url = format!("{}/key", provider.base_url.trim_end_matches('/'));
+        let request = self
+            .upstream
+            .client()
+            .get(url)
+            .timeout(self.config.router.health_poll.probe_timeout);
+        let Ok(response) = authorise(request, provider, key).send().await else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body.pointer("/data/is_free_tier")?.as_bool())
+            .unwrap_or(false)
+    }
+}
+
+/// The rows of an OpenAI-shaped or Anthropic-shaped `/models` body.
+fn model_rows(body: &serde_json::Value) -> &[serde_json::Value] {
+    body.get("data")
         .or_else(|| body.get("models"))
         .and_then(|v| v.as_array())
-        .or_else(|| body.as_array());
+        .or_else(|| body.as_array())
+        .map_or(&[], Vec::as_slice)
+}
 
-    rows.map(|rows| rows.iter().filter_map(parse_model_row).collect())
-        .unwrap_or_default()
+/// Parses an OpenAI-shaped or Anthropic-shaped `/models` body into model rows.
+pub fn parse_model_list(body: &serde_json::Value) -> Vec<ProbedModel> {
+    model_rows(body)
+        .iter()
+        .filter_map(parse_model_row)
+        .collect()
+}
+
+/// Ids of the rows whose `pricing` charges for prompt or completion tokens.
+/// OpenRouter writes prices as strings: `"0"` for a free model, `"-1"` for a
+/// variable one such as `openrouter/auto`. Any non-zero price counts as paid.
+/// A row with no `pricing` is not counted.
+fn paid_model_ids(body: &serde_json::Value) -> std::collections::HashSet<String> {
+    model_rows(body)
+        .iter()
+        .filter(|row| {
+            ["prompt", "completion"].iter().any(|field| {
+                row.get("pricing")
+                    .and_then(|p| p.get(field))
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                    })
+                    .is_some_and(|price| price != 0.0)
+            })
+        })
+        .filter_map(parse_model_row)
+        .map(|m| m.id)
+        .collect()
 }
 
 /// One row of a model list. A row with no usable id is skipped rather than
@@ -753,20 +908,27 @@ pub(crate) fn every_key_down(config: &Config, health: &HealthTable, provider_nam
     };
     let keys = config.keys_for(provider);
     !keys.is_empty()
-        && (0..keys.len()).all(|index| {
+        && keys.iter().all(|key| {
             health
                 .get(&HealthKey::ProviderKey {
                     provider: provider.name.clone(),
-                    key_id: key_id(provider, index),
+                    key_id: key_id(&provider.name, key.expose_secret()),
                 })
                 .is_some_and(|e| e.retry_counter > 0)
         })
 }
 
-/// A stable label for one of a provider's keys. Never the key itself: the
-/// position in `keys_env` is enough to name it in a log.
-fn key_id(provider: &Provider, index: usize) -> String {
-    format!("{}#{index}", provider.name)
+/// A stable label for one of a provider's keys: the provider name and a short
+/// hash of provider plus key, as `ChannelId` does. Never the key itself, and
+/// never its position in `keys_env`: pair health outlives a restart in redb,
+/// and DESIGN.md says an index means nothing after a rebuild. Reordering or
+/// deleting a key must not hand one key's backoff to another.
+pub fn key_id(provider: &str, key: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(provider.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(key.as_bytes());
+    format!("{provider}#{}", &hasher.finalize().to_hex()[..8])
 }
 
 /// Now, in whole unix seconds.
@@ -788,6 +950,15 @@ mod tests {
         capabilities: Vec<((&str, &str), crate::config::Capability)>,
         models: Vec<crate::config::ModelOverride>,
     ) -> (Prober, tempfile::TempDir) {
+        prober_ranked(capabilities, models, Vec::new())
+    }
+
+    /// `prober_with`, plus the `intelligence.yml` rows.
+    fn prober_ranked(
+        capabilities: Vec<((&str, &str), crate::config::Capability)>,
+        models: Vec<crate::config::ModelOverride>,
+        intelligence: Vec<crate::config::IntelligenceEntry>,
+    ) -> (Prober, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("a throwaway directory");
 
         let router = crate::config::RouterConfig::default();
@@ -795,7 +966,7 @@ mod tests {
             router: router.clone(),
             providers: Vec::new(),
             models,
-            intelligence: Vec::new(),
+            intelligence,
             keys: HashMap::new(),
             capabilities: capabilities
                 .into_iter()
@@ -836,7 +1007,10 @@ mod tests {
             providers,
             models: Vec::new(),
             intelligence: Vec::new(),
-            keys,
+            keys: keys
+                .into_iter()
+                .map(|(name, keys)| (name, keys.into_iter().map(SecretString::from).collect()))
+                .collect(),
             capabilities: HashMap::new(),
         };
         let db = Arc::new(
@@ -903,6 +1077,39 @@ mod tests {
             limit_output: None,
             created: None,
         }
+    }
+
+    /// A provider that publishes no `created` (Gemini, the cloudflare
+    /// fallback list) gets the release date from models.csv, not the boot
+    /// time. A provider's own date still wins.
+    #[test]
+    fn created_falls_back_to_the_release_date_not_boot_time() {
+        let (prober, _dir) = prober_ranked(
+            Vec::new(),
+            Vec::new(),
+            vec![crate::config::IntelligenceEntry {
+                slug: "gemini-3.7-flash".to_string(),
+                intelligence: 40,
+                intelligence_rank: 10,
+                release_date: Some("2025-02-19".to_string()),
+            }],
+        );
+        let p = provider("https://example.invalid", "/models");
+        let mut dated = probed("gemini-3.7-flash", None);
+        dated.created = Some(1_760_140_800);
+        let channels = prober.build_channels(
+            &p,
+            "gemini#0",
+            "secret",
+            &[
+                probed("gemini-3.7-flash", None),
+                dated,
+                probed("unranked", None),
+            ],
+        );
+        assert_eq!(channels[0].created, Some(1_739_923_200));
+        assert_eq!(channels[1].created, Some(1_760_140_800));
+        assert_eq!(channels[2].created, None);
     }
 
     /// `GET /v1/models` reports `supports_vision`, `supports_reasoning` and
@@ -1032,6 +1239,7 @@ mod tests {
             base_url: base_url.to_string(),
             keys_env: "GEMINI_KEYS".to_string(),
             models_path: models_path.to_string(),
+            models: Vec::new(),
         }
     }
 
@@ -1139,10 +1347,68 @@ mod tests {
     }
 
     #[test]
-    fn a_key_id_names_the_provider_and_the_slot_never_the_key() {
-        let p = provider("https://example.com", "/models");
-        assert_eq!(key_id(&p, 0), "gemini#0");
-        assert_eq!(key_id(&p, 8), "gemini#8");
+    fn a_key_id_follows_the_key_not_its_position() {
+        let a = key_id("gemini", "sk-not-a-real-key-a");
+        assert!(a.starts_with("gemini#") && !a.contains("sk-"));
+        assert_eq!(a, key_id("gemini", "sk-not-a-real-key-a"), "stable");
+        assert_ne!(a, key_id("gemini", "sk-not-a-real-key-b"));
+        assert_ne!(a, key_id("openai", "sk-not-a-real-key-a"));
+    }
+
+    /// Gemini has keys [A, B, C] and B is deep in backoff. B is deleted and
+    /// the router restarts with [A, C]. C now sits where B was and must not
+    /// inherit B's retry counter from the health store.
+    #[test]
+    fn a_deleted_key_does_not_hand_its_backoff_to_the_next_key() {
+        let provider = Provider {
+            name: "gemini".to_string(),
+            wire: WireName::OpenAi,
+            base_url: "http://127.0.0.1:1".to_string(),
+            keys_env: "GEMINI_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: Vec::new(),
+        };
+        let (before, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            HashMap::from([(
+                "GEMINI_KEYS".to_string(),
+                vec![
+                    "key-a".to_string(),
+                    "key-b".to_string(),
+                    "key-c".to_string(),
+                ],
+            )]),
+        );
+        let b = before.pair_id(&provider, 1);
+        for _ in 0..20 {
+            before.health.record_failure(
+                &HealthKey::ProviderKey {
+                    provider: "gemini".to_string(),
+                    key_id: b.clone(),
+                },
+                None,
+                now_unix(),
+            );
+        }
+
+        let (after, _dir2) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            HashMap::from([(
+                "GEMINI_KEYS".to_string(),
+                vec!["key-a".to_string(), "key-c".to_string()],
+            )]),
+        );
+        // The store B wrote to, read with the label C has after the restart.
+        let c = HealthKey::ProviderKey {
+            provider: "gemini".to_string(),
+            key_id: after.pair_id(&provider, 1),
+        };
+        assert!(
+            before.health.get(&c).is_none(),
+            "C must start clean, not with B's retry counter"
+        );
     }
 
     #[test]
@@ -1208,6 +1474,7 @@ mod tests {
             base_url,
             keys_env: "SLOWHOST_KEYS".to_string(),
             models_path: "/models".to_string(),
+            models: Vec::new(),
         };
         let (prober, _dir) = prober_for(router, vec![provider], HashMap::new());
 
@@ -1244,6 +1511,7 @@ mod tests {
             base_url: "http://127.0.0.1:1".to_string(),
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
+            models: Vec::new(),
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1283,6 +1551,72 @@ mod tests {
                 .is_some_and(|e| e.retry_counter > 0),
             "with every key unhealthy the provider is unhealthy, so the poller goes back to one keyless reachability call"
         );
+    }
+
+    /// DESIGN.md, "Wrong turns already taken": never filter GET /v1/models by
+    /// health. A pair whose keyed probe fails must keep its models in the
+    /// catalogue, held back by the pair's backoff, so `/v1/models` still shows
+    /// them with `healthy: 0` and a `next_eligible` time.
+    #[test]
+    fn a_failed_keyed_probe_keeps_the_models_listed_but_out_of_the_race() {
+        let provider = Provider {
+            name: "zai".to_string(),
+            wire: WireName::OpenAi,
+            base_url: "http://127.0.0.1:1".to_string(),
+            keys_env: "ZAI_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: Vec::new(),
+        };
+        let keys = HashMap::from([("ZAI_KEYS".to_string(), vec!["one".to_string()])]);
+        let (prober, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            keys,
+        );
+        let listed = || ProbeOutcome {
+            alive: true,
+            models: vec![ProbedModel {
+                created: None,
+                id: "glm-5.3".to_string(),
+                limit_context: None,
+                limit_output: None,
+            }],
+            retry_after_secs: None,
+            error: None,
+        };
+
+        assert!(prober.apply_keyed_outcome(&provider, 0, listed()));
+        prober.rebuild(false);
+
+        let quota_gone = ProbeOutcome {
+            alive: true,
+            models: Vec::new(),
+            retry_after_secs: Some(3 * 86_400),
+            error: Some("429".to_string()),
+        };
+        assert!(prober.apply_keyed_outcome(&provider, 0, quota_gone));
+        prober.rebuild(false);
+
+        let now = now_unix();
+        let rows = prober.catalogue.snapshot();
+        assert_eq!(rows.len(), 1, "the broken model must stay listed");
+        assert!(
+            !rows[0].eligible(now),
+            "a pair in backoff must not be raced"
+        );
+        assert!(
+            rows[0]
+                .health
+                .eligible_at
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > now + 86_400,
+            "the row carries the pair's Retry-After as its next_eligible time"
+        );
+
+        // The key comes back with the same list: the row is callable again.
+        assert!(prober.apply_keyed_outcome(&provider, 0, listed()));
+        prober.rebuild(false);
+        assert!(prober.catalogue.snapshot()[0].eligible(now_unix()));
     }
 
     /// A server that answers every request `401`, which is what both a keyless
@@ -1327,6 +1661,7 @@ mod tests {
             base_url,
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
+            models: Vec::new(),
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1343,7 +1678,7 @@ mod tests {
         let pairs: Vec<HealthKey> = (0..2)
             .map(|index| HealthKey::ProviderKey {
                 provider: "openrouter".to_string(),
-                key_id: key_id(&provider, index),
+                key_id: prober.pair_id(&provider, index),
             })
             .collect();
         // Both keys have failed several times, so both are well inside their
@@ -1424,6 +1759,7 @@ mod tests {
             base_url: server.uri(),
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
+            models: Vec::new(),
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1444,7 +1780,7 @@ mod tests {
         prober.apply_keyed_outcome(&provider, 0, outcome);
         let pair = HealthKey::ProviderKey {
             provider: "openrouter".to_string(),
-            key_id: key_id(&provider, 0),
+            key_id: prober.pair_id(&provider, 0),
         };
         assert!(
             prober
@@ -1457,5 +1793,247 @@ mod tests {
             !prober.has_model_list(&provider, 0),
             "an empty list must not be stored, or the poller skips the pair forever"
         );
+    }
+
+    /// Cloudflare Workers AI has no `GET /models`: the OpenAI-compatible path
+    /// accepts POST only and answers 405, which lost every channel on all five
+    /// Cloudflare accounts in the first live run. A provider that lists its
+    /// models in `providers.yml` uses that list instead.
+    #[tokio::test]
+    async fn a_provider_with_no_listing_endpoint_uses_its_configured_models() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+
+        let provider = Provider {
+            name: "cloudflare-b4b050cc".to_string(),
+            wire: WireName::OpenAi,
+            base_url: server.uri(),
+            keys_env: "CLOUDFLARE_B4B050CC_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: vec!["@cf/meta/llama-3.1-8b-instruct".to_string()],
+        };
+        let keys = HashMap::from([(
+            "CLOUDFLARE_B4B050CC_KEYS".to_string(),
+            vec!["not-a-real-key".to_string()],
+        )]);
+        let (prober, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            keys,
+        );
+
+        let outcome = prober.probe_models(&provider, "not-a-real-key").await;
+        assert!(outcome.succeeded(), "405 with a configured list is a pass");
+        assert_eq!(
+            outcome
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["@cf/meta/llama-3.1-8b-instruct"]
+        );
+
+        prober.apply_keyed_outcome(&provider, 0, outcome);
+        assert!(
+            prober.has_model_list(&provider, 0),
+            "the configured list must be stored like a probed one"
+        );
+    }
+
+    /// DESIGN.md filter check 3: OpenRouter's `/models` is not scoped to the
+    /// key, so a free key must lose the paid rows before they become channels.
+    /// A paying key keeps them all.
+    #[tokio::test]
+    async fn a_free_key_gets_no_channels_for_paid_models() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "paid/model", "pricing": {"prompt": "0.000003", "completion": "0.000015"}},
+                    {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}},
+                    {"id": "free/model:free", "pricing": {"prompt": "0", "completion": "0"}},
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for (key, free) in [("free-key", true), ("paid-key", false)] {
+            Mock::given(method("GET"))
+                .and(path("/key"))
+                .and(header("authorization", format!("Bearer {key}").as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"data": {"is_free_tier": free}})),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let provider = Provider {
+            name: "openrouter".to_string(),
+            wire: WireName::OpenAi,
+            base_url: server.uri(),
+            keys_env: "OPENROUTER_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: Vec::new(),
+        };
+        let keys = HashMap::from([(
+            "OPENROUTER_KEYS".to_string(),
+            vec!["free-key".to_string(), "paid-key".to_string()],
+        )]);
+        let (prober, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            keys,
+        );
+
+        let ids =
+            |outcome: ProbeOutcome| outcome.models.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(prober.probe_models(&provider, "free-key").await),
+            vec!["free/model:free"]
+        );
+        assert_eq!(
+            ids(prober.probe_models(&provider, "paid-key").await),
+            vec!["paid/model", "openrouter/auto", "free/model:free"]
+        );
+    }
+
+    /// An auth failure must still fail, configured models or not, or a revoked
+    /// key would produce channels that 401 on every real request.
+    #[tokio::test]
+    async fn configured_models_do_not_rescue_a_rejected_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let provider = Provider {
+            name: "cloudflare-60bf2f13".to_string(),
+            wire: WireName::OpenAi,
+            base_url: server.uri(),
+            keys_env: "CLOUDFLARE_60BF2F13_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: vec!["@cf/meta/llama-3.1-8b-instruct".to_string()],
+        };
+        let keys = HashMap::from([(
+            "CLOUDFLARE_60BF2F13_KEYS".to_string(),
+            vec!["revoked".to_string()],
+        )]);
+        let (prober, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            keys,
+        );
+
+        let outcome = prober.probe_models(&provider, "revoked").await;
+        assert!(!outcome.succeeded(), "401 is still a failed probe");
+        assert!(outcome.models.is_empty());
+    }
+
+    /// A provider with no `models` list is marked as having a listing
+    /// endpoint, so a 404 there is a wrong base URL, not a missing endpoint,
+    /// and the probe must fail rather than come up healthy.
+    #[tokio::test]
+    async fn a_404_without_configured_models_fails_the_probe() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = Provider {
+            name: "groq".to_string(),
+            wire: WireName::OpenAi,
+            base_url: server.uri(),
+            keys_env: "GROQ_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: Vec::new(),
+        };
+        let keys = HashMap::from([("GROQ_KEYS".to_string(), vec!["k".to_string()])]);
+        let (prober, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            keys,
+        );
+
+        let outcome = prober.probe_models(&provider, "k").await;
+        assert!(
+            !outcome.succeeded(),
+            "404 with no configured list is a fail"
+        );
+        assert!(outcome.models.is_empty());
+    }
+
+    /// The fallback must not be silent. A 404 on `/models` is also what a base
+    /// URL missing its version segment gives, and the configured list cannot
+    /// tell the two apart, so the warning naming the provider, the status and
+    /// the full URL is the only thing left pointing at the `BASE_URL_FIXUPS`
+    /// list in `src/bin/make-config.rs`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_configured_model_fallback_warns_with_the_url_that_answered() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = Provider {
+            name: "groq".to_string(),
+            wire: WireName::OpenAi,
+            base_url: server.uri(),
+            keys_env: "GROQ_KEYS".to_string(),
+            models_path: "/models".to_string(),
+            models: vec!["llama-3.3-70b".to_string()],
+        };
+        let keys = HashMap::from([("GROQ_KEYS".to_string(), vec!["k".to_string()])]);
+        let (prober, _dir) = prober_for(
+            crate::config::RouterConfig::default(),
+            vec![provider.clone()],
+            keys,
+        );
+        let outcome = prober.probe_models(&provider, "k").await;
+        let uri = server.uri();
+
+        assert!(outcome.succeeded(), "the fallback itself still passes");
+        // tracing-test installs one global subscriber, so the capture does not
+        // race other tests for the callsite interest cache the way a scoped
+        // `with_default` subscriber did.
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains(" WARN ")
+                        && line.contains("provider=groq")
+                        && line.contains("status=404")
+                        && line.contains(&format!("url={uri}/models"))
+                })
+                .then_some(())
+                .ok_or_else(|| format!("no warning logged: {lines:?}"))
+        });
     }
 }

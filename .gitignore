@@ -5,11 +5,30 @@ freellmapi-keys.csv
 .env
 *.env
 
-# Runtime state
+# Generated config, for a run with `--out` pointing at the repo root.
+# model_capabilities.csv is deliberately absent from this list: it is tracked
+# source data at the repo root, and the generator refuses to run with --out
+# set to the source directory, so it only ever copies the file outwards.
+/providers.yml
+/models.yml
+/intelligence.yml
+/router.yml
+
+# LOAD-BEARING. Do not delete. The deploy directories sit INSIDE this checkout.
+# On the TrueNAS host, /mnt/shuttle/share/app-data/llmrouter is the main
+# working tree (its .git lives there), and this Mac mounts the same share over
+# NFS at ~/truenas/shuttle/app-data. So the deploy config directory
+# /mnt/shuttle/share/app-data/llmrouter/config is this repo's config/, and the
+# /data mount (cache.redb, spill/ holding client prompts) is data/.
+# config/.env holds every live provider key. These lines, plus `.env` above,
+# are all that keep git from seeing it. Never `git add -f config/` or `data/`.
+# tests/integration/main.rs pins these rules.
 config/
 data/
 *.redb
 spill/
+
+# Runtime state
 logs/
 
 # Build
