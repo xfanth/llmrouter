@@ -61,6 +61,8 @@ tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# `ServiceExt::oneshot`, so a test can drive the router without a socket.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

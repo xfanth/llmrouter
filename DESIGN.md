@@ -21,7 +21,7 @@ Rough effort for one person who knows Rust:
 | Non-streamed racing and fallback | 1 day |
 | `redb` cache | half a day |
 | OpenAI chat-completions endpoint | 1 day |
-| Anthropic `/v1/messages`, non-streamed | 1-2 days |
+| Anthropic `/v1/messages`, buffered and streamed | 2-3 days |
 | Tool calling across both formats | 2-3 days |
 | Docker, logging, metrics, hardening | 1-2 days |
 
@@ -56,24 +56,26 @@ Three things follow for the new router:
 
 - **Clients: coding tools.** Claude Code, Cline and Cursor. They need tool
   calling and the Anthropic `/v1/messages` format.
-- **No streaming in v1.** Decided. Whole responses only. This is what keeps the
-  build small: racing works as specified, a failure is recoverable right up to
-  the moment a response is returned, and the cache behaves. Coding tools will
-  want streaming eventually, and adding it later means reopening the racing
-  question, not rewriting the router.
+- **Streaming, with a hedge strategy.** `streaming: true` by default.
+  `hedge_strategy: tps` buffers every stream for 1 second, then keeps the
+  fastest and cancels the rest. Not a nicety: a channel call takes 34.5 minutes
+  and Claude Code's `API_TIMEOUT_MS` defaults to 10, so without streaming the
+  client hangs up every time. See **Streaming**.
 - **Deployment: home network, no password.** Runs on TrueNAS, reachable only
   from inside the LAN. No shared secret, no rate limiting, no TLS.
 - **Key handling: fall through, no quota tracking.** Per spec item 8: a failed
-  tuple moves immediately to the next. No per-key quota accounting, no parked
+  channel moves immediately to the next. No per-key quota accounting, no parked
   keys, no circuit breakers. That subsystem is a large part of what makes
   omniroute heavy.
 - **Providers:** everything in `providers.yml`, 15 providers and 47 keys.
-- **Context windows** from each provider's model list at startup, with
-  `context_defaults.yaml` as the fallback.
+- **Context windows and tool support** from `model_capabilities.csv`, joined
+  against each provider's model list at startup.
 - **Model naming** matched automatically against the ranking file, with an
   override file for anything matched wrongly.
 - **Caching:** caller sent `auto` or no model, any saved answer for that prompt
   is reused. Caller named a model, only an answer from that same model serves.
+- **Admission on memory, not a request count.** `memory_high_water: 3GB`, then
+  `503`. See **Admission: the gate is memory, not a request count**.
 
 ## Targets
 
@@ -348,7 +350,7 @@ Default 0 means never wait.
 The M copies are one trial, not M trials. Identical request, identical provider,
 model and key, same moment. The second copy tells you nothing the first did not.
 Counting them would also make the backoff depend on a latency dial: at M=3 a
-channel hits the 1 hour cap after 4 walks instead of 12.
+channel reaches the 30 day cap after 8 walks instead of 23.
 
 - Any copy returns 2xx with content: the channel is healthy, `retry_counter`
   resets to 0. Ignore the sibling failures.
@@ -503,11 +505,22 @@ again. Each `retry_counter` goes to 2 and each wait goes to 2 seconds.
 Request 3 doubles it again, to 4 seconds. Then 8, 16, 32.
 
 The waits grow faster than the client requests arrive, so the list empties
-itself. By the twelfth failure each wait is at the 1 hour cap and the router
-answers `504` without making a channel call.
+itself.
 
-Twelve full walks is the cost, and the router pays it once. No cap is needed to
-stop it, because the backoff is the cap.
+| Failure | Wait |
+|---|---|
+| 1 | 1s |
+| 12 | 34 minutes |
+| 17 | 18 hours |
+| 20 | 6 days |
+| 23 | the 30 day cap |
+
+By failure 12 the wait is 34 minutes, which is longer than the client requests
+arriving, so the list is already empty and the router answers `504` without
+making a channel call.
+
+Twelve full walks is the cost, and the router pays it once. No cap on channel
+calls is needed, because the backoff is the cap.
 
 ## Cache
 
@@ -609,30 +622,56 @@ SHA-256 without hardware support eats the whole 10ms budget. Both give 32 bytes.
 
 ### Writing: the most intelligent answer wins
 
-One client request fires N=32 channel calls with M=2 copies each. The first 2xx
-with content is served to the client and the rest are cancelled. **Some of those
-have already finished.** Their bodies are in memory and already paid for.
+**Cancel every other channel call the moment the winner arrives.** No grace
+period, no waiting for a smarter model.
 
-One of them may come from a smarter model than the one that answered first.
+The winner is the first to finish, so at that moment nothing else has finished.
+A smarter model is usually a slower one, and the gap is minutes:
 
-So at the moment of cancellation, collect every channel call that already
-returned a 2xx with content, including the winner. Take the one with the highest
-`intelligence`. That is the candidate for the cache.
+| Generation | Time for 32k tokens |
+|---|---|
+| 1,000 tok/s | 32s |
+| 500 tok/s | 64s |
+| 100 tok/s | 5.3 min |
+| 30 tok/s | 17.8 min |
 
-Then compare against what is already stored under that key:
+Waiting long enough to catch a slower model means holding 31 channel calls open
+for up to 17 minutes after the client already has its answer. That costs 0.99
+million output tokens per client request, 3 billion a day, to improve a cache
+that rarely gets a hit.
+
+### The cancellation race
+
+Cancellation is not instant. A channel call can return a good answer in the gap
+between the winner landing and the cancel reaching it.
+
+**Do not throw those away.** They are already paid for. Offer each one to the
+cache under the same rule as the winner.
+
+### The write rule
+
+Every candidate, the winner and any late arrival, goes through the same check:
 
 | Stored entry | Action |
 |---|---|
 | None | Write the candidate. |
-| Expired, older than the 7 day limit | Overwrite. |
+| Older than the 7 day ttl | Overwrite. |
 | `intelligence` lower than the candidate | Overwrite. |
 | `intelligence` equal or higher | Keep it. Discard the candidate. |
 
-**The client gets the fastest answer. The cache keeps the best one.**
+So a late arrival from a smarter model replaces the winner in the cache, and one
+from a weaker model does not. The client keeps the fast answer either way.
 
-A model's `intelligence` comes from the in-memory ranking, looked up by
-`model_id`. A model absent from the ranking scores 0, so it never displaces a
-ranked one.
+The same rule guards against an entry from an earlier client request: a fast
+weak model cannot overwrite a slow strong one that answered the same prompt
+yesterday.
+
+`intelligence` comes from the in-memory ranking, looked up by `model_id`. A
+model absent from the ranking scores 0, so it never displaces a ranked one.
+
+**Writes must be atomic.** Several late arrivals can reach the cache at once.
+Do the read, the compare and the write in one `redb` transaction, or two
+candidates both read the old entry and the weaker one wins.
 
 ### One entry per prompt, by design
 
@@ -692,6 +731,275 @@ prompts almost never repeat. A `redb` read is tens of microseconds against a
 containers, and disk is not. Cap `redb`'s own page cache so it cannot grow into
 the 4GB budget.
 
+## `GET /v1/models`
+
+One row per distinct `model_id`, not per channel. A model served by 9 Gemini
+keys is one row, not nine. Your providers carry 848 distinct model ids across
+roughly 4,000 channels.
+
+Sorted by `intelligence`, highest first. `auto` sits at the top, because it is
+what a client should pick.
+
+### Extra fields are fine
+
+OpenAI documents `id`, `object`, `created`, `owned_by` and `shutdown_date`.
+Nothing says that is the whole set, and in practice nobody treats it as one.
+
+OpenRouter's live `/api/v1/models` returns 458 models. Of OpenAI's documented
+fields it includes only `id` and `created`. It drops `object` and `owned_by`,
+and adds 16 of its own: `context_length`, `pricing`, `architecture`,
+`supported_parameters`, `top_provider`, `reasoning`, `name`, `description`,
+`canonical_slug`, `hugging_face_id`, `default_parameters`, `knowledge_cutoff`,
+`expiration_date`, `links`, `per_request_limits`, `supported_voices`.
+
+Every coding tool reads that endpoint and copes. So put everything useful in.
+
+### The response
+
+```json
+{"object": "list", "data": [
+  {
+    "id": "claude-fable-5-1",
+    "object": "model",
+    "owned_by": "openrouter",
+    "created": 1760140800,
+
+    "intelligence": 71,
+    "intelligence_rank": 3,
+    "context_length": 200000,
+    "max_output": 64000,
+    "supports_tools": true,
+    "supports_vision": true,
+    "supports_reasoning": true,
+
+    "channels": {
+      "total": 9,
+      "healthy": 7,
+      "in_backoff": 2,
+      "providers": ["openrouter", "zai"],
+      "next_eligible": "2026-10-11T03:14:22Z"
+    }
+  }
+]}
+```
+
+Standard fields first, so a client that only knows OpenAI's four finds them at
+the top. Everything else after.
+
+### Where each field comes from
+
+| Field | Source |
+|---|---|
+| `id`, `context_length`, `max_output`, `supports_tools`, `supports_vision`, `supports_reasoning` | `model_capabilities.csv`, joined on `(provider, model_id)` |
+| `intelligence`, `intelligence_rank` | `models.csv`, the Artificial Analysis ranking |
+| `owned_by` | The provider of the highest-ranked healthy channel for this model |
+| `created` | The provider's own value where it gives one, else the file's release date |
+| `channels` | The live in-memory channel list and health table |
+
+### `channels` is the debugging view
+
+Nine channels, seven healthy, two in backoff, and when the next one comes back.
+That answers "why is this model not being used" without an admin endpoint, a
+control surface or saved state. See **Applying a change** for why there is no
+admin endpoint.
+
+`next_eligible` is the soonest `eligible_at` across that model's channels. Null
+when one is healthy now.
+
+### Which models appear
+
+**All of them, with their status.** Every model the router knows a channel for,
+healthy or not.
+
+A model with 9 channels all in backoff appears with `"healthy": 0` and a
+`next_eligible` timestamp. A model on a provider that failed its reachability
+probe appears the same way.
+
+Filtering by health would delete the view of what is broken, which is half the
+job of this endpoint. A client that wants only working models reads
+`channels.healthy`.
+
+Only one thing keeps a model out: the router has never seen a channel for it. A
+model listed in `model_capabilities.csv` for a provider you do not hold a key
+for never enters the channel list, so it never appears here.
+
+## Streaming
+
+`streaming: true` in `router.yml`. Off gives the behaviour in **Core loop**:
+wait for a complete answer, first 2xx with content wins.
+
+### Why it matters more than it looks
+
+**It keeps the client connected.** Claude Code's `API_TIMEOUT_MS` defaults to
+10 minutes. A channel call takes 34.5 minutes: 1,000s of prefill on a 1M token
+prompt, then 1,067s of generation at 30 tokens/second. Without streaming the
+client hangs up at 10 minutes, every time.
+
+Streamed, a token arrives every 33ms at 30 tokens/second, so the client's read
+timer keeps resetting and never fires.
+
+**Streaming alone is not enough.** Nothing is sent during prefill, and prefill
+on a 1M token prompt runs past the timeout on its own:
+
+| Prefill | First token | Against a 10 min timeout |
+|---|---|---|
+| 1,000 tok/s | 16.7 min | over |
+| 5,000 tok/s | 3.3 min | under |
+| 10,000 tok/s | 1.7 min | under |
+| 50,000 tok/s | 0.3 min | under |
+
+That is what the keepalive below is for.
+
+**It lets the router pick a fast channel.** Generation speed across your
+providers spans 30 to 1,000 tokens/second, which is 17 minutes of difference on
+one answer.
+
+| Generation | Total | Client waits |
+|---|---|---|
+| 30 tok/s | 2,067s | 34.4 min |
+| 100 tok/s | 1,320s | 22.0 min |
+| 500 tok/s | 1,064s | 17.7 min |
+| 1,000 tok/s | 1,032s | 17.2 min |
+
+Without streaming the router cannot see that difference until the answer lands,
+and by then the choice is made.
+
+### Two separate settings
+
+**`streaming` in `router.yml` is about the providers. `stream` in the client's
+request is about the client.** They are independent, and a mismatch is fine.
+
+| Client asks for | Router does |
+|---|---|
+| `stream: true` | Forwards the winning stream as it arrives. |
+| `stream: false`, or no field | Buffers the winning stream, sends one piece. |
+
+**Always stream from the providers.** The hedge strategy needs a stream to
+measure, and giving that up because the client did not ask for streaming would
+throw away the 17 minute saving for nothing.
+
+**Buffering costs nothing.** 125KB per client request, 42.7MB at 350 concurrent,
+and the router already holds that response to write it to the cache.
+
+**Never reject a mismatch.** Returning `400` because the client's mode differs
+from the router's breaks every tool for no gain.
+
+### `hedge_strategy: ttft`
+
+Time to first token. The first channel to emit a token wins. Cancel the other 31
+immediately.
+
+Simple and fastest to a first token. It picks whichever channel got through
+prefill first, which is not the channel that will finish first.
+
+### `hedge_strategy: tps`
+
+Tokens per second. The default.
+
+1. `t0` is the moment the first channel emits its first token.
+2. Buffer every stream. Send nothing to the client yet.
+3. Wait `hedge_window_ms`, default 1000.
+4. At `t0 + 1s`: one channel streaming means it wins. Several streaming means
+   measure each one's tokens per second across that window, and the highest
+   wins.
+5. Cancel every other channel call. Flush the winner's buffer to the client,
+   then forward the rest of its stream.
+
+**Cost: 1 second.** **Gain: up to 17 minutes**, when it picks a 1,000 tok/s
+channel over a 30 tok/s one.
+
+**Buffering is cheap.** 32 streams for 1 second holds 125KB per client request
+at 1,000 tokens/second each, 12KB at 100.
+
+### Keepalive
+
+**The router sends a keepalive from the moment it accepts a client request until
+the first real byte of the answer.** Every `keepalive_interval: 15s`.
+
+Do not tell the user to raise `API_TIMEOUT_MS`. A router that only works after
+the client is reconfigured is a broken router.
+
+| Client | Keepalive |
+|---|---|
+| `stream: true` | An SSE comment line, `: ping`, which the spec says a client must ignore. Anthropic's own API sends `ping` events for the same reason. |
+| `stream: false` | Send the `200` and its headers at once, then one space every 15 seconds, then the JSON body. JSON parsers skip leading whitespace, so the body still parses. |
+
+Both keep bytes moving, so the client's read timer resets and never fires.
+
+The space trick is ugly. It is also the only thing that keeps a non-streaming
+client alive through 16.7 minutes of prefill, and every JSON parser accepts it.
+
+Stop the keepalive the moment the first real byte goes out. For a streaming
+client that is the winner's first token. For a non-streaming client it is the
+opening brace of the body.
+
+### Commitment
+
+Once a token reaches the client, the router is committed to that channel. There
+is no taking it back.
+
+That is why `tps` buffers rather than forwarding the first token it sees. `ttft`
+commits at the first token and accepts the consequence.
+
+### When the winning stream dies
+
+`stream_stall_timeout: 60s`. No token for 60 seconds means the channel failed.
+So does a dropped connection or a mid-stream error.
+
+**Before the winner is picked**, a dead channel drops out and the race carries
+on. Nothing reached the client, so there is nothing to undo.
+
+**After the winner is picked, end the client request.** The stream stops. The
+channel is marked unhealthy and backs off as usual.
+
+Carrying on from another channel was considered and rejected. The client already
+has half an answer on screen from one model. Splicing a second model's output
+onto it produces a reply that changes voice and loses the thread mid-sentence,
+and no client can tell that happened.
+
+Ending it is honest. Claude Code retries from the start, and the retry skips the
+dead channel because it is now in backoff.
+
+### Cancellation and the cache
+
+Cancel every losing channel call the moment the winner is picked, same as the
+non-streamed path.
+
+**Only a complete stream goes in the cache.** A cancelled stream is a partial
+answer, and a partial answer is wrong. This removes the late-arrival rule that
+applies without streaming: a losing stream has no complete body to offer.
+
+A cached entry replays to a streaming client as a stream. The router holds the
+whole answer, so it chunks it out.
+
+### The client disconnects
+
+Claude Code hanging up is a cancellation like any other. Drop all 64 channel
+calls at once.
+
+Without this, a client that gives up at 10 minutes leaves 64 calls running for
+another 24 minutes, burning quota on an answer nobody reads.
+
+Watch for it on the response body sink: `axum` surfaces a dropped connection as
+a send error.
+
+### Config
+
+```yaml
+streaming: true
+hedge_strategy: tps        # tps | ttft
+hedge_window_ms: 1000      # tps only: how long to watch before choosing
+stream_stall_timeout: 60s  # no token for this long means the channel failed
+keepalive_interval: 15s    # until the first real byte reaches the client
+```
+
+### Translation
+
+`switchyard-translation` handles streams in both directions: `decode_stream`
+turns provider SSE bytes into normalised events, `encode_stream` turns them into
+the target format's events. Same two-edges rule as the buffered path. See
+**Format translation**.
+
 ## Status codes
 
 Five outcomes, one code each. Every failure says which of four different things
@@ -743,7 +1051,7 @@ which is the whole reason for the split.
 |---|---|
 | `POST /v1/messages` | Anthropic format. Claude Code uses this. Primary path. |
 | `POST /v1/chat/completions` | OpenAI format. Cline, Cursor, scripts. |
-| `GET /v1/models` | Merged catalogue, ranked. Clients read it to fill a picker. |
+| `GET /v1/models` | Merged catalogue, ranked, with live channel health. Clients fill a picker from it; you read it to see what is broken. See **`GET /v1/models`**. |
 | `GET /healthz` | Docker health check. |
 | `GET /metrics` | Prometheus text. Omniroute died silently; this is why. |
 
@@ -808,7 +1116,7 @@ models anywhere else.
 
 **Do not test the providers by hand before building this.** The router probes
 all 15 on every startup. That is the test. A provider with no `/models` endpoint
-marks itself unhealthy, costs one keyless call an hour, and is reported on
+marks itself unhealthy, costs one keyless call a month, and is reported on
 `/healthz`. There is nothing to decide in advance, nothing to prune from
 `providers.yaml`, and no list to hand-maintain.
 
@@ -877,8 +1185,10 @@ channel, a provider/key pair and a provider alike.
 | `retry_counter` | Consecutive failures. 1, 2, 3, and so on. |
 | `retry_base` | Seconds. 1 by default. |
 
+The cap is **30 days**, not an hour.
+
 ```
-wait_seconds = min(3600, retry_base * 2.pow(retry_counter - 1))
+wait_seconds = min(2_592_000, retry_base * 2.pow(retry_counter - 1))
 ```
 
 On a failure, add 1 to `retry_counter` and wait that long before the thing is
@@ -890,7 +1200,14 @@ date rather than a number, use the seconds between now and that date. Everything
 else is unchanged: the same doubling applies on top.
 
 So a provider saying 60 seconds gives 60s, then 120s, then 240s on the third
-consecutive failure, still capped at 1 hour.
+consecutive failure, capped at 30 days.
+
+**Why the cap is 30 days and not an hour.** A monthly quota is the normal way a
+free tier runs out, and the provider says so: `Retry-After` carries a figure in
+days. An hourly cap would ignore that and retry a channel 24 times a day for the
+rest of the month, failing every time, burning rate limit and keeping a dead
+channel at the top of the ranking. 30 days matches how the quotas actually
+reset.
 
 **On a success, reset both.** `retry_counter` back to 0 and `retry_base` back to
 1, so the next failure is failure number one again and waits 1 second. A success
@@ -952,10 +1269,10 @@ Only unhealthy things get polled. Each unhealthy thing carries its own backoff.
 A channel differs only in that nothing polls it. It is hidden from the channel
 list until its backoff expires, then it goes back in. If the next real request
 that reaches it fails again, its backoff doubles and it drops out again. A
-permanently dead channel settles at one attempt an hour, carried by traffic that
+permanently dead channel settles at one attempt a month, carried by traffic that
 was happening anyway.
 
-A dead provider costs one keyless call an hour, not nine keyed ones, because it
+A dead provider costs one keyless call a month, not nine keyed ones, because it
 stays on probe 1 until its host answers.
 
 ### Swapping the list while serving
@@ -1519,6 +1836,48 @@ Edit the file under `/mnt/shuttle/share/app-data/llmrouter/config`, then
 `docker compose restart llmrouter`. Boot re-reads every file and re-probes the
 providers. See **Config**.
 
+## Every number here is a starting point
+
+**Nothing in `router.yml` is a commitment.** N, M, the backoff cap, the stream
+window, the memory high water, the cache size: all of them are config. Edit the
+file, restart the container, done in two seconds.
+
+The job of this document is to pick a defensible starting value for each one and
+say what it costs, so the first change is informed rather than a guess.
+
+| Setting | Start at | Change it when |
+|---|---|---|
+| `race_width` (N) | 32 | Provider quotas run dry, or the answer is good enough from fewer channels. |
+| `max_per_channel` (M) | 2 | Latency is fine without the hedge, or a key keeps hitting its rate limit. |
+| `backoff_max` | 30d | Channels come back sooner than a monthly reset. |
+| `http2_stream_window` | 131072 | `router_rss_bytes` approaches `memory_high_water`. |
+| `memory_high_water` | 3GB | The container memory limit changes. |
+| `cache.max_bytes` | 100GB | The pool fills, or 7 days of entries never gets close. |
+| `request_timeout` | 3600s | Models are faster than 30 tokens/second. |
+
+### What N=32 and M=2 cost
+
+At 3,000 client requests a day with 1M token prompts:
+
+| Setting | Calls per request | Input tokens/day | Per key, across 47 | Against 3B used |
+|---|---|---|---|---|
+| N=32, M=2 | 64 | 192 billion | 4.1 billion | 64x |
+| N=8, M=1 | 8 | 24 billion | 0.5 billion | 8x |
+| N=4, M=1 | 4 | 12 billion | 0.3 billion | 4x |
+| N=2, M=1 | 2 | 6 billion | 0.1 billion | 2x |
+| N=1, M=1 | 1 | 3 billion | 0.1 billion | 1x |
+
+189 billion tokens a day buy answers that get cancelled and thrown away.
+
+**Starting at N=32, M=2.** The trade is the best model slowly against the
+twentieth best model fast, and 32 picks the second. The 30 day backoff cap makes
+the failure mode clean: a channel that exhausts its monthly quota says so
+through `Retry-After`, goes quiet for the right length of time, and the router
+walks down the ranking to channels with quota left.
+
+Watch `router_attempts_total{channel,outcome}` on `/metrics`. If the top of the
+ranking sits permanently in backoff, lower N.
+
 ## Config
 
 Split by concern, not one file. Restart to apply any change.
@@ -1529,7 +1888,7 @@ Split by concern, not one file. Restart to apply any change.
 | `providers.yml` | Channels: name, base URL, wire format, which `.env` keys it uses. |
 | `models.yml` | Per-model overrides: context window, tool support, name mapping. |
 | `intelligence.yml` | The ranking. Built from `models.csv`. |
-| `router.yml` | N, M, timeouts, health and backoff, cache path, cache TTL. |
+| `router.yml` | N, M, streaming and hedge strategy, timeouts, health and backoff, memory gate, cache path and size. |
 
 `providers.yml` names its keys instead of holding them, so the file is safe to
 read and share:
@@ -1552,7 +1911,12 @@ providers:
 race_width: 32           # N: concurrent channel calls, different channels
 max_per_channel: 2       # M: hedged copies of one channel call
 hedge_delay_ms: 0        # 0 = the M copies fire with the first one
-request_timeout: 3600s    # one channel call; the client request has no cap
+streaming: true
+hedge_strategy: tps           # tps | ttft
+hedge_window_ms: 1000         # tps only: how long to watch before choosing
+stream_stall_timeout: 60s     # no token for this long means the channel failed
+keepalive_interval: 15s       # until the first real byte reaches the client
+request_timeout: 3600s        # one channel call; the client request has no cap
 connect_timeout: 5s       # handshake only; a dead host fails fast
 spill_above_concurrent: 100
 spill_path: /data/spill
@@ -1562,7 +1926,7 @@ http2_connection_window: 1048576
 health_poll:
   probe_timeout: 5s      # per probe, every wave
   retry_base: 1s         # default base; Retry-After overrides it per failure
-  backoff_max: 1h        # wait = min(backoff_max, retry_base * 2^(counter-1))
+  backoff_max: 30d       # wait = min(backoff_max, retry_base * 2^(counter-1))
   network_test_timeout: 2s  # runs beside every request's upstream calls
 cache:
   enabled: true
@@ -1594,7 +1958,7 @@ provider.
 
 **"Request slot" means one HTTP/2 stream**, which is one request and its
 response multiplexed onto a shared connection. It has nothing to do with token
-streaming, which this router does not do.
+streaming, which is a separate thing: see **Streaming**.
 
 | Setting | Value | Why |
 |---|---|---|
@@ -2065,8 +2429,8 @@ spreadsheet of which endpoint works. See **Startup and health**.
 
 **Do not add a cap on channel calls per client request.** Spec item 8 says walk
 until success or the list runs out. The exponential backoff is the cap: a
-channel that keeps failing reaches a 1 hour wait after 12 failures and leaves
-the list on its own. A fixed `max_attempts` was proposed and removed.
+channel that keeps failing reaches 34 minutes after 12 failures and the 30 day
+cap after 23, so it leaves the list on its own. A fixed `max_attempts` was proposed and removed.
 
 **Do not add a wall-clock deadline for the client request.** Same reason.
 `request_timeout` limits one channel call and nothing limits the client request.
@@ -2133,9 +2497,13 @@ question get two different keys and two caches that never meet.
 9.3ms on a 3.8MB prompt, which is the whole latency budget. BLAKE3 gives the
 same 32 bytes about ten times faster.
 
-**Do not throw away a channel call that finished before cancellation.** It is
-already paid for. If it came from a smarter model than the winner, it is the one
-to cache.
+**Do not throw away a channel call that finishes during cancellation.** It is
+already paid for. Offer it to the cache: if its model is smarter than the stored
+entry, it wins.
+
+**Do not wait for slower channel calls to improve the cache.** The winner is
+the first to finish, a smarter model is usually minutes behind, and holding 31
+calls open costs 3 billion output tokens a day for a cache that rarely hits.
 
 **Do not write custom code where a maintained library exists.** A library is
 faster to ship and less buggy than a hand-written version. This decided the
@@ -2148,8 +2516,8 @@ It saves 13.7ms against an upstream call of 10 to 60 seconds, and costs a
 maintained fork of a pre-alpha crate.
 
 **Do not set a short `request_timeout`.** A channel call is prefill plus
-generation with no streaming: 1M tokens at 1,000 tok/s plus 32k at 30 tok/s is
-2,067 seconds. A 60s timeout needs 32,000 tok/s to finish, and every timeout
+generation: 1M tokens at 1,000 tok/s plus 32k at 30 tok/s is 2,067 seconds.
+Streaming fixes the client's timeout, not the provider's generation time. A 60s timeout needs 32,000 tok/s to finish, and every timeout
 marks an honest slow model unhealthy. 3,600s.
 
 **Do not assume a fixed number of concurrent client requests.** It is arrival
@@ -2194,6 +2562,43 @@ size difference is noise next to a 100GB cache pool.
 **Do not omit `mem_limit` from the compose file.** Without it the 4GB budget is
 a comment, and the process grows into memory Frigate and Plex need.
 
+**Do not forward the first token you see when `hedge_strategy` is `tps`.**
+Sending a token commits the router to that channel. Buffer for
+`hedge_window_ms`, pick the fastest stream, then flush.
+
+**Do not expect the client to raise its timeout.** Claude Code's
+`API_TIMEOUT_MS` defaults to 10 minutes and prefill on a 1M token prompt takes
+16.7 minutes at 1,000 tok/s. The router sends a keepalive every 15 seconds until
+the first real byte: an SSE comment for a streaming client, a leading space for
+a non-streaming one. A router that only works after the client is reconfigured
+is a broken router.
+
+**Do not reject a client whose streaming mode differs from the router's.**
+`streaming` in `router.yml` governs the providers. `stream` in the request
+governs the client. Buffer the stream for a client that wants one piece: it
+costs 42.7MB at 350 concurrent, and that response is already held for the cache
+write.
+
+**Do not splice a second channel onto a broken stream.** Once the client has
+part of an answer, the router is committed. A stream that dies after that ends
+the client request. Joining another model's output mid-sentence produces a reply
+nobody can trust and no client can detect.
+
+**Do not cache a cancelled stream.** It is a partial answer, and a partial
+answer is wrong.
+
+**Do not keep channel calls running after the client hangs up.** 64 calls for
+another 24 minutes, for an answer nobody reads.
+
+**Do not filter `GET /v1/models` by health.** It lists every model the router
+knows a channel for, with its live status. Hiding the broken ones deletes the
+view of what is broken.
+
+**Do not restrict `GET /v1/models` to OpenAI's documented fields.** OpenRouter
+returns 458 models carrying 16 non-standard fields and drops two standard ones,
+and every coding tool copes. Put the intelligence score, context window,
+capability flags and live channel health in.
+
 **Do not return one status code for "no capacity" and "no channel".** They are
 opposite problems: `503` means the router is full and healthy, `504` means it is
 idle and the upstreams are failing. They call for opposite reactions. See
@@ -2221,7 +2626,6 @@ the thing being chosen.
 - No retry with backoff on the racing path. Failure moves to the next channel.
 - No admin UI. Config is a YAML file; the container reloads.
 - No per-user quotas, billing, or multi-tenancy.
-- No streaming. Whole responses only, `stream: false` upstream.
 - No semantic cache. Exact match only. Fuzzy matching needs embeddings, which
   needs a model call, which defeats the point.
 
@@ -2241,13 +2645,9 @@ for interactive coding.
 **Anthropic format is a first-class path, not a shim.** Claude Code speaks
 `/v1/messages`. Every provider in `providers.yml` speaks OpenAI. So the
 Anthropic-to-OpenAI translation sits on the hot path for your main client, in
-both directions. Without streaming this is the straightforward version of that
-job, but it is still the second largest piece of work after tool calling.
-
-**Claude Code without streaming.** It will work, since `/v1/messages` accepts
-`stream: false`, but every reply arrives in one lump after the full generation
-time. Expect it to feel slow rather than broken. Worth confirming on the real
-client early, before the rest is built on the assumption.
+both directions, and now in both buffered and streamed form. The streamed path
+is the harder half: `decode_stream` and `encode_stream` must keep tool-call ids
+intact across SSE chunk boundaries.
 
 **Z.ai coding plan economics.** It is a flat subscription, not metered tokens.
 Racing or hedging against it multiplies usage against whatever allowance the

@@ -1,0 +1,27 @@
+services:
+  llmrouter:
+    image: llmrouter:latest
+    build: .
+    # The health table flushes every 5 minutes, so a restart costs at most 5
+    # minutes of learned health. The cache is on the pool and survives.
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8080:8080"
+    # Makes the 4GB budget real. The RSS gate refuses client requests above
+    # memory_high_water (3GB) so the kernel never has to refuse them here.
+    mem_limit: 4g
+    ulimits:
+      # The Linux default of 1,024 is reached by a provider stuck on HTTP/1.1,
+      # and running out of descriptors fails in confusing ways.
+      nofile: 65536
+    volumes:
+      # Read-only on /config means a bug cannot rewrite the keys.
+      - /mnt/shuttle/share/app-data/llmrouter/config:/config:ro
+      # /data is on the ZFS pool, so cache.redb and spill/ survive the
+      # container being deleted and recreated.
+      - /mnt/shuttle/share/app-data/llmrouter/data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 30s
+      # Covers the two startup probe waves.
+      start_period: 10s

@@ -72,8 +72,8 @@ One agent owns one file. Never edit another module's file.
 | `src/cache.rs` | redb `responses` table, blake3 key over the neutral request, read rules, the intelligence write rule in one transaction, ttl and `max_bytes`. | Cache |
 | `src/wire.rs` | The only module that names `switchyard_translation`. Four buffered functions and two streaming ones. | Format translation |
 | `src/upstream.rs` | The shared `reqwest::Client`, HTTP/2 settings, one channel call buffered or streamed, the shared `Bytes` body. | HTTP client settings, Memory over the life of one client request |
-| `src/race.rs` | N channels, M hedged copies, `ttft` and `tps` hedge strategies, the 1s decision window, cancellation, fallback, the client-disconnect path. | Core loop, Streaming, Concurrency against one provider |
-| `src/server.rs` | axum routes, the keepalive, request and response translation at the edges, status codes. | Endpoints, Status codes, Streaming |
+| `src/race.rs` | N channels, M hedged copies, first copy home wins, cancellation, fallback, the client-disconnect path. | Core loop, Streaming, Concurrency against one provider |
+| `src/server.rs` | axum routes, request and response translation at the edges, status codes (no keepalive: the status line must not go out before the outcome is known). | Endpoints, Status codes, Streaming |
 | `src/models_api.rs` | `GET /v1/models`, one row per distinct model with live channel health. | `GET /v1/models` |
 | `src/admission.rs` | The RSS gate: read `/proc/self/statm`, compare to `memory_high_water`, `503` above it. | Admission: the gate is memory |
 | `src/net.rs` | The two network test calls that run beside every client request. | When the network itself is down |
