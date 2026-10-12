@@ -321,8 +321,11 @@ The provider decides what exists. The file supplies the detail.
 `model_capabilities.csv` is a snapshot from 8 October 2026 and goes stale.
 Models appear and retire. Never treat it as the list of what exists.
 
-Cloudflare and Pollinations are absent from the file, so they depend on step 1
-entirely.
+Pollinations is absent from the file, so it depends on step 1 entirely.
+Cloudflare is present, but under the single provider name
+`cloudflare-workers-ai`, while `providers.yaml` names each account
+`cloudflare-<account id>`. `llmrouter-make-config` copies those 27 rows across
+under each account's own name, so the join in step 2 matches.
 
 ## Vocabulary
 
@@ -1105,18 +1108,22 @@ providers. One expired Gemini key must not disable the other eight.
    and every model on it becomes a channel. Anything else marks the pair
    unhealthy.
 
-**A `/models` endpoint is required.** No list, no channels. A provider that does
-not serve one is unhealthy and stays unhealthy. Do not fall back to a model list
-in config, and do not probe with a completion call instead.
+**A `/models` endpoint is required.** No list, no channels. Anything other than
+a 2xx leaves the pair unhealthy, and do not probe with a completion call
+instead. The single exception is a provider that has no model-listing endpoint
+at all: it answers `404` or `405`, and if it carries a `models` list in
+`providers.yml` the probe uses that list instead. Cloudflare Workers AI is the
+case this exists for. See the "Config" section for the shape.
+A `401`, a `403`, a `429` or a `5xx` is still a failed probe, so a dead key
+never produces channels.
 
-Every model fact the router holds came from a `/models` endpoint in the first
-place. `model_capabilities.csv` is 9,927 rows built that way. A provider that
-will not answer `/models` cannot be trusted to have told the truth about its
-models anywhere else.
+Every other model fact the router holds came from a `/models` endpoint in the
+first place. `model_capabilities.csv` is 9,927 rows built that way. A provider
+that answers `/models` but lies about it cannot be corrected from config.
 
 **Do not test the providers by hand before building this.** The router probes
-all 15 on every startup. That is the test. A provider with no `/models` endpoint
-marks itself unhealthy, costs one keyless call a month, and is reported on
+all 15 on every startup. That is the test. A provider whose `/models` probe
+fails marks itself unhealthy, costs one keyless call a month, and is reported on
 `/healthz`. There is nothing to decide in advance, nothing to prune from
 `providers.yaml`, and no list to hand-maintain.
 
@@ -1242,8 +1249,6 @@ Requests fail while the link is down. That is correct and unavoidable. When it
 returns, the first channel is eligible 1 second later, because nothing inflated
 its counter while the fault was local.
 
-| Code | Means |
-|---|---|
 | Code | Means | Whose fault |
 |---|---|---|
 | `413` | The filter emptied the channel list: no model has a large enough context window for this prompt. The body names the largest found. | The caller's. No wait helps. |
@@ -1377,7 +1382,7 @@ a week later. Never use a list index to name a channel.
    is spec item 8: move to the next immediately.
 5. **First 2xx with non-empty content wins.** Cancel the token, which tears
    down every other call in flight.
-6. **The query returns nothing**: `503`, with the number of channel calls made
+6. **The query returns nothing**: `504`, with the number of channel calls made
    and the last upstream error.
 
 **A sliding window of N, not waves of N.** At any moment N channel calls are
@@ -1477,11 +1482,11 @@ channels before one works.
 
 **4. Every key dead, big prompt.** Every key expired overnight. The long prompt
 means only 1,973 channels qualify. All are called, all return `401`, the client
-gets `503`.
+gets `504`.
 
 **5. Every key dead, cold start.** The router restarted, so the health table is
 empty and nothing is in backoff. The short prompt means all 4,000 channels
-qualify and all are called. `503`. This happens once: every channel picks up a
+qualify and all are called. `504`. This happens once: every channel picks up a
 `retry_counter` on the way through, so the next client request finds a shorter
 list. See the worked case in **Startup and health**.
 
@@ -1701,7 +1706,7 @@ Omniroute died quietly. These four metrics are the reason `/metrics` exists.
 |---|---|
 | `router_requests_total{outcome}` | One per code: `hit_cache`, `success`, `too_large` (413), `no_network` (502), `not_admitted` (503), `no_channel` (504). |
 | `router_rss_bytes` against `memory_high_water` | How close the gate is to firing. The one graph to watch. |
-| `router_attempts_total{channel,outcome}` | `success`, `http_error`, `timeout`, `cancelled`. A channel that flips to all `http_error` overnight is a dead key. |
+| `router_attempts_total{provider,model,outcome}` | `success`, `http_error`, `timeout`, `cancelled`. A provider and model that flips to all `http_error` overnight is dead. Labelled by provider and model, not by channel id: a channel id is per key, which would put tens of thousands of series on the page. |
 | `router_latency_seconds` | Histogram, split into time to the winning response and time added by the router. The second one proves the latency target. |
 | `router_rss_bytes`, `router_cache_entries` | Memory growth killed omniroute and nobody watched. A flat line here is the proof it is not repeating. |
 
@@ -1810,7 +1815,7 @@ authentication**.
 
 | Host path | Container path | Mode | Holds |
 |---|---|---|---|
-| `/mnt/shuttle/share/app-data/llmrouter/config` | `/config` | read-only | `.env`, `providers.yml`, `models.yml`, `intelligence.yml`, `router.yml` |
+| `/mnt/shuttle/share/app-data/llmrouter/config` | `/config` | read-only | `.env`, `providers.yml`, `models.yml`, `intelligence.yml`, `router.yml`, `model_capabilities.csv` |
 | `/mnt/shuttle/share/app-data/llmrouter/data` | `/data` | read-write | `cache.redb`, `spill/` |
 
 Read-only on `/config` means a bug cannot rewrite your keys.
@@ -1875,7 +1880,7 @@ the failure mode clean: a channel that exhausts its monthly quota says so
 through `Retry-After`, goes quiet for the right length of time, and the router
 walks down the ranking to channels with quota left.
 
-Watch `router_attempts_total{channel,outcome}` on `/metrics`. If the top of the
+Watch `router_attempts_total{provider,model,outcome}` on `/metrics`. If the top of the
 ranking sits permanently in backoff, lower N.
 
 ## Config
@@ -1889,6 +1894,7 @@ Split by concern, not one file. Restart to apply any change.
 | `models.yml` | Per-model overrides: context window, tool support, name mapping. |
 | `intelligence.yml` | The ranking. Built from `models.csv`. |
 | `router.yml` | N, M, streaming and hedge strategy, timeouts, health and backoff, memory gate, cache path and size. |
+| `model_capabilities.csv` | Context window, max output and tool support per `(provider, model_id)`. Missing rows mean defaults, so a missing file silently widens the race. |
 
 `providers.yml` names its keys instead of holding them, so the file is safe to
 read and share:
@@ -1903,7 +1909,23 @@ providers:
     wire: openai
     base_url: https://openrouter.ai/api/v1
     keys_env: OPENROUTER_KEYS
+  - name: cloudflare-b4b050cc
+    wire: openai
+    base_url: https://api.cloudflare.com/client/v4/accounts/b4b050cc/ai/v1
+    keys_env: CLOUDFLARE_B4B050CC_KEYS
+    models:                      # used only when the probe gets 404 or 405
+      - '@cf/meta/llama-3.1-8b-instruct'
 ```
+
+A provider with no model-listing endpoint answers `404` or `405` on the
+`/models` probe. Cloudflare Workers AI is one: the OpenAI-compatible path takes
+`POST` only. Such a provider lists its models under `models`, and the probe
+uses that list in place of the one it could not fetch. Any other status, `401`
+included, is still a failed probe, so a dead key never produces channels.
+Set `models` on such a provider and nothing else: a base URL missing its version
+segment also answers `404`, and a `models` list would turn that into a healthy
+provider whose every chat call fails. `llmrouter-make-config` therefore copies
+`known_models` across for Cloudflare only.
 
 `router.yml`:
 
@@ -2165,8 +2187,6 @@ admission removes the gap and the reserve.
 
 It is not a channel failure. The three codes stay distinct:
 
-| Code | Means |
-|---|---|
 | Code | Means | Whose fault |
 |---|---|---|
 | `413` | The filter emptied the channel list: no model has a large enough context window for this prompt. The body names the largest found. | The caller's. No wait helps. |
@@ -2182,9 +2202,9 @@ probably does not.
 The body says which. A `503` from the memory gate carries `Retry-After` and
 names the current RSS, so the cause is obvious from the client side.
 
-`/metrics` separates them: `router_requests_total{outcome}` gains a
-`not_admitted` value alongside `hit_cache`, `success`, `exhausted` and
-`deadline`.
+`/metrics` separates them: `router_requests_total{outcome}` counts the `503`
+as `not_admitted` and the `504` as `no_channel`, alongside `hit_cache`,
+`success`, `too_large` and `no_network`.
 
 ## Capacity: what this box actually serves
 

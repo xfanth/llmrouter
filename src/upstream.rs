@@ -20,6 +20,7 @@ use futures::{Stream, StreamExt};
 use reqwest::header::{
     HeaderMap, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER,
 };
+use secrecy::ExposeSecret;
 
 use crate::catalogue::Channel;
 use crate::config::{RouterConfig, WireName};
@@ -339,8 +340,8 @@ pub fn auth_header(channel: &Channel) -> String {
     match channel.wire {
         // Anthropic takes the bare key in `x-api-key`, OpenAI-format providers
         // take it as a bearer token.
-        WireName::OpenAi => format!("Bearer {}", channel.key),
-        WireName::Anthropic => channel.key.to_string(),
+        WireName::OpenAi => format!("Bearer {}", channel.key.expose_secret()),
+        WireName::Anthropic => channel.key.expose_secret().to_string(),
     }
 }
 
@@ -356,7 +357,7 @@ mod tests {
             provider: Arc::from("testprovider"),
             model_id: Arc::from("test-model"),
             key_id: Arc::from("key-0"),
-            key: Arc::from("sk-secret-value"),
+            key: "sk-secret-value".into(),
             base_url: Arc::from(base_url),
             wire,
             limit_context: 128_000,
@@ -465,38 +466,24 @@ mod tests {
     /// the host it points at should never be contacted.
     #[tokio::test]
     async fn a_redirect_is_not_followed_and_the_key_never_reaches_the_new_host() {
-        use tokio::io::AsyncWriteExt;
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
 
-        // The host the redirect points at. It only has to notice a connection.
-        let collector = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a port binds");
-        let collector_addr = collector.local_addr().expect("the port is known");
-        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&reached);
-        let collector_task = tokio::spawn(async move {
-            if collector.accept().await.is_ok() {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        });
-
-        // The provider, which answers every request with a redirect.
-        let provider = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a port binds");
-        let provider_addr = provider.local_addr().expect("the port is known");
-        let provider_task = tokio::spawn(async move {
-            while let Ok((mut socket, _)) = provider.accept().await {
-                let response = format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://{collector_addr}/v1/messages\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-            }
-        });
+        // The host the redirect points at. It must never see a request.
+        let collector = MockServer::start().await;
+        // The provider, which answers every request with a redirect. wiremock
+        // reads the request before replying, so the client never gets a reset
+        // mid-body the way a hand-rolled listener that ignored it could.
+        let provider = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/v1/messages", collector.uri())),
+            )
+            .mount(&provider)
+            .await;
 
         let upstream = Upstream::new(&RouterConfig::default()).expect("client builds");
-        let channel = channel(&format!("http://{provider_addr}/v1"), WireName::Anthropic);
+        let channel = channel(&format!("{}/v1", provider.uri()), WireName::Anthropic);
         let body = SharedBody::new(Bytes::from_static(br#"{"messages":[]}"#));
 
         let outcome = upstream
@@ -505,12 +492,13 @@ mod tests {
             .expect("the redirect is a status, not a transport failure");
         assert_eq!(outcome.status, 302, "the 3xx must surface as a status");
         assert!(
-            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            collector
+                .received_requests()
+                .await
+                .expect("request recording is on")
+                .is_empty(),
             "the key must never reach the host the redirect named"
         );
-
-        collector_task.abort();
-        provider_task.abort();
     }
 
     #[test]

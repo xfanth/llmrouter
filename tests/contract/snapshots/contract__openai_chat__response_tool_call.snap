@@ -5,7 +5,7 @@ expression: encoded
 {
   "id": "chatcmpl-tool1",
   "object": "chat.completion",
-  "created": 0,
+  "created": "[created]",
   "model": "router/auto",
   "choices": [
     {

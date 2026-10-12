@@ -80,6 +80,9 @@ enum Link {
     Up,
     /// Both calls go to a closed port, so both fail to connect.
     Down,
+    /// As `Up`, but the test answers only after this long, so channel
+    /// failures that land first are held until it does.
+    SlowUp(Duration),
 }
 
 /// A racer over a throwaway redb file, a catalogue of the given channels and
@@ -123,10 +126,14 @@ impl Harness {
         let upstream = llmrouter::Upstream::new(&config.router).expect("the client builds");
 
         let (link_server, urls) = match link {
-            Link::Up => {
+            Link::Up | Link::SlowUp(_) => {
+                let delay = match link {
+                    Link::SlowUp(delay) => delay,
+                    _ => Duration::ZERO,
+                };
                 let server = MockServer::start().await;
                 Mock::given(method("GET"))
-                    .respond_with(ResponseTemplate::new(204))
+                    .respond_with(ResponseTemplate::new(204).set_delay(delay))
                     .mount(&server)
                     .await;
                 let urls = vec![
@@ -851,6 +858,53 @@ async fn a_client_that_hangs_up_cancels_the_walk() {
     );
 }
 
+/// A trial that failed before the client hung up is a real channel failure,
+/// not a cancellation. The network test is still out when the client goes, so
+/// the failure is held, and it must still land once the test says the link is
+/// up rather than vanish with the client.
+#[tokio::test]
+async fn a_client_hanging_up_still_settles_failures_already_held() {
+    let broken = upstream(ResponseTemplate::new(401).set_body_string("bad key")).await;
+    let slow = upstream(
+        ResponseTemplate::new(200)
+            .set_body_json(reply("nobody reads this"))
+            .set_delay(TOO_SLOW),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let broken_channel = channel("broken", &broken.uri(), 0);
+    let broken_id = broken_channel.id;
+
+    let harness = Harness::new(
+        router_config(2, 1, dir.path()),
+        vec![broken_channel, channel("slow", &slow.uri(), 1)],
+        Link::SlowUp(Duration::from_millis(500)),
+    )
+    .await;
+
+    let cancel = CancellationToken::new();
+    let hang_up = cancel.clone();
+    tokio::spawn(async move {
+        // Long enough for the 401 on loopback, well short of the network test.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        hang_up.cancel();
+    });
+
+    let outcome = harness.racer.run(input(false), cancel).await;
+    assert!(
+        matches!(outcome, RaceOutcome::ClientGone),
+        "expected the client gone, got {}",
+        name_of(&outcome)
+    );
+
+    let entry = harness
+        .health
+        .get(&HealthKey::Channel(broken_id))
+        .expect("the failure held before the hang up is written");
+    assert_eq!(entry.retry_counter, 1);
+}
+
 /// A stream that breaks inside the `tps` window is an ordinary failed trial:
 /// nothing reached the client, so the walk replaces the dead channel and
 /// carries on. Width is 1, so the broken channel is the whole in-flight set
@@ -875,6 +929,22 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
         Link::Up,
     )
     .await;
+    // Earlier live traffic had already taken the broken channel's key down.
+    let broken_pair = HealthKey::ProviderKey {
+        provider: "broken".to_string(),
+        key_id: "key-fake".to_string(),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past the epoch")
+        .as_secs();
+    // Two failures, so the row holds a counter a fresh escalation cannot
+    // rebuild: if the first token wiped the pair, the broken channel's later
+    // failure would record it afresh at counter 1 and look just as present.
+    harness.health.record_failure(&broken_pair, None, now);
+    let seeded = harness.health.record_failure(&broken_pair, None, now);
+    assert_eq!(seeded.retry_counter, 2);
+    let broken_id = channel("broken", &broken_url, 0).id;
 
     let (outcome, elapsed) = harness.run(input(true)).await;
 
@@ -900,6 +970,27 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
         .await
         .expect("the winning stream folds into one answer");
     assert_eq!(text_of(&aggregated), "ok".repeat(4));
+
+    // Getting a first token out is not an answer. The broken channel owes a
+    // failure, and the first token must not have wiped the key's backoff.
+    let entry = harness
+        .health
+        .get(&HealthKey::Channel(broken_id))
+        .expect("the broken channel is charged a failure");
+    assert_eq!(entry.retry_counter, 1);
+    assert!(
+        row_for(&harness.rows(), broken_id)
+            .health
+            .eligible_at
+            .load(Ordering::Relaxed)
+            > now,
+        "the broken channel's row is backed off"
+    );
+    assert_eq!(
+        harness.health.get(&broken_pair),
+        Some(seeded),
+        "the key stays with the poller, its backoff untouched by the first token"
+    );
 
     broken_task.abort();
 }

@@ -290,6 +290,25 @@ impl Cache {
         }
     }
 
+    /// [`Cache::put_stream`] on the blocking pool.
+    ///
+    /// The write is blocking work: a `stat`, possibly an eviction scan over
+    /// the whole table, and a redb write transaction that waits for whichever
+    /// writer holds the file, since redb allows exactly one. Run inline it
+    /// parks a tokio worker, and enough of them parked means no stream is
+    /// polled and no connection is accepted. So it runs off the runtime.
+    pub async fn put_stream_off_thread(
+        self: Arc<Self>,
+        key: CacheKey,
+        candidate: CacheEntry,
+        end: StreamEnd,
+        now_unix: u64,
+    ) -> crate::Result<bool> {
+        tokio::task::spawn_blocking(move || self.put_stream(key, candidate, end, now_unix))
+            .await
+            .map_err(|e| store("the cache write task", e))?
+    }
+
     /// Deletes the oldest 10 percent by `created_at` in one transaction.
     /// Called on write when the file is over `max_bytes`. redb does not shrink
     /// its file, so the cap is on bytes and the freed space is reused.
@@ -396,6 +415,58 @@ mod tests {
             provider: "groq".to_string(),
             body: b"{\"ok\":true}".to_vec(),
         }
+    }
+
+    /// A cache write must never sit on a runtime worker. With one worker and
+    /// another writer holding redb's single write lock, an inline write parks
+    /// the only thread and nothing else on the runtime is polled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_cache_write_leaves_the_runtime_polling() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let config = CacheConfig {
+            path: dir.path().join("off-thread.redb"),
+            max_bytes: 1 << 20,
+            ttl: Duration::from_secs(7 * DAY),
+            ..CacheConfig::default()
+        };
+        let db = Arc::new(open_database(&config).expect("create"));
+        let cache = Arc::new(Cache::open(Arc::clone(&db), &config).expect("open"));
+
+        // Take redb's one write lock from outside the runtime and sit on it
+        // until told to let go. The holder says when it has the lock, so no
+        // wall-clock guess decides who gets there first.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let txn = db.begin_write().expect("begin write");
+            locked_tx.send(()).expect("signal locked");
+            release_rx.recv().expect("wait for release");
+            txn.commit().expect("commit");
+        });
+        locked_rx.recv().expect("holder took the lock");
+
+        // Both tasks go on the runtime's shared queue, which is first in,
+        // first out, so the one worker picks up the write first. An inline
+        // write then parks that worker on the lock and `other` never runs.
+        let write = tokio::spawn(Arc::clone(&cache).put_stream_off_thread(
+            key(9),
+            entry("claude-fable-5-1", 10, 1_000),
+            StreamEnd::Complete,
+            1_000,
+        ));
+
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        let other = tokio::spawn(async move { ran_tx.send(()).expect("signal ran") });
+
+        // Wait on a plain thread channel, not a tokio timer: tokio timers are
+        // driven by the worker, which a regressed write would have parked.
+        let polled = ran_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).expect("release the lock");
+        polled.expect("the runtime stopped polling while the cache write waited");
+
+        other.await.expect("join");
+        assert!(write.await.expect("join").expect("put"));
+        holder.join().expect("holder");
     }
 
     /// The named-model check matches the catalogue's, which ignores ASCII case.

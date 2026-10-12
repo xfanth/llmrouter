@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use llmrouter::probe::key_id;
 use llmrouter::{
     Catalogue, Config, HealthKey, HealthTable, Prober, Provider, RouterConfig, Upstream, WireName,
 };
@@ -62,6 +63,7 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
             base_url: live.uri(),
             keys_env: "LIVE_KEYS".to_string(),
             models_path: "/models".to_string(),
+            models: Vec::new(),
         },
         Provider {
             name: "dead".to_string(),
@@ -71,16 +73,17 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
             base_url: "http://127.0.0.1:1".to_string(),
             keys_env: "DEAD_KEYS".to_string(),
             models_path: "/models".to_string(),
+            models: Vec::new(),
         },
     ];
     let keys = HashMap::from([
         (
             "LIVE_KEYS".to_string(),
-            vec![GOOD_KEY.to_string(), BAD_KEY.to_string()],
+            vec![GOOD_KEY.into(), BAD_KEY.into()],
         ),
         (
             "DEAD_KEYS".to_string(),
-            vec![GOOD_KEY.to_string(), BAD_KEY.to_string()],
+            vec![GOOD_KEY.into(), BAD_KEY.into()],
         ),
     ]);
 
@@ -112,7 +115,16 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
         Arc::clone(&health),
     );
 
-    prober.run_startup_waves().await;
+    let summary = prober.run_startup_waves().await;
+
+    // The expired key answered with `401`, so it reached the host but fetched
+    // no models. Counting it as answered would report 2 of 2 keys working on a
+    // run where half the keys are dead.
+    assert_eq!(
+        (summary.keys, summary.keys_answered),
+        (2, 1),
+        "only the good key fetched a model list"
+    );
 
     // Wave 2 ran only the live provider's good key, so only its two models
     // are channels.
@@ -122,7 +134,11 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
         .map(|c| format!("{}/{}/{}", c.provider, c.model_id, c.key_id))
         .collect();
     built.sort();
-    assert_eq!(built, ["live/fast-1/live#0", "live/fast-2/live#0"]);
+    let good = key_id("live", GOOD_KEY);
+    assert_eq!(
+        built,
+        [format!("live/fast-1/{good}"), format!("live/fast-2/{good}")]
+    );
 
     // Wave 1 put the unreachable provider in backoff.
     assert!(
@@ -143,19 +159,19 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
         health
             .get(&HealthKey::ProviderKey {
                 provider: "live".to_string(),
-                key_id: "live#1".to_string(),
+                key_id: key_id("live", BAD_KEY),
             })
             .is_some_and(|e| e.retry_counter > 0),
         "the rejected key must be in backoff"
     );
 
     // And nothing spent a keyed call on the provider wave 1 already ruled out.
-    for index in 0..2 {
+    for key in [GOOD_KEY, BAD_KEY] {
         assert!(
             health
                 .get(&HealthKey::ProviderKey {
                     provider: "dead".to_string(),
-                    key_id: format!("dead#{index}"),
+                    key_id: key_id("dead", key),
                 })
                 .is_none(),
             "wave 2 must not probe keys on an unreachable provider"

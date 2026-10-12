@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use arc_swap::ArcSwap;
 use rand::seq::SliceRandom;
@@ -58,8 +58,9 @@ pub struct Channel {
     pub model_id: Arc<str>,
     /// Stable label for the key, for logs and metrics. Never the key itself.
     pub key_id: Arc<str>,
-    /// The key used on the wire. Never logged, never returned in a response.
-    pub key: Arc<str>,
+    /// The key used on the wire. Never logged, never returned in a response:
+    /// `Debug` prints `[REDACTED]`, and reading it takes `expose_secret()`.
+    pub key: secrecy::SecretString,
     /// Root of the provider's API, with no trailing slash.
     pub base_url: Arc<str>,
     /// Which wire format this channel speaks.
@@ -189,6 +190,11 @@ pub struct ChannelFilter {
 #[derive(Debug, Default)]
 pub struct Catalogue {
     channels: ArcSwap<Vec<Channel>>,
+    /// Held for writing across a whole rebuild, from reading the health table
+    /// to swapping the new rows in, and for reading by every health move that
+    /// mirrors itself onto a row. Without it a move landing mid-rebuild goes
+    /// onto a row about to be orphaned, and the new row keeps the stale value.
+    rows: RwLock<()>,
 }
 
 impl Catalogue {
@@ -197,7 +203,22 @@ impl Catalogue {
     pub fn new() -> Self {
         Self {
             channels: ArcSwap::from_pointee(Vec::new()),
+            rows: RwLock::new(()),
         }
+    }
+
+    /// Blocks a rebuild for as long as it is held. A health move takes this,
+    /// then loads the snapshot and writes its row, so the row it writes is
+    /// the one the next query scans and not one a rebuild is replacing.
+    pub fn hold_rows(&self) -> RwLockReadGuard<'_, ()> {
+        self.rows.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Builds the rows and swaps them in with every health move shut out, so
+    /// nothing written to the health table after `build` read it is lost.
+    pub fn replace_with(&self, build: impl FnOnce() -> Vec<Channel>) {
+        let _rebuilding = self.rows.write().unwrap_or_else(|e| e.into_inner());
+        self.store(build());
     }
 
     /// The snapshot one client request holds for its whole life. Cloning the
@@ -209,7 +230,11 @@ impl Catalogue {
     /// Sorts by `intelligence_rank` ascending, shuffling within each rank
     /// group, then swaps the pointer. Called by the startup waves and the
     /// poller, never per client request.
-    pub fn replace(&self, mut channels: Vec<Channel>) {
+    pub fn replace(&self, channels: Vec<Channel>) {
+        self.replace_with(|| channels);
+    }
+
+    fn store(&self, mut channels: Vec<Channel>) {
         // Carry each channel's in-flight count over from the row it replaces.
         // Calls already running hold the previous snapshot and keep counting
         // on the old row, so a fresh counter would hide them from the
@@ -335,6 +360,13 @@ mod tests {
 
     /// The clock the filter tests use. Any fixed value does.
     const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn debug_never_prints_the_key() {
+        let printed = format!("{:?}", channel("p", "m", "sk-live-do-not-print", 1));
+        assert!(!printed.contains("do-not-print"), "{printed}");
+        assert!(printed.contains("REDACTED"), "{printed}");
+    }
 
     #[test]
     fn id_is_deterministic_and_separates_the_parts() {

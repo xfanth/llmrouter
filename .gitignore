@@ -5,22 +5,30 @@ freellmapi-keys.csv
 .env
 *.env
 
-# Generated config. `llmrouter-make-config` normally writes these to
-# /mnt/shuttle/share/app-data/llmrouter/config, which is outside the repo, but
-# a run with `--out .` would land them here. The deploy path itself is
-# absolute and outside the repo, so git never sees it. model_capabilities.csv
-# is deliberately absent from this list: it is tracked source data at the repo
-# root, and the generator only ever copies it outwards.
+# Generated config, for a run with `--out` pointing at the repo root.
+# model_capabilities.csv is deliberately absent from this list: it is tracked
+# source data at the repo root, and the generator refuses to run with --out
+# set to the source directory, so it only ever copies the file outwards.
 /providers.yml
 /models.yml
 /intelligence.yml
 /router.yml
 
-# Runtime state
+# LOAD-BEARING. Do not delete. The deploy directories sit INSIDE this checkout.
+# On the TrueNAS host, /mnt/shuttle/share/app-data/llmrouter is the main
+# working tree (its .git lives there), and this Mac mounts the same share over
+# NFS at ~/truenas/shuttle/app-data. So the deploy config directory
+# /mnt/shuttle/share/app-data/llmrouter/config is this repo's config/, and the
+# /data mount (cache.redb, spill/ holding client prompts) is data/.
+# config/.env holds every live provider key. These lines, plus `.env` above,
+# are all that keep git from seeing it. Never `git add -f config/` or `data/`.
+# tests/integration/main.rs pins these rules.
 config/
 data/
 *.redb
 spill/
+
+# Runtime state
 logs/
 
 # Build

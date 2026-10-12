@@ -15,8 +15,6 @@ use metrics_exporter_prometheus::{
     Matcher, PrometheusBuilder, PrometheusHandle, PrometheusRecorder,
 };
 
-use crate::catalogue::ChannelId;
-
 /// One value per status code, as `router_requests_total{outcome}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -59,8 +57,8 @@ impl Outcome {
     }
 }
 
-/// How one channel call ended, as `router_attempts_total{channel,outcome}`. A
-/// channel that flips to all `http_error` overnight is a dead key.
+/// How one channel call ended, as `router_attempts_total{provider,model,outcome}`.
+/// A provider/model pair that flips to all `http_error` overnight is dead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
     /// 2xx with non-empty content.
@@ -164,12 +162,20 @@ impl Metrics {
         });
     }
 
-    /// One channel call finished. `router_attempts_total{channel,outcome}`.
-    pub fn record_attempt(&self, channel: ChannelId, outcome: AttemptOutcome) {
+    /// One channel call finished.
+    /// `router_attempts_total{provider,model,outcome}`.
+    ///
+    /// Labelled by provider and model, not by channel id. A channel id is per
+    /// provider/model/key, so with 4,807 channels and four outcomes the label
+    /// set runs to tens of thousands of series. Provider and model give the
+    /// same diagnosis at a fraction of that, and the per-key detail stays in
+    /// the request log where it is not multiplied by a scrape interval.
+    pub fn record_attempt(&self, provider: &str, model_id: &str, outcome: AttemptOutcome) {
         self.on_recorder(|| {
             counter!(
                 "router_attempts_total",
-                "channel" => channel.to_string(),
+                "provider" => provider.to_owned(),
+                "model" => model_id.to_owned(),
                 "outcome" => outcome.label(),
             )
             .increment(1);
@@ -213,7 +219,7 @@ fn describe_everything() {
     );
     describe_counter!(
         "router_attempts_total",
-        "Channel calls finished, by channel id and outcome."
+        "Channel calls finished, by provider, model and outcome."
     );
     describe_histogram!(
         "router_latency_seconds",
@@ -233,7 +239,7 @@ fn describe_everything() {
 
 /// Touches every series whose labels are known up front, so an alert on a
 /// never-seen outcome sits on a zero rather than on missing data until the
-/// first failure. Channel ids are not known at startup, so
+/// first failure. Providers and models are not known at startup, so
 /// `router_attempts_total` cannot be seeded and appears on first use.
 fn seed_zero() {
     for outcome in ALL_OUTCOMES {
@@ -246,6 +252,7 @@ fn seed_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus_parse::{Sample, Scrape, Value};
 
     /// A fresh set of counters. Each `Metrics` owns its recorder, so tests in
     /// one process do not share numbers.
@@ -272,6 +279,44 @@ mod tests {
     }
 
     #[test]
+    fn design_names_only_real_request_outcomes() {
+        // A dashboard built from DESIGN.md on an outcome this module never
+        // emits sits on missing data forever, so every label the design pairs
+        // with router_requests_total must be one we seed.
+        let labels: Vec<&str> = ALL_OUTCOMES.iter().map(|o| o.label()).collect();
+        let design = include_str!("../DESIGN.md");
+        // A prose paragraph is one unit; a table row is its own unit, so the
+        // other metrics in the same table do not count.
+        let units = design.split("\n\n").flat_map(|p| {
+            if p.starts_with('|') {
+                p.lines().collect()
+            } else {
+                vec![p]
+            }
+        });
+        for para in units.filter(|p| p.contains("router_requests_total{outcome}")) {
+            for name in para.split('`').skip(1).step_by(2) {
+                if name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    assert!(
+                        labels.contains(&name),
+                        "DESIGN.md names outcome `{name}`:\n{para}"
+                    );
+                }
+            }
+        }
+        // A table with two header rows renders wrongly.
+        let lines: Vec<&str> = design.lines().collect();
+        for (i, pair) in lines.windows(3).enumerate() {
+            let sep = |l: &str| l.starts_with("|---");
+            assert!(
+                !(sep(pair[0]) && sep(pair[2])),
+                "two table headers at DESIGN.md line {}",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
     fn attempt_labels_match_the_design() {
         assert_eq!(AttemptOutcome::Success.label(), "success");
         assert_eq!(AttemptOutcome::HttpError.label(), "http_error");
@@ -289,55 +334,116 @@ mod tests {
         assert!(*LATENCY_BUCKETS.last().expect("non-empty") >= 1800.0);
     }
 
+    /// The scrape read into samples, so a test compares exact values rather
+    /// than matching a prefix of the text, where `2` would also match `20`.
+    fn scrape(metrics: &Metrics) -> Vec<Sample> {
+        let text = metrics.render();
+        Scrape::parse(text.lines().map(|l| Ok(l.to_owned())))
+            .expect("the scrape parses")
+            .samples
+    }
+
+    /// The one sample of `metric` whose labels are exactly `labels`.
+    fn sample<'a>(samples: &'a [Sample], metric: &str, labels: &[(&str, &str)]) -> &'a Value {
+        let found: Vec<&Sample> = samples
+            .iter()
+            .filter(|s| {
+                s.metric == metric
+                    && s.labels.len() == labels.len()
+                    && labels.iter().all(|(k, v)| s.labels.get(k) == Some(*v))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{metric} {labels:?} in {samples:#?}");
+        &found[0].value
+    }
+
+    /// A counter, gauge or untyped value.
+    fn value(samples: &[Sample], metric: &str, labels: &[(&str, &str)]) -> f64 {
+        match sample(samples, metric, labels) {
+            Value::Counter(v) | Value::Gauge(v) | Value::Untyped(v) => *v,
+            other => panic!("{metric} is not a single value: {other:?}"),
+        }
+    }
+
+    /// The count in one bucket of `router_latency_seconds`.
+    fn bucket(samples: &[Sample], stage: &str, le: f64) -> f64 {
+        let Value::Histogram(counts) =
+            sample(samples, "router_latency_seconds", &[("stage", stage)])
+        else {
+            panic!("router_latency_seconds is not a histogram");
+        };
+        counts
+            .iter()
+            .find(|c| c.less_than == le)
+            .unwrap_or_else(|| panic!("no le={le} bucket for {stage}"))
+            .count
+    }
+
     #[test]
     fn first_scrape_carries_every_request_outcome_at_zero() {
-        let metrics = local();
-        let text = metrics.render();
+        let s = scrape(&local());
 
         for outcome in ALL_OUTCOMES {
-            let series = format!("router_requests_total{{outcome=\"{}\"}} 0", outcome.label());
-            assert!(text.contains(&series), "missing {series} in:\n{text}");
+            let labels = [("outcome", outcome.label())];
+            assert_eq!(value(&s, "router_requests_total", &labels), 0.0);
         }
-        assert!(text.contains("router_rss_bytes 0"));
-        assert!(text.contains("router_cache_entries 0"));
+        assert_eq!(value(&s, "router_rss_bytes", &[]), 0.0);
+        assert_eq!(value(&s, "router_cache_entries", &[]), 0.0);
     }
 
     #[test]
     fn counters_add_up_per_label() {
         let metrics = local();
-        let channel = ChannelId::new("groq", "sk-secret", "llama-4");
         metrics.record_request(Outcome::Success);
         metrics.record_request(Outcome::Success);
         metrics.record_request(Outcome::NoChannel);
-        metrics.record_attempt(channel, AttemptOutcome::Timeout);
-        metrics.record_attempt(channel, AttemptOutcome::Cancelled);
-        let text = metrics.render();
+        metrics.record_attempt("groq", "llama-4", AttemptOutcome::Timeout);
+        metrics.record_attempt("groq", "llama-4", AttemptOutcome::Cancelled);
+        let s = scrape(&metrics);
 
-        assert!(text.contains("router_requests_total{outcome=\"success\"} 2"));
-        assert!(text.contains("router_requests_total{outcome=\"no_channel\"} 1"));
-        assert!(text.contains(&format!(
-            "router_attempts_total{{channel=\"{channel}\",outcome=\"timeout\"}} 1"
-        )));
-        assert!(text.contains(&format!(
-            "router_attempts_total{{channel=\"{channel}\",outcome=\"cancelled\"}} 1"
-        )));
-        // The key went through the hasher and nowhere else.
-        assert!(!text.contains("sk-secret"));
+        let requests = |outcome| value(&s, "router_requests_total", &[("outcome", outcome)]);
+        assert_eq!(requests("success"), 2.0);
+        assert_eq!(requests("no_channel"), 1.0);
+        // The label set must match exactly, so a stray `channel` label fails.
+        for outcome in ["timeout", "cancelled"] {
+            let labels = [
+                ("provider", "groq"),
+                ("model", "llama-4"),
+                ("outcome", outcome),
+            ];
+            assert_eq!(value(&s, "router_attempts_total", &labels), 1.0);
+        }
+    }
+
+    #[test]
+    fn a_count_that_only_starts_with_the_expected_digits_does_not_match() {
+        // Twenty successes render as `} 20`, which a substring check for `} 2`
+        // accepted. The parsed value must not.
+        let metrics = local();
+        for _ in 0..20 {
+            metrics.record_request(Outcome::Success);
+        }
+        let s = scrape(&metrics);
+        assert_ne!(
+            value(&s, "router_requests_total", &[("outcome", "success")]),
+            2.0
+        );
     }
 
     #[test]
     fn latency_splits_into_two_stages() {
         let metrics = local();
         metrics.record_latency(Duration::from_millis(1500), Duration::from_micros(800));
-        let text = metrics.render();
+        let s = scrape(&metrics);
 
         // Router overhead of 0.8ms sits above the 0.0005 bucket and inside 0.001.
-        assert!(text.contains("router_latency_seconds_bucket{stage=\"router\",le=\"0.001\"} 1"));
-        assert!(text.contains("router_latency_seconds_bucket{stage=\"router\",le=\"0.0005\"} 0"));
+        assert_eq!(bucket(&s, "router", 0.001), 1.0);
+        assert_eq!(bucket(&s, "router", 0.0005), 0.0);
         // Upstream 1.5s sits above 1 and inside 2.5.
-        assert!(text.contains("router_latency_seconds_bucket{stage=\"upstream\",le=\"1\"} 0"));
-        assert!(text.contains("router_latency_seconds_bucket{stage=\"upstream\",le=\"2.5\"} 1"));
-        assert!(text.contains("router_latency_seconds_sum{stage=\"upstream\"} 1.5"));
+        assert_eq!(bucket(&s, "upstream", 1.0), 0.0);
+        assert_eq!(bucket(&s, "upstream", 2.5), 1.0);
+        let upstream = [("stage", "upstream")];
+        assert_eq!(value(&s, "router_latency_seconds_sum", &upstream), 1.5);
     }
 
     #[test]
@@ -347,9 +453,9 @@ mod tests {
         metrics.set_rss(250);
         metrics.set_cache_entries(7);
         metrics.set_cache_entries(4);
-        let text = metrics.render();
+        let s = scrape(&metrics);
 
-        assert!(text.contains("router_rss_bytes 250"));
-        assert!(text.contains("router_cache_entries 4"));
+        assert_eq!(value(&s, "router_rss_bytes", &[]), 250.0);
+        assert_eq!(value(&s, "router_cache_entries", &[]), 4.0);
     }
 }

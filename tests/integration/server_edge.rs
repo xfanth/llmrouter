@@ -42,6 +42,9 @@ enum Link {
     /// Both calls go to a closed port, so the fault is local and a drained walk
     /// comes back as `502`.
     Down,
+    /// As `Up`, but the test answers only after the delay, so a failure that
+    /// lands before it is held.
+    SlowUp(Duration),
 }
 
 /// Per network test call. Only reached on the `Down` path, where the connect is
@@ -52,10 +55,14 @@ const NET_TEST_TIMEOUT: Duration = Duration::from_secs(2);
 async fn net_test(link: Link) -> (NetTest, Vec<String>, Option<MockServer>) {
     let client = reqwest::Client::new();
     match link {
-        Link::Up => {
+        Link::Up | Link::SlowUp(_) => {
+            let delay = match link {
+                Link::SlowUp(delay) => delay,
+                _ => Duration::ZERO,
+            };
             let server = MockServer::start().await;
             Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(204))
+                .respond_with(ResponseTemplate::new(204).set_delay(delay))
                 .mount(&server)
                 .await;
             let urls = vec![
@@ -836,11 +843,73 @@ async fn a_client_hanging_up_tears_down_every_channel_call_in_flight() {
         "the handler future was dropped, not run to completion"
     );
 
+    // The walk runs as its own task, so it tears the calls down on its next
+    // poll rather than inside the drop.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while in_flight(&edge) != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(
         in_flight(&edge),
         0,
         "a disconnect must tear down every channel call, not leave them running"
     );
+}
+
+/// The real server, not the racer driven by hand: a client hanging up drops
+/// the handler, and the walk must still settle the failure it held while the
+/// network test was out. Were the walk dropped with the handler, the broken
+/// channel would get no backoff and the next request would race it again.
+#[tokio::test]
+async fn a_client_hanging_up_on_the_server_still_settles_failures_already_held() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let broken = upstream_serving(ResponseTemplate::new(401).set_body_string("bad key")).await;
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(SignalThenHang(tx))
+        .mount(&slow)
+        .await;
+
+    let broken_channel = channel(&base_url(&broken), "fake-model", "sk-test-key-one", 200_000);
+    let broken_id = broken_channel.id;
+    let edge = Edge::new(
+        plain_config(),
+        vec![
+            broken_channel,
+            channel(&base_url(&slow), "fake-model", "sk-test-key-two", 200_000),
+        ],
+        Link::SlowUp(Duration::from_millis(500)),
+    )
+    .await;
+
+    let client = tokio::spawn(
+        edge.service()
+            .oneshot(chat_post(&chat_request("ping", false))),
+    );
+    rx.recv().await.expect("the slow channel call arrives");
+    // Long enough for the 401 on loopback, well short of the network test.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    client.abort();
+    assert!(
+        client
+            .await
+            .expect_err("the task was aborted")
+            .is_cancelled(),
+        "the handler future was dropped, not run to completion"
+    );
+
+    let key = llmrouter::HealthKey::Channel(broken_id);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while edge.state.health.get(&key).is_none() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let entry = edge
+        .state
+        .health
+        .get(&key)
+        .expect("the failure held before the hang up is written");
+    assert_eq!(entry.retry_counter, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,7 +1278,7 @@ fn series_value(text: &str, series: &str) -> f64 {
 }
 
 /// The last two series DESIGN.md lists only appear once a request has run:
-/// `router_attempts_total` carries a channel id that is unknown at startup, and
+/// `router_attempts_total` carries a provider and model unknown at startup, and
 /// a histogram has no series until something has been recorded into it.
 ///
 /// This router owns its recorder, so the counts are this test's own. The
@@ -1268,19 +1337,75 @@ async fn metrics_gains_the_latency_histogram_and_the_attempt_counter_once_a_requ
             "the {stage} half of the latency split is missing from /metrics:\n{text}"
         );
     }
-    let id = ChannelId::new("fakeprovider", FAKE_KEY, model_id).to_string();
-    let attempts = series_value(
-        &text,
-        &format!("router_attempts_total{{channel=\"{id}\",outcome=\"success\"}}"),
+    let line = attempt_series(&text, "success");
+    assert!(
+        line.contains("provider=\"fakeprovider\"") && line.contains(&format!("model=\"{model_id}\"")),
+        "this request's one winning channel call is counted against its provider and model:\n{text}"
     );
-    assert_eq!(
-        attempts, 1.0,
-        "this request's one winning channel call is counted against its own channel:\n{text}"
-    );
+    assert!(line.ends_with(" 1"), "{line}");
     assert!(
         !text.contains(FAKE_KEY),
-        "the key is hashed into the channel id and never written out"
+        "the key never reaches a metric label"
     );
+}
+
+/// Two keys on the same provider and model are two channels, but one series.
+///
+/// The attempt counter used to carry the channel id, which is per
+/// provider/model/key: 4,807 channels times four outcomes is tens of thousands
+/// of series on a page scraped every few seconds. Both channels here fail, so
+/// both are counted, and the scrape must hold one `router_attempts_total`
+/// series rather than one per key.
+#[tokio::test]
+async fn attempts_are_counted_per_provider_and_model_not_per_key() {
+    let server =
+        upstream_serving(ResponseTemplate::new(500).set_body_string("upstream down")).await;
+    let model_id = "cardinality-model";
+    let edge = Edge::new(
+        plain_config(),
+        vec![
+            channel(&base_url(&server), model_id, "sk-test-key-one", 200_000),
+            channel(&base_url(&server), model_id, "sk-test-key-two", 200_000),
+        ],
+        Link::Up,
+    )
+    .await;
+
+    let response = edge.post_chat(&chat_request("ping", false)).await;
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+    let text = text_body(edge.get("/metrics").await).await;
+    let series: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("router_attempts_total{"))
+        .collect();
+    assert_eq!(
+        series.len(),
+        1,
+        "two keys on one provider and model must share one series:\n{text}"
+    );
+    let line = attempt_series(&text, "http_error");
+    assert!(
+        line.contains("provider=\"fakeprovider\"")
+            && line.contains(&format!("model=\"{model_id}\"")),
+        "the one series is labelled by provider and model:\n{text}"
+    );
+    assert!(
+        line.ends_with(" 2"),
+        "both failed channel calls land on the one series:\n{line}"
+    );
+}
+
+/// The one `router_attempts_total` line carrying `outcome`. The exporter picks
+/// the label order, so a series is matched by its parts, not by one rendered
+/// string.
+fn attempt_series<'a>(text: &'a str, outcome: &str) -> &'a str {
+    text.lines()
+        .find(|line| {
+            line.starts_with("router_attempts_total{")
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .unwrap_or_else(|| panic!("no {outcome} attempt series in:\n{text}"))
 }
 
 /// Serving a client that did not ask for a stream means folding the whole
@@ -1407,5 +1532,82 @@ async fn encoding_a_large_reply_for_the_client_is_counted_as_router_overhead() {
         wall.as_millis(),
         huge.len() / 1_000_000,
         accounted * 1000.0
+    );
+}
+
+/// A provider that sends its first token, then goes on generating for `pause`
+/// before it sends the rest. wiremock cannot pause part way through a body, so
+/// this is a raw listener.
+async fn stream_that_pauses_after_the_first_token(
+    pause: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is free");
+    let addr = listener.local_addr().expect("the port is known");
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut scratch = [0u8; 65_536];
+                let _ = socket.read(&mut scratch).await;
+                let first = sse("first ", 1);
+                let first = &first[..first.find("\n\n").expect("a frame ends") + 2];
+                let rest = sse("rest ", 3);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n",
+                    first.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(pause).await;
+                let tail = format!("{:x}\r\n{rest}\r\n0\r\n\r\n", rest.len());
+                let _ = socket.write_all(tail.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), task)
+}
+
+/// A plain client on a streaming router waits for the fold, and the fold waits
+/// for the provider to finish generating. That generation is the provider's
+/// time, not the router's. It used to land in the router half of
+/// `router_latency_seconds`, so a long answer read as minutes of router
+/// overhead on the one graph meant to prove the router adds under 10ms.
+#[tokio::test]
+async fn generation_after_the_first_token_is_upstream_time_for_a_plain_client() {
+    const PAUSE: Duration = Duration::from_millis(2_000);
+    let (url, task) = stream_that_pauses_after_the_first_token(PAUSE).await;
+    let edge = Edge::new(
+        streaming_config(),
+        vec![channel(&url, "generation-timing-model", FAKE_KEY, 200_000)],
+        Link::Up,
+    )
+    .await;
+
+    let response = edge.post_chat(&chat_request("generate", false)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = text_body(edge.get("/metrics").await).await;
+    task.abort();
+
+    let sum = |stage: &str| {
+        series_value(
+            &text,
+            &format!("router_latency_seconds_sum{{stage=\"{stage}\"}}"),
+        )
+    };
+    assert!(
+        sum("upstream") >= PAUSE.as_secs_f64() * 0.9,
+        "the provider generated for {}ms after its first token, and the upstream \
+         half only holds {}ms:\n{text}",
+        PAUSE.as_millis(),
+        sum("upstream") * 1000.0
+    );
+    assert!(
+        sum("router") < 0.5,
+        "the router half holds {}ms, which is the provider's generation time:\n{text}",
+        sum("router") * 1000.0
     );
 }

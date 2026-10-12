@@ -24,8 +24,15 @@ use comfy_table::Table;
 use llmrouter::config::{IntelligenceEntry, Provider, RouterConfig, WireName};
 use serde::Deserialize;
 
-/// Where the router reads its config in production. Outside the repo, and not
-/// a git worktree, so nothing written there is ever committed.
+/// Where the router reads its config in production: the host path
+/// docker-compose bind mounts at `/config`, so it only exists on the deploy
+/// host. Anywhere else, set `LLMROUTER_CONFIG_DIR` or pass `--out`.
+///
+/// This directory is INSIDE the git checkout. On the deploy host
+/// `/mnt/shuttle/share/app-data/llmrouter` is the repo's main working tree,
+/// so this is its `config/` folder, and the `.env` written here holds every
+/// live key. Only the `config/` and `.env` lines in `.gitignore` keep git
+/// from seeing it. Never `git add -f` anything under it.
 const DEFAULT_OUT: &str = "/mnt/shuttle/share/app-data/llmrouter/config";
 
 #[derive(Parser, Debug)]
@@ -41,7 +48,12 @@ struct Args {
     source: PathBuf,
 
     /// Directory to write the six config files into. Created if missing.
-    #[arg(long, default_value = DEFAULT_OUT)]
+    /// Must not be the source directory: the run refuses rather than
+    /// overwrite the source `model_capabilities.csv`.
+    /// Reads `LLMROUTER_CONFIG_DIR`, the same variable the router itself uses
+    /// to find its config, so off the deploy host both tools point at one
+    /// directory without a flag.
+    #[arg(long, env = "LLMROUTER_CONFIG_DIR", default_value = DEFAULT_OUT)]
     out: PathBuf,
 
     /// Overwrite an existing `.env`. Without this the run refuses, because
@@ -67,10 +79,12 @@ struct SourceFile {
     providers: Vec<SourceProvider>,
 }
 
-/// One provider in `providers.yaml`. `priority` and `known_models` are read
-/// and dropped: `providers.yml` has no field for either. Unknown keys are
-/// ignored rather than fatal, since the file is generated upstream and may
-/// grow columns.
+/// One provider in `providers.yaml`. `priority` is read and dropped:
+/// `providers.yml` has no field for it. `known_models` is carried across as
+/// `models` only for a provider with no model-listing endpoint, since the
+/// probe treats that list as a pass on a 404 or 405.
+/// Unknown keys are ignored rather than fatal, since the file is generated
+/// upstream and may grow columns.
 #[derive(Debug, Deserialize)]
 struct SourceProvider {
     name: String,
@@ -80,6 +94,8 @@ struct SourceProvider {
     keys: Vec<String>,
     #[serde(default)]
     models_path: Option<String>,
+    #[serde(default)]
+    known_models: Vec<String>,
 }
 
 /// One row of `models.csv`, narrowed to the three columns the ranking needs.
@@ -91,6 +107,8 @@ struct ModelRow {
     slug: String,
     intelligence: Option<f64>,
     intelligence_rank: Option<u32>,
+    #[serde(default)]
+    release_date: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,23 +119,41 @@ struct ModelRow {
 /// never a key.
 #[derive(Debug, Default)]
 struct Report {
-    /// Provider name, its `.env` variable, how many keys it has.
-    providers: Vec<(String, String, usize)>,
+    /// Provider name, its `.env` variable, how many keys it has, and whether
+    /// its base URL is only reachable from the host it runs on.
+    providers: Vec<(String, String, usize, bool)>,
     ranked_models: usize,
     skipped_models: usize,
     capability_rows: usize,
+    /// Files that already existed and were left as the operator had them.
+    kept: Vec<String>,
 }
 
 impl Report {
     fn total_keys(&self) -> usize {
-        self.providers.iter().map(|(_, _, n)| n).sum()
+        self.providers.iter().map(|(_, _, n, _)| n).sum()
+    }
+
+    /// The providers whose base URL is a LAN or loopback address.
+    fn lan_only(&self) -> Vec<&str> {
+        self.providers
+            .iter()
+            .filter(|(_, _, _, lan)| *lan)
+            .map(|(name, _, _, _)| name.as_str())
+            .collect()
     }
 
     fn render(&self, out: &Path) -> String {
         let mut keys = Table::new();
-        keys.set_header(vec!["provider", "env variable", "keys"]);
-        for (name, env, count) in &self.providers {
-            keys.add_row(vec![name.clone(), env.clone(), count.to_string()]);
+        keys.set_header(vec!["provider", "env variable", "keys", "reachable from"]);
+        for (name, env, count, lan) in &self.providers {
+            let scope = if *lan { "its own host" } else { "anywhere" };
+            keys.add_row(vec![
+                name.clone(),
+                env.clone(),
+                count.to_string(),
+                scope.to_string(),
+            ]);
         }
 
         let mut totals = Table::new();
@@ -132,14 +168,54 @@ impl Report {
             totals.add_row(vec![what.to_string(), count.to_string()]);
         }
 
-        format!("{keys}\n{totals}\nWritten to {}\n", out.display())
+        let lan = self.lan_only();
+        let note = if lan.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nLAN or loopback only: {}. The router's keyless reachability\n\
+                 probe fails on these from any other machine, so they are dropped\n\
+                 at startup off their own host. Expected there, not a fault.\n",
+                lan.join(", ")
+            )
+        };
+
+        let kept = if self.kept.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nLeft as they were: {}. These hold hand corrections the source\n\
+                 data knows nothing about, so an existing one is never replaced.\n\
+                 Delete it and rerun to get a fresh template.\n",
+                self.kept.join(", ")
+            )
+        };
+
+        format!(
+            "{keys}\n{totals}\n{note}{kept}Written to {}\n",
+            out.display()
+        )
     }
 }
 
 /// Reads the source data and writes the six files. Returns the counts for the
 /// summary.
 fn generate(source: &Path, out: &Path, force: bool) -> anyhow::Result<Report> {
-    fs::create_dir_all(out).with_context(|| format!("creating {}", out.display()))?;
+    // The source model_capabilities.csv is a tracked, dated snapshot. Writing
+    // the aliased copy over it would edit the source, and the next run would
+    // then treat the stale alias rows as source data. Canonicalising catches
+    // `--out .` from the data directory as well as a symlinked output file.
+    let source_caps = fs::canonicalize(source.join("model_capabilities.csv")).ok();
+    if source_caps.is_some()
+        && source_caps == fs::canonicalize(out.join("model_capabilities.csv")).ok()
+    {
+        bail!(
+            "--out {} would overwrite the source model_capabilities.csv in {}; \
+             write the config to a different directory",
+            out.display(),
+            source.display()
+        );
+    }
 
     let env_path = out.join(".env");
     if env_path.exists() && !force {
@@ -150,11 +226,14 @@ fn generate(source: &Path, out: &Path, force: bool) -> anyhow::Result<Report> {
         );
     }
 
+    // Every source file is read and every output body built before anything
+    // is written. A failure part way through used to leave .env and
+    // providers.yml on disk with the other four files missing, and the guard
+    // above then refused the retry as though an operator had put that .env
+    // there.
     let providers = read_providers(&source.join("providers.yaml"))?;
     let mut report = Report::default();
 
-    // .env first: if the key material cannot be written there is no point
-    // writing a providers.yml that points at variables which do not exist.
     let mut env_body = String::from(
         "# Provider API keys, comma separated, one variable per provider.\n\
          # Generated by llmrouter-make-config. Never commit this file.\n",
@@ -169,29 +248,35 @@ fn generate(source: &Path, out: &Path, force: bool) -> anyhow::Result<Report> {
             );
         }
         env_body.push_str(&format!("{env_name}={}\n", provider.keys.join(",")));
-        report
-            .providers
-            .push((provider.name.clone(), env_name, provider.keys.len()));
+        report.providers.push((
+            provider.name.clone(),
+            env_name,
+            provider.keys.len(),
+            is_lan_only(&provider.base_url),
+        ));
     }
-    write_private(&env_path, &env_body)?;
-
-    write_yaml(
-        &out.join("providers.yml"),
+    let providers_yml = yaml_text(
+        "providers.yml",
         "# Channels: name, wire format, base URL, and the .env variable holding\n\
          # that provider's keys. Safe to read and share: it names variables\n\
          # rather than holding keys. Generated by llmrouter-make-config.\n",
         &providers
             .iter()
             .zip(&report.providers)
-            .map(|(p, (_, env_name, _))| Provider {
+            .map(|(p, (_, env_name, _, _))| Provider {
                 name: p.name.clone(),
                 wire: p.wire,
-                base_url: p.base_url.trim_end_matches('/').to_string(),
+                base_url: fix_base_url(&p.base_url),
                 keys_env: env_name.clone(),
                 models_path: p
                     .models_path
                     .clone()
                     .unwrap_or_else(|| "/models".to_string()),
+                models: if has_no_model_listing(&p.name) {
+                    p.known_models.clone()
+                } else {
+                    Vec::new()
+                },
             })
             .collect::<Vec<_>>(),
     )?;
@@ -199,27 +284,107 @@ fn generate(source: &Path, out: &Path, force: bool) -> anyhow::Result<Report> {
     let (ranking, skipped) = read_ranking(&source.join("models.csv"))?;
     report.ranked_models = ranking.len();
     report.skipped_models = skipped;
-    write_yaml(
-        &out.join("intelligence.yml"),
+    let intelligence_yml = yaml_text(
+        "intelligence.yml",
         "# The Artificial Analysis ranking, from models.csv. Lower\n\
          # intelligence_rank is better. Generated by llmrouter-make-config.\n",
         &ranking,
     )?;
 
-    fs::write(out.join("models.yml"), MODELS_YML).context("writing models.yml")?;
-    fs::write(out.join("router.yml"), router_yml()?).context("writing router.yml")?;
-
-    report.capability_rows = copy_capabilities(
+    let (capabilities, capability_rows) = read_capabilities(
         &source.join("model_capabilities.csv"),
-        &out.join("model_capabilities.csv"),
+        &providers.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
     )?;
+    report.capability_rows = capability_rows;
+
+    let router_yml = router_yml()?;
+
+    // Every source file has now been read and every body built. Only now does
+    // anything land on disk. Only the last path segment is created. The
+    // default --out sits on a network share, and if that share is not mounted
+    // a create_dir_all would quietly build the tree on the local disk under
+    // the mount point and put the live keys there. A missing parent is an
+    // error instead.
+    if !out.is_dir() {
+        fs::create_dir(out).with_context(|| {
+            format!(
+                "creating {}. Its parent must already exist; if it is on a share, \
+                 check the share is mounted",
+                out.display()
+            )
+        })?;
+    }
+    write_private(&env_path, &env_body)?;
+    fs::write(out.join("providers.yml"), providers_yml).context("writing providers.yml")?;
+    fs::write(out.join("intelligence.yml"), intelligence_yml)
+        .context("writing intelligence.yml")?;
+    fs::write(out.join("model_capabilities.csv"), capabilities)
+        .context("writing model_capabilities.csv")?;
+
+    // models.yml and router.yml are the operator's edit surface. The source
+    // data says nothing about what is in them, so a rerun leaves an existing
+    // one alone and says so in the summary. --force covers the .env, which is
+    // generated material; it does not licence throwing away hand corrections.
+    for (name, body) in [("models.yml", MODELS_YML), ("router.yml", &router_yml)] {
+        let path = out.join(name);
+        if path.exists() {
+            report.kept.push(name.to_string());
+        } else {
+            fs::write(&path, body).with_context(|| format!("writing {name}"))?;
+        }
+    }
 
     Ok(report)
+}
+
+/// Base URLs that `build_providers.py` copies out of new-api's `channels.csv`
+/// without their version segment. The router appends `models_path` to the base
+/// URL exactly as given, so a missing `/v1` turns every keyed `/models` probe
+/// into a 404 and the provider contributes no channels at all.
+///
+/// An explicit list rather than a rule: most providers in `providers.yaml`
+/// already carry a version segment, and several of those are not `/v1` (`/v4`,
+/// `/v1beta/openai`, `/ai/v1`), so appending one by guesswork would break more
+/// than it fixed. Add a line here when a live run shows a keyed `/models` probe
+/// returning 404 on a provider that is otherwise alive.
+const BASE_URL_FIXUPS: &[(&str, &str)] = &[
+    (
+        "https://api.groq.com/openai",
+        "https://api.groq.com/openai/v1",
+    ),
+    ("https://api.mistral.ai", "https://api.mistral.ai/v1"),
+];
+
+/// Providers with no model-listing endpoint, whose `known_models` therefore
+/// has to be written into `providers.yml` as the probe's fallback catalogue.
+/// Cloudflare Workers AI is the only one: its OpenAI-compatible path takes
+/// POST only, so the keyed `/models` probe answers 405.
+///
+/// Every other provider lists its models, so it gets no fallback. A 404 or
+/// 405 there means the listing path is wrong or has moved, and the pair must
+/// be marked unhealthy and reported on `/healthz` rather than quietly coming
+/// up with a one-to-three-model catalogue. That is also the signal
+/// `BASE_URL_FIXUPS` above is written from.
+fn has_no_model_listing(provider: &str) -> bool {
+    provider.starts_with("cloudflare-")
+}
+
+/// Trims any trailing slash, then applies `BASE_URL_FIXUPS`.
+fn fix_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    BASE_URL_FIXUPS
+        .iter()
+        .find(|(from, _)| *from == trimmed)
+        .map_or_else(|| trimmed.to_string(), |(_, to)| (*to).to_string())
 }
 
 /// The `.env` variable name for a provider: the name uppercased, every
 /// non-alphanumeric character turned into an underscore, then `_KEYS`.
 /// `cloudflare-b4b050cc` becomes `CLOUDFLARE_B4B050CC_KEYS`.
+///
+/// A name starting with a digit, such as the new-api channel `302ai`, gets a
+/// leading underscore: `dotenvy` rejects an identifier starting with a digit,
+/// so the router would drop the line and leave that provider with no keys.
 fn keys_env_name(provider: &str) -> String {
     let stem: String = provider
         .chars()
@@ -231,22 +396,100 @@ fn keys_env_name(provider: &str) -> String {
             }
         })
         .collect();
-    format!("{stem}_KEYS")
+    let prefix = if stem.starts_with(|c: char| c.is_ascii_digit()) {
+        "_"
+    } else {
+        ""
+    };
+    format!("{prefix}{stem}_KEYS")
 }
 
+/// True when a base URL names a host only resolvable on the machine the
+/// provider itself runs on: localhost, a loopback, private, shared (CGNAT or
+/// tailnet), unique-local or link-local address, a bare hostname, or a
+/// `.arpa`, `.local`, `.lan`, `.home` or `.internal` name. The router's keyless reachability probe fails on these
+/// from anywhere else and drops the provider, which is expected rather than a
+/// broken config, so the summary says which ones they are. A URL that will not
+/// parse is treated as public: the router reports the real problem.
+fn is_lan_only(base_url: &str) -> bool {
+    use reqwest::Url;
+
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']).trim_end_matches('.');
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            // 100.64.0.0/10 is the shared address space a CGNAT or a tailnet
+            // hands out. `Ipv4Addr::is_shared` is still unstable, so test it here.
+            std::net::IpAddr::V4(ip) => {
+                let o = ip.octets();
+                ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || (o[0] == 100 && (64..=127).contains(&o[1]))
+            }
+            // fc00::/7 unique-local and fe80::/10 link-local. The matching
+            // `Ipv6Addr` helpers are unstable, so test the first segment here.
+            std::net::IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        };
+    }
+
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || !host.contains('.')
+        || [".arpa", ".local", ".lan", ".home", ".internal"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+}
+
+/// Reads `providers.yaml`. The parse error text is never surfaced, because
+/// serde_yaml quotes the offending value verbatim and that value may be a
+/// key. Only the location it points at is reported, the same rule
+/// `parse_env_file` in `src/config.rs` follows for dotenvy.
 fn read_providers(path: &Path) -> anyhow::Result<Vec<SourceProvider>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed: SourceFile =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let parsed: SourceFile = serde_yaml::from_str(&text).map_err(|e| {
+        let where_ = e.location().map_or_else(
+            || "an unknown position".to_string(),
+            |l| format!("line {} column {}", l.line(), l.column()),
+        );
+        anyhow::anyhow!(
+            "{} is malformed at {where_} (the parser's message is withheld because it quotes the offending value, which may be a key)",
+            path.display()
+        )
+    })?;
     Ok(parsed.providers)
 }
 
 /// Reads `models.csv` into the ranking. A row with no intelligence score is
 /// skipped and counted: it has nothing to rank by. Returns the entries and
 /// the number skipped.
+///
+/// The score columns are `Option`, so serde would fill a renamed or dropped
+/// column with `None` and every row would quietly be skipped. The header is
+/// checked up front instead, and a file where no row ranks at all is an
+/// error, since an empty ranking loses the sort order for every request.
 fn read_ranking(path: &Path) -> anyhow::Result<(Vec<IntelligenceEntry>, usize)> {
     let mut reader =
         csv::Reader::from_path(path).with_context(|| format!("reading {}", path.display()))?;
+    let headers = reader
+        .headers()
+        .with_context(|| format!("reading the header of {}", path.display()))?;
+    for column in ["slug", "intelligence", "intelligence_rank"] {
+        anyhow::ensure!(
+            headers.iter().any(|h| h == column),
+            "{} has no {column} column",
+            path.display()
+        );
+    }
     let mut out = Vec::new();
     let mut skipped = 0_usize;
     for row in reader.deserialize::<ModelRow>() {
@@ -257,34 +500,104 @@ fn read_ranking(path: &Path) -> anyhow::Result<(Vec<IntelligenceEntry>, usize)> 
                     slug: row.slug,
                     intelligence: score.round().min(f64::from(u16::MAX)) as u16,
                     intelligence_rank: rank,
+                    release_date: row.release_date.filter(|d| !d.trim().is_empty()),
                 });
             }
             _ => skipped += 1,
         }
     }
+    anyhow::ensure!(
+        !out.is_empty(),
+        "{} has no row with both an intelligence score and a rank",
+        path.display()
+    );
     Ok((out, skipped))
 }
 
-/// Copies the capabilities file across unchanged and returns its row count.
-fn copy_capabilities(from: &Path, to: &Path) -> anyhow::Result<usize> {
-    fs::copy(from, to)
-        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
-    let mut reader =
-        csv::Reader::from_path(to).with_context(|| format!("reading {}", to.display()))?;
-    Ok(reader.records().flatten().count())
+/// Capability rows that arrive under a provider name no entry in
+/// `providers.yaml` uses, paired with the provider-name prefix they belong to.
+/// `model_capabilities.csv` carries its 27 Cloudflare Workers AI rows under
+/// `cloudflare-workers-ai`, while the live `providers.yaml` names each account
+/// `cloudflare-<account id>`. `Config::capability` joins on the provider name
+/// exactly, so those rows match nothing and every Cloudflare channel falls
+/// back to the 8,192 token default context window, which drops it from any
+/// prompt longer than that. Add a line here when an export names a provider
+/// differently from the key file.
+const CAPABILITY_ALIASES: &[(&str, &str)] = &[("cloudflare-workers-ai", "cloudflare-")];
+
+/// Reads the capabilities file into memory and returns its bytes and row
+/// count. Read rather than copied so that the whole output directory is
+/// written in one go, after every source file has been read.
+///
+/// The source rows go across unchanged. Appended after them is a copy of each
+/// `CAPABILITY_ALIASES` row under the name of every provider that needs it, so
+/// the join in `src/config.rs` finds the real context window instead of the
+/// default. A provider the file already carries rows for is left alone.
+fn read_capabilities(from: &Path, providers: &[String]) -> anyhow::Result<(Vec<u8>, usize)> {
+    let mut bytes = fs::read(from).with_context(|| format!("reading {}", from.display()))?;
+
+    let mut reader = csv::Reader::from_reader(bytes.as_slice());
+    let provider_column = reader
+        .headers()
+        .with_context(|| format!("reading the header of {}", from.display()))?
+        .iter()
+        .position(|h| h == "provider")
+        .with_context(|| format!("{} has no provider column", from.display()))?;
+    let rows: Vec<csv::StringRecord> = reader.records().flatten().collect();
+    let known: HashSet<&str> = rows.iter().filter_map(|r| r.get(provider_column)).collect();
+
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(Vec::new());
+    let mut aliased = 0_usize;
+    for (source_name, prefix) in CAPABILITY_ALIASES {
+        let targets: Vec<&str> = providers
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with(prefix) && !known.contains(name))
+            .collect();
+        for row in rows
+            .iter()
+            .filter(|r| r.get(provider_column) == Some(*source_name))
+        {
+            for target in &targets {
+                let mut fields: Vec<&str> = row.iter().collect();
+                fields[provider_column] = target;
+                writer
+                    .write_record(&fields)
+                    .with_context(|| format!("aliasing a row of {}", from.display()))?;
+                aliased += 1;
+            }
+        }
+    }
+    let extra = writer
+        .into_inner()
+        .with_context(|| format!("aliasing rows of {}", from.display()))?;
+
+    if !extra.is_empty() {
+        // An export with no final newline would otherwise run the first
+        // appended row onto the end of the last source one.
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(&extra);
+    }
+
+    let total = rows.len() + aliased;
+    Ok((bytes, total))
 }
 
 /// Serialises `value` to YAML under a header comment. serde_yaml owns the
 /// quoting and escaping; nothing here formats YAML by hand.
-fn write_yaml<T: serde::Serialize>(path: &Path, header: &str, value: &T) -> anyhow::Result<()> {
-    let body =
-        serde_yaml::to_string(value).with_context(|| format!("serialising {}", path.display()))?;
-    fs::write(path, format!("{header}{body}"))
-        .with_context(|| format!("writing {}", path.display()))
+fn yaml_text<T: serde::Serialize>(what: &str, header: &str, value: &T) -> anyhow::Result<String> {
+    let body = serde_yaml::to_string(value).with_context(|| format!("serialising {what}"))?;
+    Ok(format!("{header}{body}"))
 }
 
-/// Writes a file only the owner can read. Created at mode 0600 rather than
-/// chmod'ed afterwards, so it is never briefly world readable.
+/// Writes a file only the owner can read. A new file is created at mode 0600,
+/// so it is never briefly world readable. An existing file keeps whatever mode
+/// it already had, because the open mode only applies on creation, so it is
+/// narrowed to 0600 before anything is written into it.
 fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -293,6 +606,9 @@ fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     let mut file = opts
         .open(path)
         .with_context(|| format!("creating {}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .with_context(|| format!("restricting permissions on {}", path.display()))?;
     file.write_all(contents.as_bytes())
         .with_context(|| format!("writing {}", path.display()))
 }
@@ -401,6 +717,7 @@ no-score-model,Unscored,,,ghi,
 provider,model_id,tool_call,reasoning,structured_output,limit_context,limit_output,modalities_input,family,open_weights
 302ai,MiniMax-M1,1,0,,1000000,128000,\"[\"\"text\"\"]\",minimax,0
 gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
+cloudflare-workers-ai,@cf/meta/llama,1,0,,128000,4096,\"[\"\"text\"\"]\",llama,1
 ";
 
     /// Writes the three source files into a throwaway directory.
@@ -412,6 +729,59 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         dir
     }
 
+    /// A run that fails because a source file is missing must leave the output
+    /// directory exactly as it found it, so the retry after the missing file is
+    /// copied across is not refused by the `.env` guard.
+    #[test]
+    fn a_failed_run_writes_nothing_and_the_retry_succeeds() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("providers.yaml"), PROVIDERS_YAML).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let err = generate(source.path(), out.path(), false).expect_err("no models.csv");
+        assert!(err.to_string().contains("models.csv"), "{err}");
+        assert_eq!(
+            fs::read_dir(out.path()).unwrap().count(),
+            0,
+            "a failed run leaves nothing behind, not even .env"
+        );
+
+        fs::write(source.path().join("models.csv"), MODELS_CSV).unwrap();
+        let out2 = tempfile::tempdir().unwrap();
+        let err = generate(source.path(), out2.path(), false).expect_err("no capabilities csv");
+        assert!(err.to_string().contains("model_capabilities.csv"), "{err}");
+        assert_eq!(fs::read_dir(out2.path()).unwrap().count(), 0);
+
+        fs::write(
+            source.path().join("model_capabilities.csv"),
+            CAPABILITIES_CSV,
+        )
+        .unwrap();
+        generate(source.path(), out.path(), false).expect("the retry is not refused");
+        assert!(out.path().join("router.yml").exists());
+    }
+
+    /// A shape error on a `keys` entry must not put the value on the terminal:
+    /// serde_yaml quotes it verbatim, and in `providers.yaml` it is a live key.
+    #[test]
+    fn a_malformed_providers_yaml_never_quotes_the_offending_value() {
+        let dir = tempfile::tempdir().expect("a throwaway directory");
+        let path = dir.path().join("providers.yaml");
+        fs::write(
+            &path,
+            "providers:\n  - name: zai\n    wire: openai\n    base_url: https://api.z.ai\n    keys: sk-live-AAAABBBBCCCC\n",
+        )
+        .unwrap();
+
+        let err = read_providers(&path).expect_err("a scalar where a sequence belongs is an error");
+        let text = format!("{err:?}");
+        assert!(
+            !text.contains("sk-live"),
+            "the error text leaked key material: {text}"
+        );
+        assert!(text.contains("line 5"), "no location reported: {text}");
+    }
+
     #[test]
     fn env_variable_names_flatten_everything_that_is_not_alphanumeric() {
         assert_eq!(keys_env_name("zai"), "ZAI_KEYS");
@@ -421,6 +791,16 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
             "CLOUDFLARE_B4B050CC_KEYS"
         );
         assert_eq!(keys_env_name("a.b c/d"), "A_B_C_D_KEYS");
+        assert_eq!(keys_env_name("302ai"), "_302AI_KEYS");
+    }
+
+    /// A generated name must survive the router's own `.env` parser: `dotenvy`
+    /// drops a line whose identifier starts with a digit.
+    #[test]
+    fn env_variable_names_parse_back_out_of_a_dotenv_file() {
+        let name = keys_env_name("302ai");
+        let parsed = llmrouter::config::parse_env_file(&format!("{name}=aaa,bbb\n"));
+        assert_eq!(parsed.get(&name).map(Vec::len), Some(2));
     }
 
     #[test]
@@ -436,9 +816,66 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         assert_eq!(providers[0].keys_env, "ZAI_KEYS");
         // No models_path in the source means the router's own default.
         assert_eq!(providers[0].models_path, "/models");
+        // known_models reaches providers.yml only for a provider with no
+        // model-listing endpoint. Cloudflare has none, so it keeps its list.
+        assert_eq!(providers[1].models, vec!["@cf/meta/llama".to_string()]);
+        // zai lists its models, so it gets no fallback: a 404 or 405 on its
+        // keyed /models probe has to surface as unhealthy, not be masked by a
+        // one-model catalogue.
+        assert!(providers[0].models.is_empty());
+        assert!(providers[2].models.is_empty());
         // One that sets it keeps what it set, and the wire name survives.
         assert_eq!(providers[2].models_path, "/v1/models");
         assert_eq!(providers[2].wire, WireName::Anthropic);
+    }
+
+    #[test]
+    fn a_base_url_missing_its_version_segment_is_corrected() {
+        // groq and mistral arrive without the `/v1`, so the keyed /models
+        // probe 404s and the provider yields no channels at all.
+        assert_eq!(
+            fix_base_url("https://api.groq.com/openai/"),
+            "https://api.groq.com/openai/v1"
+        );
+        assert_eq!(
+            fix_base_url("https://api.mistral.ai"),
+            "https://api.mistral.ai/v1"
+        );
+        // One that already carries a version segment is left alone, whatever
+        // that segment happens to be.
+        assert_eq!(
+            fix_base_url("https://api.z.ai/api/coding/paas/v4/"),
+            "https://api.z.ai/api/coding/paas/v4"
+        );
+        assert_eq!(
+            fix_base_url("https://api.groq.com/openai/v1"),
+            "https://api.groq.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn the_corrected_base_url_reaches_providers_yml() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("providers.yaml"),
+            "providers:\n  - name: groq\n    wire: openai\n    \
+             base_url: https://api.groq.com/openai\n    keys: [one]\n",
+        )
+        .unwrap();
+        fs::write(source.path().join("models.csv"), MODELS_CSV).unwrap();
+        fs::write(
+            source.path().join("model_capabilities.csv"),
+            CAPABILITIES_CSV,
+        )
+        .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        generate(source.path(), out.path(), false).expect("generates");
+
+        let config = llmrouter::Config::load(out.path()).expect("the router loads it");
+        assert_eq!(
+            config.providers[0].base_url,
+            "https://api.groq.com/openai/v1"
+        );
     }
 
     #[test]
@@ -454,7 +891,8 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
             (
                 "cloudflare-b4b050cc".to_string(),
                 "CLOUDFLARE_B4B050CC_KEYS".to_string(),
-                0
+                0,
+                false
             )
         );
 
@@ -465,6 +903,55 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         let parsed = llmrouter::config::parse_env_file(&env);
         assert!(parsed["CLOUDFLARE_B4B050CC_KEYS"].is_empty());
         assert_eq!(parsed["ZAI_KEYS"].len(), 2);
+    }
+
+    /// The live run dropped hades-local (http://hades-ubuntu.arpa:8021) and
+    /// chatjimmy-local (http://localhost:4100) at the keyless reachability
+    /// probe. Both are LAN addresses that only answer on the host they run on,
+    /// so the summary names them instead of leaving an operator to read the
+    /// probe failure as a broken config.
+    #[test]
+    fn lan_only_providers_are_flagged_in_the_summary() {
+        for url in [
+            "http://hades-ubuntu.arpa:8021",
+            "http://localhost:4100",
+            "http://127.0.0.1:8080",
+            "http://192.168.1.10/v1",
+            "http://hades-ubuntu:8021",
+            "http://printer.local",
+            "http://[::1]:8021",
+            "http://[fd7a:115c:a1e0::1]:8021",
+            "http://[fe80::1]:8021",
+            "http://100.100.64.3:8021",
+        ] {
+            assert!(is_lan_only(url), "{url} should be LAN only");
+        }
+        for url in [
+            "https://api.z.ai/api/coding/paas/v4",
+            "https://api.anthropic.com",
+            "http://203.0.113.7:8021",
+            "http://[2001:db8::1]:8021",
+            "http://100.63.0.1:8021",
+            "not a url",
+        ] {
+            assert!(!is_lan_only(url), "{url} should not be LAN only");
+        }
+
+        let report = Report {
+            providers: vec![
+                ("zai".to_string(), "ZAI_KEYS".to_string(), 2, false),
+                (
+                    "hades-local".to_string(),
+                    "HADES_LOCAL_KEYS".to_string(),
+                    1,
+                    true,
+                ),
+            ],
+            ..Default::default()
+        };
+        let rendered = report.render(Path::new("/tmp/config"));
+        assert!(rendered.contains("LAN or loopback only: hades-local"));
+        assert!(rendered.contains("its own host"));
     }
 
     #[cfg(unix)]
@@ -479,6 +966,23 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_rewrite_narrows_a_world_readable_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = source_dir();
+        let out = tempfile::tempdir().unwrap();
+        let env_path = out.path().join(".env");
+        // An operator made it by hand under umask 022, so it is world readable.
+        fs::write(&env_path, "HAND_EDITED_KEYS=keep-me\n").unwrap();
+        fs::set_permissions(&env_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        generate(source.path(), out.path(), true).expect("--force replaces it");
+
+        let mode = fs::metadata(&env_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "forced rewrite must narrow the mode");
     }
 
     #[test]
@@ -499,6 +1003,32 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         assert_eq!(ranking[0].intelligence, 53);
         assert_eq!(ranking[0].intelligence_rank, 1);
         assert!(!ranking.iter().any(|e| e.slug == "no-score-model"));
+    }
+
+    #[test]
+    fn a_renamed_score_column_is_an_error_not_an_empty_ranking() {
+        let source = source_dir();
+        let renamed = MODELS_CSV.replacen("intelligence_rank", "rank", 1);
+        fs::write(source.path().join("models.csv"), renamed).unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let err = generate(source.path(), out.path(), false).expect_err("refuses");
+        assert!(err.to_string().contains("intelligence_rank"), "{err}");
+        assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_models_csv_where_nothing_ranks_is_an_error() {
+        let source = source_dir();
+        fs::write(
+            source.path().join("models.csv"),
+            "slug,intelligence,intelligence_rank\nno-score-model,,\n",
+        )
+        .unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let err = generate(source.path(), out.path(), false).expect_err("refuses");
+        assert!(err.to_string().contains("no row"), "{err}");
     }
 
     #[test]
@@ -523,6 +1053,38 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
     }
 
     #[test]
+    fn hand_edited_models_and_router_survive_a_rerun() {
+        let source = source_dir();
+        let out = tempfile::tempdir().unwrap();
+        let models = "- provider: zai\n  model_id: glm-5.3\n  ranks_as: glm-5-3\n";
+        let router = "race_width: 3\n";
+        fs::write(out.path().join("models.yml"), models).unwrap();
+        fs::write(out.path().join("router.yml"), router).unwrap();
+
+        // --force, the case that regenerates the .env, must still leave these
+        // two alone.
+        let report = generate(source.path(), out.path(), true).expect("regenerates");
+
+        assert_eq!(
+            fs::read_to_string(out.path().join("models.yml")).unwrap(),
+            models
+        );
+        assert_eq!(
+            fs::read_to_string(out.path().join("router.yml")).unwrap(),
+            router
+        );
+        assert_eq!(report.kept, vec!["models.yml", "router.yml"]);
+        assert!(report.render(out.path()).contains("Left as they were"));
+
+        // A directory without them still gets both templates.
+        let fresh = tempfile::tempdir().unwrap();
+        let report = generate(source.path(), fresh.path(), false).expect("writes both");
+        assert!(report.kept.is_empty());
+        assert!(fresh.path().join("models.yml").exists());
+        assert!(fresh.path().join("router.yml").exists());
+    }
+
+    #[test]
     fn two_providers_cannot_share_one_variable() {
         let source = tempfile::tempdir().unwrap();
         fs::write(
@@ -537,11 +1099,51 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         assert!(err.to_string().contains("A_B_KEYS"), "{err}");
     }
 
+    /// `--out .` with the default `--source .` must not rewrite the tracked
+    /// source snapshot with the Cloudflare alias rows, nor write anything else.
+    #[test]
+    fn out_equal_to_source_is_refused_and_the_source_csv_is_untouched() {
+        let source = source_dir();
+        // A different spelling of the same directory, so only canonicalising
+        // catches it.
+        let out = source.path().join(".");
+        let err = generate(source.path(), &out, false).expect_err("refuses");
+        assert!(err.to_string().contains("model_capabilities.csv"), "{err}");
+        assert_eq!(
+            fs::read_to_string(source.path().join("model_capabilities.csv")).unwrap(),
+            CAPABILITIES_CSV
+        );
+        assert!(!source.path().join(".env").exists());
+    }
+
+    /// An unmounted share looks like a missing parent. The run must refuse
+    /// rather than build the tree on the local disk and put keys there.
+    #[test]
+    fn a_missing_parent_is_refused_and_nothing_is_created() {
+        let source = source_dir();
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("share").join("config");
+        let err = generate(source.path(), &out, false).expect_err("refuses");
+        assert!(err.to_string().contains("mounted"), "{err}");
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    /// A failed run must not leave a freshly made output directory behind.
+    #[test]
+    fn a_failed_run_does_not_create_the_output_directory() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("providers.yaml"), PROVIDERS_YAML).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("config");
+        generate(source.path(), &out, false).expect_err("no models.csv");
+        assert!(!out.exists());
+    }
+
     #[test]
     fn the_output_directory_is_created_and_holds_all_six_files() {
         let source = source_dir();
         let parent = tempfile::tempdir().unwrap();
-        let out = parent.path().join("nested").join("config");
+        let out = parent.path().join("config");
         let report = generate(source.path(), &out, false).expect("generates");
 
         for name in [
@@ -554,12 +1156,14 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         ] {
             assert!(out.join(name).exists(), "{name} should have been written");
         }
-        assert_eq!(report.capability_rows, 2);
-        // The capabilities file goes across byte for byte.
-        assert_eq!(
-            fs::read_to_string(out.join("model_capabilities.csv")).unwrap(),
-            CAPABILITIES_CSV
-        );
+        // Three source rows, plus the Workers AI row aliased onto the one
+        // cloudflare account in the fixture.
+        assert_eq!(report.capability_rows, 4);
+        // The source rows go across byte for byte, with the aliased ones
+        // appended after them.
+        assert!(fs::read_to_string(out.join("model_capabilities.csv"))
+            .unwrap()
+            .starts_with(CAPABILITIES_CSV));
         assert!(report.render(&out).contains("capability rows"));
     }
 
@@ -584,6 +1188,31 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
             40,
             "the ranking joins against the generated intelligence.yml"
         );
+    }
+
+    /// The capabilities export names Cloudflare `cloudflare-workers-ai`, while
+    /// `providers.yaml` names each account `cloudflare-<account id>`. Without
+    /// the alias the join finds nothing, the channel takes the 8,192 token
+    /// default and sits out every prompt longer than that.
+    #[test]
+    fn cloudflare_accounts_join_the_workers_ai_capability_rows() {
+        let source = source_dir();
+        let out = tempfile::tempdir().unwrap();
+        generate(source.path(), out.path(), false).expect("generates");
+
+        let config = llmrouter::Config::load(out.path()).expect("the router loads it");
+        let capability = config
+            .capability("cloudflare-b4b050cc", "@cf/meta/llama")
+            .expect("the Workers AI row reaches the account that serves it");
+        assert_eq!(capability.limit_context, Some(128_000));
+        assert_eq!(capability.limit_output, Some(4096));
+        assert_eq!(capability.tool_call, Some(true));
+        // The row it was copied from stays where it was.
+        assert!(config
+            .capability("cloudflare-workers-ai", "@cf/meta/llama")
+            .is_some());
+        // A provider with no such prefix gets nothing it did not already have.
+        assert!(config.capability("zai", "@cf/meta/llama").is_none());
     }
 
     /// `router.yml` must survive the round trip. `RouterConfig` sets
@@ -644,10 +1273,29 @@ gemini,gemini-3.8-flash,0,0,,1048576,,\"[\"\"text\"\"]\",,0
         assert!(err.to_string().contains("providers.yaml"), "{err}");
     }
 
+    /// The generator must read the same variable the router reads, or off the
+    /// deploy host the two end up on different directories. Asserted against
+    /// the parser rather than by setting the variable, because the environment
+    /// is process wide and the other tests run beside this one.
+    #[test]
+    fn the_output_directory_reads_the_routers_own_variable() {
+        use clap::CommandFactory;
+        let env = Args::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "out")
+            .expect("an --out argument")
+            .get_env()
+            .expect("--out reads an environment variable")
+            .to_owned();
+        assert_eq!(env, "LLMROUTER_CONFIG_DIR");
+    }
+
     #[test]
     fn the_arguments_default_to_the_deploy_path() {
         let args = Args::parse_from(["llmrouter-make-config"]);
-        assert_eq!(args.out, PathBuf::from(DEFAULT_OUT));
+        if std::env::var_os("LLMROUTER_CONFIG_DIR").is_none() {
+            assert_eq!(args.out, PathBuf::from(DEFAULT_OUT));
+        }
         assert_eq!(args.source, PathBuf::from("."));
         assert!(!args.force);
 
