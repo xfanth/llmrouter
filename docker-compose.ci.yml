@@ -1,0 +1,27 @@
+# Overlay for the smoke tier. The production compose file mounts host paths
+# that only exist on the NAS, so CI swaps them for a fixture config directory
+# and a throwaway named volume.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
+services:
+  llmrouter:
+    volumes:
+      - ./tests/smoke/fixture-config:/config:ro
+      - smoke-data:/data
+    # The base file restarts the container for ever. A smoke container that
+    # outlives its run would come back after a daemon restart and sit on the
+    # published port, so the overlay turns the policy off.
+    restart: !override "no"
+    # `!override` replaces the inherited list. Without the tag Compose
+    # concatenates, and the service ends up publishing 8080 twice: once on
+    # 0.0.0.0 from the base file and once here, so the second bind fails.
+    #
+    # No host port is pinned. A fixed 8080 races every other thing on the
+    # machine that might hold it: a leftover container, a locally running
+    # router, a second checkout running this same tier. The kernel picks a
+    # free port and the test reads it back with `docker compose port`.
+    ports: !override
+      - "127.0.0.1::8080"
+
+volumes:
+  smoke-data:

@@ -1,0 +1,94 @@
+[package]
+name = "llmrouter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Fast, lightweight LLM router: races many provider/model/key channels, returns the first good answer"
+license = "MIT"
+
+[dependencies]
+# Runtime
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-stream = "0.3"
+
+# HTTP server
+axum = { version = "0.8", features = ["json", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+hyper = "1.6"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "stream", "http2", "rustls-tls", "gzip",
+] }
+
+# Wire-format translation, Anthropic <-> OpenAI
+switchyard-translation = "0.3"
+switchyard-protocol = "0.3"
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+humantime-serde = "1"
+# RFC 3339 timestamps on `GET /v1/models`, already in the tree under
+# humantime-serde.
+humantime = "2"
+# `Retry-After` dates: all three forms RFC 9110 requires. Already in the tree
+# under hyper.
+httpdate = "1"
+
+# Storage
+redb = "2.6"
+blake3 = "1.5"
+
+# State
+arc-swap = "1.7"
+dashmap = "6"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Misc
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+rand = "0.8"
+csv = "1.3"
+tracing-appender = "0.2.5"
+indicatif = "0.18.4"
+tracing-indicatif = "0.3.14"
+comfy-table = "8.0.0"
+time = { version = "0.3.41", default-features = false, features = ["std", "formatting"] }
+# `.env` parsing: `export `, quoting, escapes and inline comments.
+dotenvy = "0.15.7"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+tokio-test = "0.4"
+# `ServiceExt::oneshot`, so a test can drive the router without a socket.
+tower = { version = "0.5", features = ["util"] }
+# Snapshot assertions on wire-format output, so a change to the bytes we emit
+# shows up as a diff rather than a hand-written comparison.
+insta = { version = "1.49.0", features = ["json"] }
+# Table-driven cases.
+rstest = "0.26.1"
+# Throwaway directories for redb and the spill files.
+tempfile = "3.27.0"
+# Mocked upstream providers, instead of a hand-rolled mock server.
+wiremock = "0.6.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

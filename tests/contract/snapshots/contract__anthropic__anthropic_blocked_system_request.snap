@@ -1,0 +1,15 @@
+---
+source: tests/contract/anthropic.rs
+expression: encoded
+---
+{
+  "model": "claude-sonnet-4",
+  "system": "You are a careful assistant.\n\nAnswer in British English.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ping"
+    }
+  ],
+  "max_tokens": 256
+}

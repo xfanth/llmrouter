@@ -1,0 +1,10 @@
+# Deny everything, then re-include only what the build needs.
+#
+# The Dockerfile does `COPY . .`, so an allowlist is the only safe shape here:
+# a deny-list has to be kept in step with every new secret-bearing file, and
+# missing one bakes live API keys into the build layer where `docker history`
+# will show them. Anything not named below never enters the build context.
+*
+!src
+!Cargo.toml
+!Cargo.lock

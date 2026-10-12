@@ -1,0 +1,14 @@
+---
+source: tests/contract/main.rs
+expression: encoded
+---
+{
+  "model": "gpt-4o-mini",
+  "messages": [
+    {
+      "role": "user",
+      "content": "ping"
+    }
+  ],
+  "max_completion_tokens": 16
+}
