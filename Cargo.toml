@@ -68,6 +68,19 @@ comfy-table = "8.0.0"
 time = { version = "0.3.41", default-features = false, features = ["std", "formatting"] }
 # `.env` parsing: `export `, quoting, escapes and inline comments.
 dotenvy = "0.15.7"
+# Arguments for the `llmrouter-make-config` bin.
+clap = { version = "4.5.51", features = ["derive"] }
+
+# `src/main.rs` is the router. `src/bin/make-config.rs` builds the config
+# directory the router reads, named in full so the installed binary says what
+# it belongs to.
+[[bin]]
+name = "llmrouter"
+path = "src/main.rs"
+
+[[bin]]
+name = "llmrouter-make-config"
+path = "src/bin/make-config.rs"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"

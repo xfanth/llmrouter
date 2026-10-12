@@ -94,9 +94,13 @@ for url, c in sorted(channels.items(), key=lambda x: -x[1]["priority"]):
     lines.append(f"    base_url: {url}")
     lines.append(f"    priority: {c['priority']}   # from new-api, highest first")
     if c["models"]:
-        lines.append(f"    known_models: [{', '.join(sorted(c['models']))}]")
+        # JSON is a subset of YAML, so json.dumps gives correct quoting for
+        # free. Needed: a Cloudflare model id starts with '@', which is a
+        # reserved YAML character, and an unquoted one makes the whole file
+        # unparseable.
+        lines.append(f"    known_models: {json.dumps(sorted(c['models']))}")
     lines.append("    keys:")
-    lines.extend(f"      - {k}" for k in c["keys"])
+    lines.extend(f"      - {json.dumps(k)}" for k in c["keys"])
 
 with open(OUT, "w") as f:
     f.write("\n".join(lines) + "\n")

@@ -80,6 +80,7 @@ One agent owns one file. Never edit another module's file.
 | `src/metrics.rs` | Prometheus text, every counter and histogram named in the design. | What it records |
 | `src/logging.rs` | The subscriber: pretty console plus pretty uncoloured file at `./logs/<iso_datetime>.log`, the startup progress bars and the startup summary table. | Deployment |
 | `src/main.rs` | Bootstrap: jemalloc, logging, config, state, startup probes, axum serve, graceful shutdown. | Deployment |
+| `src/bin/make-config.rs` | The `llmrouter-make-config` bin: turns `providers.yaml`, `models.csv` and `model_capabilities.csv` into the six files `src/config.rs` reads. Writes `.env` at mode 0600 and never prints a key. | Config, Deployment |
 
 ## Rules every agent follows
 

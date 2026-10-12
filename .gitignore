@@ -5,6 +5,17 @@ freellmapi-keys.csv
 .env
 *.env
 
+# Generated config. `llmrouter-make-config` normally writes these to
+# /mnt/shuttle/share/app-data/llmrouter/config, which is outside the repo, but
+# a run with `--out .` would land them here. The deploy path itself is
+# absolute and outside the repo, so git never sees it. model_capabilities.csv
+# is deliberately absent from this list: it is tracked source data at the repo
+# root, and the generator only ever copies it outwards.
+/providers.yml
+/models.yml
+/intelligence.yml
+/router.yml
+
 # Runtime state
 config/
 data/
