@@ -1716,7 +1716,7 @@ there.
 | Metric | Why |
 |---|---|
 | `router_requests_total{outcome}` | One per code: `hit_cache`, `success`, `too_large` (413), `no_network` (502), `not_admitted` (503), `no_channel` (504). |
-| `router_latency_seconds{stage}` | Histogram, split into `upstream` (time to the winning response) and `router` (time the router added). The second one proves the latency target. |
+| `router_latency_seconds{stage}` | Histogram, split into `upstream` (the whole walk, first channel call to the answer) and `router` (time the router added). The second one proves the latency target. `upstream` is the walk, not the winning call on its own: the channels that failed first are the providers' time, and splitting on the winner's own duration put all of it in the router's half. A live run read 829 seconds of mean router overhead against a target in milliseconds. |
 | `router_ttft_seconds` | Histogram, accepting the client request to its first content token. Separate from latency because the two diverge: on the live run a request took 755 seconds to start and 1.3 seconds to finish, and only this says which half the client waited on. |
 | `router_trials_per_request`, `router_copies_per_request` | Histograms. How deep the walk went, and what M cost on top. The live run sat at 9.2 trials and 18.4 copies. |
 
@@ -1733,8 +1733,9 @@ there.
 | Metric | Why |
 |---|---|
 | `router_copies_total{provider,outcome}` | One per copy, M per trial: `success`, `http_error`, `timeout`, `superseded`, `cancelled`, `self_inflicted_429`, `body_error`. `superseded` is a copy whose sibling on the same channel won. Nothing recorded it before, which is why no number could reconcile. |
-| `router_hedge_wins_total{provider,copy}` | Which copy index won. All the wins on `0` means M is buying a second call per channel and nothing else. This is the number that decides whether M should be 1. |
-| `router_copy_latency_seconds{outcome}` | Histogram, how long one copy ran before it won or failed. The live run's failures were taking 40 to 120 seconds each, which is the whole explanation for a 12 minute walk, and the page did not show it. |
+| `router_hedge_wins_total{provider,copy}` | Which copy index won. On its own this settles nothing: two copies race and one of them wins, and the first live run came back 5 against 5. |
+| `router_hedge_outcome_total{provider,result}` | What the hedge bought on a won trial: `rescued` when every sibling had already failed, `redundant` when one was still running, `no_hedge` at M=1. This is the number that decides M. Read it against `router_copies_total{outcome="self_inflicted_429"}`, which is what M costs: mostly `redundant` with self-inflicted 429s climbing means `max_per_channel` comes down, or `hedge_delay_ms` comes up off 0. |
+| `router_copy_latency_seconds{outcome}` | Histogram, how long one copy ran before it won, failed or was stopped. The live run's failures were taking five minutes each, which is the whole explanation for a 24 minute walk, and the page did not show it. Read `superseded` and `cancelled` with care: a copy on either of those is stopped at the instant the race ends, so the number says when the race ended, not how long that copy would have taken. |
 
 ### Errors
 

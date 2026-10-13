@@ -1576,6 +1576,66 @@ async fn folding_a_stream_for_a_plain_client_is_counted_in_the_time_the_request_
     );
 }
 
+/// Time spent on channels that failed is the providers' time, not the
+/// router's. The split used to be taken against the winning channel call's
+/// own duration, so every failed channel the walk got through first landed in
+/// the router half: a live run reported a mean of 829 seconds of router
+/// overhead against a target measured in milliseconds.
+///
+/// `race_width: 1` is what makes the gap visible. The slow channel has to
+/// fail before the fast one is tried, so the walk is far longer than the call
+/// that wins it.
+#[tokio::test]
+async fn time_spent_on_failed_channels_is_upstream_time_not_router_overhead() {
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_millis(400)))
+        .mount(&slow)
+        .await;
+    let fast =
+        upstream_serving(ResponseTemplate::new(200).set_body_json(provider_reply("ok"))).await;
+
+    // The catalogue sorts on `intelligence_rank` ascending and shuffles ties,
+    // so the ranks have to differ or the walk picks its first channel at
+    // random and the test passes or fails on the toss.
+    let mut doomed = channel(&base_url(&slow), "slow-model", "sk-test-slow", 200_000);
+    doomed.intelligence = 900;
+    doomed.intelligence_rank = 1;
+    let mut good = channel(&base_url(&fast), "fast-model", "sk-test-fast", 200_000);
+    good.intelligence = 100;
+    good.intelligence_rank = 2;
+
+    let config = RouterConfig {
+        race_width: 1,
+        ..plain_config()
+    };
+    let edge = Edge::new(config, vec![doomed, good], Link::Up).await;
+
+    let response = edge.post_chat(&chat_request("split", false)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let text = text_body(edge.get("/metrics").await).await;
+    let upstream = series_value(&text, "router_latency_seconds_sum{stage=\"upstream\"}");
+    let router = series_value(&text, "router_latency_seconds_sum{stage=\"router\"}");
+
+    assert!(
+        upstream >= 0.4,
+        "the walk waited 400ms on the slow channel, so the upstream half \
+         carries it: upstream {upstream}s, router {router}s:\n{text}"
+    );
+    assert!(
+        router < 0.1,
+        "the router did milliseconds of work, so its half stays small. \
+         Before the fix this held the slow channel's 400ms: upstream \
+         {upstream}s, router {router}s:\n{text}"
+    );
+    assert!(
+        router < upstream,
+        "the router half cannot exceed the walk it sits beside: upstream \
+         {upstream}s, router {router}s:\n{text}"
+    );
+}
+
 /// The buffered arm has the same job as the fold: the reply still has to be
 /// translated back into the client's format, and that encode is the largest
 /// piece of work the router does after the race. The duration used to be

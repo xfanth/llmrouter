@@ -48,7 +48,9 @@ use tokio_util::sync::CancellationToken;
 use crate::catalogue::{Catalogue, Channel, ChannelFilter, ChannelId};
 use crate::config::{Config, HedgeStrategy};
 use crate::health::{HealthKey, HealthTable, StreamVerdict};
-use crate::metrics::{AttemptOutcome, CopyOutcome, ErrorClass, Metrics, TrialOutcomeLabel};
+use crate::metrics::{
+    AttemptOutcome, CopyOutcome, ErrorClass, HedgeOutcome, Metrics, TrialOutcomeLabel,
+};
 use crate::net::{LinkState, NetTest};
 use crate::server::PromptBody;
 use crate::upstream::{CallError, SharedBody, Upstream};
@@ -124,6 +126,15 @@ pub enum RaceOutcome {
         also_finished: Vec<Winner>,
         /// Channel calls made.
         attempts: u32,
+        /// The whole walk, from the first channel call to this answer.
+        ///
+        /// Not the same as `winner.latency`, which is the winning call on its
+        /// own. The gap between the two is every failed channel the walk got
+        /// through first, and that time is the providers', not the router's.
+        /// Splitting the latency histogram on `winner.latency` put all of it
+        /// in the router's half: a live run reported a mean of 829 seconds of
+        /// router overhead for work the router never did.
+        race_elapsed: Duration,
     },
     /// A channel started streaming. `200`.
     ///
@@ -138,6 +149,9 @@ pub enum RaceOutcome {
         winner: Box<StreamWinner>,
         /// Channel calls made.
         attempts: u32,
+        /// The whole walk, from the first channel call to this stream's first
+        /// token. See the note on [`RaceOutcome::Buffered::race_elapsed`].
+        race_elapsed: Duration,
     },
     /// Both network test calls failed. `502`, and no channel's health moved.
     NoNetwork {
@@ -210,7 +224,19 @@ impl Racer {
     /// channel call at once.
     pub async fn run(&self, input: RaceInput, cancel: CancellationToken) -> RaceOutcome {
         let fired = WalkCount::default();
-        let outcome = self.walk(input, cancel, &fired).await;
+        // Started here rather than inside `walk`, so every one of the walk's
+        // ten exits carries the same reading and none of them can forget to
+        // take it.
+        let started = std::time::Instant::now();
+        let mut outcome = self.walk(input, cancel, &fired).await;
+        match &mut outcome {
+            RaceOutcome::Buffered { race_elapsed, .. }
+            | RaceOutcome::Streamed { race_elapsed, .. } => *race_elapsed = started.elapsed(),
+            // The other three never answered, so there is no split to make.
+            RaceOutcome::NoNetwork { .. }
+            | RaceOutcome::Exhausted { .. }
+            | RaceOutcome::ClientGone => {}
+        }
         // The gap between the two is what M cost: the live run came back with
         // 9.2 trials and 18.4 copies for each client request, and nothing on
         // `/metrics` said so.
@@ -330,6 +356,10 @@ impl Racer {
                     // router stage short of the work that happens after the
                     // race returns.
                     return RaceOutcome::Buffered {
+                        // Stamped by `run`, which owns the clock for the
+                        // whole walk. A reading taken here would miss the
+                        // walk's other nine exits.
+                        race_elapsed: Duration::ZERO,
                         winner,
                         also_finished,
                         attempts: fired.queued(),
@@ -406,9 +436,11 @@ impl Racer {
                     match self.winner_from(*picked) {
                         Ok(winner) => {
                             return RaceOutcome::Streamed {
+                                // Stamped by `run`. See the note above.
+                                race_elapsed: Duration::ZERO,
                                 winner: Box::new(winner),
                                 attempts: fired.queued(),
-                            }
+                            };
                         }
                         // The decoder refused the stream. Everything else is
                         // already cancelled, so the walk is over.
@@ -589,12 +621,14 @@ impl Racer {
         .await;
         match raced {
             CopyRace::Won((index, win)) => {
-                // Copy 0 is the one fired first, so wins on 0 alone mean M is
-                // buying a second call per channel and nothing else. A
-                // streamed win can still lose the decision window later; the
-                // trial is counted on what it produced, not on what the walk
-                // did with it afterwards.
+                // Which copy won, and then what the hedge actually bought.
+                // The index alone is a coin flip: two copies race and one of
+                // them wins, and a live run came back 5 against 5. The
+                // question that decides M is whether the siblings had already
+                // failed, which is what `failures` holds at this point.
                 self.metrics.record_hedge_win(&channel.provider, index);
+                self.metrics
+                    .record_hedge_outcome(&channel.provider, hedge_outcome(copies, failures.len()));
                 trial.settle(TrialOutcomeLabel::Won);
                 return self.trial_won(channel, win);
             }
@@ -1152,7 +1186,11 @@ fn escalate_failure(
     if pair_alive {
         return;
     }
-    health.record_failure(&pair, retry_after_secs, now);
+    health.record_failure_then(&pair, retry_after_secs, now, |entry| {
+        hold_until(channels, entry.eligible_at, |c| {
+            c.provider == failed.provider && c.key_id == failed.key_id
+        });
+    });
 
     let provider = HealthKey::Provider(failed.provider.to_string());
     if is_unhealthy(health, &provider) {
@@ -1173,7 +1211,32 @@ fn escalate_failure(
         )
     });
     if every_key_down {
-        health.record_failure(&provider, retry_after_secs, now);
+        health.record_failure_then(&provider, retry_after_secs, now, |entry| {
+            hold_until(channels, entry.eligible_at, |c| {
+                c.provider == failed.provider
+            });
+        });
+    }
+}
+
+/// Pushes a deadline recorded above the channel level down onto the rows it
+/// covers.
+///
+/// `catalogue::query` decides eligibility from the row's own atomics and
+/// nothing else, so a pair or a provider marked down in the health table is
+/// invisible to the walk until the poller next rebuilds the catalogue. That
+/// gap is what let one run keep racing all 1,401 channels on a single key
+/// after the key itself had already been handed to the poller as dead.
+/// `probe::build_channels` folds the same deadlines in when it builds fresh
+/// rows, so this only makes the live path agree with the rebuilt one.
+///
+/// `fetch_max` never shortens a row: a channel serving a longer backoff of its
+/// own keeps it.
+fn hold_until(channels: &[Channel], deadline: u64, covered: impl Fn(&Channel) -> bool) {
+    for row in channels.iter().filter(|c| covered(c)) {
+        row.health
+            .eligible_at
+            .fetch_max(deadline, Ordering::Relaxed);
     }
 }
 
@@ -2068,6 +2131,23 @@ impl Drop for InFlight {
     }
 }
 
+/// What the hedge bought on a trial that won.
+///
+/// `failed_siblings` is how many copies of this same channel had already
+/// failed when the winning copy came home. If that is every other copy, the
+/// trial would have failed without M and the hedge rescued it. If any sibling
+/// was still running, both were going to answer and the second call bought
+/// nothing but a second draw against the key's rate budget.
+fn hedge_outcome(copies: usize, failed_siblings: usize) -> HedgeOutcome {
+    if copies <= 1 {
+        HedgeOutcome::NoHedge
+    } else if failed_siblings >= copies - 1 {
+        HedgeOutcome::Rescued
+    } else {
+        HedgeOutcome::Redundant
+    }
+}
+
 /// When copy `index` starts, relative to the trial. `hedge_delay_ms` of 0 means
 /// every copy fires with the first one.
 fn hedge_offset(index: usize, delay: Duration) -> Duration {
@@ -2478,6 +2558,55 @@ mod tests {
         escalate_failure(&health, &channels, &channels[2], None, now);
         assert!(is_unhealthy(&health, &pair_one));
         assert!(is_unhealthy(&health, &provider));
+    }
+
+    /// A dead key puts the pair into backoff, but `catalogue::query` reads
+    /// eligibility off the channel row alone. Without the deadline being
+    /// pushed down onto the rows, every channel on that key reads eligible
+    /// again the moment its own short backoff expires, and the walk goes
+    /// straight back into a key the poller has already written off. One live
+    /// run raced all 1,401 channels on a single provider this way while
+    /// `/metrics` reported nothing in backoff.
+    #[test]
+    fn a_pair_and_a_provider_in_backoff_hold_their_channel_rows_back() {
+        let (health, _dir) = health_table();
+        let now = 1_000_000u64;
+        let channels = vec![
+            row("nvidia", "key-0", "model-a"),
+            row("nvidia", "key-0", "model-b"),
+        ];
+
+        // Both channels fail with no `Retry-After`, so each row serves the
+        // one second base.
+        for channel in &channels {
+            fail_channel(&health, channel, now);
+        }
+        // The upstream asked for ten minutes on the last one, which is what
+        // the pair and the provider back off for.
+        escalate_failure(&health, &channels, &channels[1], Some(600), now);
+
+        let pair = health
+            .get(&pair_key(&channels[0]))
+            .expect("the pair is down");
+        assert_eq!(pair.eligible_at, now + 600);
+        let provider = health
+            .get(&HealthKey::Provider("nvidia".to_string()))
+            .expect("the provider is down");
+        assert_eq!(provider.eligible_at, now + 600);
+
+        // Ten seconds on, each row's own one second backoff is long gone.
+        let later = now + 10;
+        for channel in &channels {
+            assert!(
+                !channel.eligible(later),
+                "a channel on a pair in backoff must not read eligible"
+            );
+            assert_eq!(
+                channel.health.eligible_at.load(Ordering::Relaxed),
+                now + 600,
+                "the row carries the deadline recorded above it"
+            );
+        }
     }
 
     /// A pair already with the poller must not have its re-probe pushed out by
@@ -3792,6 +3921,32 @@ mod tests {
             .and_then(|line| line.rsplit(' ').next())
             .and_then(|value| value.parse().ok())
             .unwrap_or(0.0)
+    }
+
+    /// `hedge_outcome` is the number that decides M, so its three cases are
+    /// pinned here directly rather than only through a live trial. A live run
+    /// returned a 5 against 5 split on the copy index, which says nothing;
+    /// this is what tells the two apart.
+    #[test]
+    fn the_hedge_only_counts_as_a_rescue_when_every_sibling_had_failed() {
+        // M=1: there is no sibling to rescue anything.
+        assert_eq!(hedge_outcome(1, 0), HedgeOutcome::NoHedge);
+
+        // M=2, the sibling was still running: both were going to answer, so
+        // the second call bought nothing.
+        assert_eq!(hedge_outcome(2, 0), HedgeOutcome::Redundant);
+
+        // M=2, the sibling had already failed: without it the trial would
+        // have failed and the walk would have moved to the next channel.
+        assert_eq!(hedge_outcome(2, 1), HedgeOutcome::Rescued);
+
+        // M=3, one of the two siblings still running.
+        assert_eq!(hedge_outcome(3, 1), HedgeOutcome::Redundant);
+        assert_eq!(hedge_outcome(3, 2), HedgeOutcome::Rescued);
+
+        // M=0 is not reachable through config, which clamps with `max(1)`,
+        // but the function must not divide the floor out from under itself.
+        assert_eq!(hedge_outcome(0, 0), HedgeOutcome::NoHedge);
     }
 
     /// The copy that wins is not always the one fired first, and the sibling

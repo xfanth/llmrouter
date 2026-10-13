@@ -776,6 +776,7 @@ async fn handle_completion(
             winner,
             also_finished,
             attempts,
+            race_elapsed,
         } => {
             if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
                 let best = crate::race::best_for_cache(&winner, &also_finished);
@@ -823,9 +824,15 @@ async fn handle_completion(
             // of the split.
             let total = started.elapsed();
 
+            // Split on the whole walk, not on the winning call alone.
+            // `winner.latency` is that one channel's own wall clock, so every
+            // failed channel the walk got through first used to land in the
+            // router's half: a live run reported 829 seconds of mean router
+            // overhead for work the router never did, against a target in
+            // milliseconds.
             state
                 .metrics
-                .record_latency(winner.latency, total.saturating_sub(winner.latency));
+                .record_latency(race_elapsed, total.saturating_sub(race_elapsed));
             // Nothing streamed, so the client's first token is its whole
             // answer and the two timings are the same reading.
             state.metrics.record_ttft(total);
@@ -844,7 +851,11 @@ async fn handle_completion(
             reply
         }
 
-        RaceOutcome::Streamed { winner, attempts } => {
+        RaceOutcome::Streamed {
+            winner,
+            attempts,
+            race_elapsed,
+        } => {
             let crate::race::StreamWinner {
                 channel_id,
                 provider,
@@ -860,7 +871,9 @@ async fn handle_completion(
             // A plain client only has it once the fold is done, so the plain
             // path below adds the time the provider spent generating after
             // that first token: it is upstream time, not time the router added.
-            let mut upstream = latency;
+            // The walk, not the winning call on its own. See the note on
+            // the buffered arm above.
+            let mut upstream = race_elapsed;
             // The first token's arrival, as a distance from the start of the
             // request. `first_token_at` is a tokio Instant and `started` is a
             // std one, so the two cannot be subtracted; going via each one's

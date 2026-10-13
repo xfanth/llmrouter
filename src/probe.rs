@@ -268,6 +268,16 @@ impl Prober {
             })
             .filter(|e| e.retry_counter > 0)
             .map_or(0, |e| e.eligible_at);
+        // A provider in backoff holds its channels back too. Reading only the
+        // pair left a provider marked unreachable with every one of its rows
+        // still eligible, so the walk kept racing channels on a host the
+        // poller had already written off.
+        let provider_eligible_at = self
+            .health
+            .get(&HealthKey::Provider(provider.name.clone()))
+            .filter(|e| e.retry_counter > 0)
+            .map_or(0, |e| e.eligible_at);
+        let above = pair_eligible_at.max(provider_eligible_at);
         let key_id: Arc<str> = Arc::from(key_id);
 
         models
@@ -308,8 +318,9 @@ impl Prober {
                     .health
                     .get(&HealthKey::Channel(id))
                     .unwrap_or_else(|| HealthEntry::new(self.health.retry_base_secs()));
-                // A pair in backoff holds every channel on it back too.
-                let eligible_at = known.eligible_at.max(pair_eligible_at);
+                // A pair or provider in backoff holds every channel under
+                // it back too.
+                let eligible_at = known.eligible_at.max(above);
 
                 Channel {
                     id,
@@ -1232,6 +1243,32 @@ mod tests {
         let channels = prober.build_channels(&p, "gemini#0", "secret", &[probed("no-tools", None)]);
         assert!(channels[0].tool_call);
         assert_eq!(channels[0].limit_context, 8_000);
+    }
+
+    /// The poller rebuilds the catalogue every tick, and a rebuild that read
+    /// only the pair handed back fresh rows with the provider's own backoff
+    /// thrown away. The walk then raced a host the keyless probe had already
+    /// found unreachable.
+    #[test]
+    fn a_rebuild_keeps_a_provider_level_backoff_on_the_new_rows() {
+        let (prober, _dir) = prober_ranked(Vec::new(), Vec::new(), Vec::new());
+        let p = provider("https://example.invalid", "/models");
+        let entry = prober.health.record_failure(
+            &HealthKey::Provider("gemini".to_string()),
+            Some(600),
+            1_000,
+        );
+
+        let channels = prober.build_channels(&p, "gemini#0", "secret", &[probed("model-a", None)]);
+        assert_eq!(
+            channels[0]
+                .health
+                .eligible_at
+                .load(std::sync::atomic::Ordering::Relaxed),
+            entry.eligible_at,
+            "a rebuilt row carries the provider's deadline"
+        );
+        assert!(!channels[0].eligible(1_010));
     }
 
     fn provider(base_url: &str, models_path: &str) -> Provider {
