@@ -945,8 +945,18 @@ async fn handle_completion(
                 // The client wants one piece, so the stream is folded into one
                 // here. That is the only place the whole answer exists, so it
                 // is also the only streamed path that can feed the cache.
+                // The fold is timed on its own rather than taken from the
+                // first token. Under `hedge_strategy: tps` the race does not
+                // return at the first token: it holds the decision window
+                // open first, so that window is already inside
+                // `race_elapsed`, and adding the distance from the first
+                // token would count it a second time. With a one second
+                // window that put the upstream half a second per request too
+                // high and saturated the router half to zero, which is the
+                // one number the split exists to prove.
+                let fold_started = Instant::now();
                 let folded = crate::wire::aggregate_stream(chunks).await;
-                upstream += first_token_at.elapsed();
+                upstream += fold_started.elapsed();
                 match folded {
                     Ok(response) => {
                         let winner = crate::race::Winner {

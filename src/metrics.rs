@@ -356,15 +356,19 @@ impl TokenKind {
 /// its siblings already failed, or were they still running?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HedgeOutcome {
-    /// Every sibling had already failed. Without the hedge the whole trial
-    /// would have failed and the walk would have moved to the next channel.
-    /// This is M earning its keep.
+    /// A hedge copy won and the first copy had already failed. Without the
+    /// hedge the whole trial would have failed and the walk would have moved
+    /// to the next channel. This is M earning its keep.
     Rescued,
-    /// At least one sibling was still running and healthy when this copy won.
-    /// The second call bought nothing: both copies were going to answer.
-    /// This is M costing a call against the key's rate budget for nothing.
+    /// A hedge copy won while the first copy was still running, so it beat
+    /// the first copy on speed. M saved time here. How much is not knowable
+    /// without letting the loser finish, which the race kills on purpose.
+    Faster,
+    /// The first copy won. Every other copy was a second call against the
+    /// key's rate budget that changed nothing, because the copy that would
+    /// have run at M=1 is the one that answered.
     Redundant,
-    /// There was no sibling, because `max_per_channel` is 1.
+    /// There was no hedge, because `max_per_channel` is 1.
     NoHedge,
 }
 
@@ -373,6 +377,7 @@ impl HedgeOutcome {
     pub fn label(self) -> &'static str {
         match self {
             HedgeOutcome::Rescued => "rescued",
+            HedgeOutcome::Faster => "faster",
             HedgeOutcome::Redundant => "redundant",
             HedgeOutcome::NoHedge => "no_hedge",
         }
@@ -878,8 +883,9 @@ fn describe_everything() {
     );
     describe_counter!(
         "router_hedge_outcome_total",
-        "Won trials by what the hedge bought: rescued when every sibling had \
-         already failed, redundant when one was still running."
+        "Won trials by what the hedge bought: rescued when a hedge copy won \
+         after the first copy failed, faster when a hedge copy beat a first \
+         copy still running, redundant when the first copy won anyway."
     );
     describe_counter!(
         "router_trials_total",

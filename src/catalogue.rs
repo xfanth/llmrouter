@@ -103,9 +103,25 @@ pub struct ChannelHealth {
     pub retry_counter: AtomicU32,
     /// Seconds. 1 by default; a `Retry-After` header replaces it.
     pub retry_base_secs: AtomicU64,
-    /// Absolute unix second from which this channel is eligible again. A
-    /// deadline already past means eligible now.
+    /// Absolute unix second from which this channel is eligible again, from
+    /// this channel's own failures alone. A deadline already past means
+    /// eligible now.
+    ///
+    /// The three deadline fields are kept apart rather than folded into one
+    /// because each has exactly one writer: the channel's own trials write
+    /// this one, `escalate_failure` writes the pair's and the provider's. A
+    /// single shared field made each writer able to erase the other two, and
+    /// it did: a channel failing with no `Retry-After` stored its one second
+    /// base over a ten minute provider hold and went straight back into a
+    /// provider already handed to the poller as dead.
     pub eligible_at: AtomicU64,
+    /// The deadline the provider/key pair above this row is serving, 0 when
+    /// the pair is healthy. Written for every row on the pair at once, so a
+    /// dead key holds its channels back without waiting for a rebuild.
+    pub pair_eligible_at: AtomicU64,
+    /// The deadline the provider above this row is serving, 0 when the
+    /// provider is healthy. Written for every row on the provider at once.
+    pub provider_eligible_at: AtomicU64,
     /// Channel calls currently open against this channel, hedged copies
     /// included. Shared behind an `Arc` so that a catalogue rebuild can hand
     /// the same counter to the new row: requests already running hold the old
@@ -115,6 +131,17 @@ pub struct ChannelHealth {
 }
 
 impl ChannelHealth {
+    /// The second this row is next callable: the latest deadline any of the
+    /// three levels is serving. Every eligibility test goes through here, so
+    /// a level that is down cannot be missed by a reader that only knew about
+    /// one of the fields.
+    pub fn not_before(&self) -> u64 {
+        self.eligible_at
+            .load(Ordering::Relaxed)
+            .max(self.pair_eligible_at.load(Ordering::Relaxed))
+            .max(self.provider_eligible_at.load(Ordering::Relaxed))
+    }
+
     /// A fresh row that may be called straight away. `Default` leaves
     /// `enabled` false and `retry_base_secs` 0, neither of which is what a
     /// newly built channel wants, so build rows through this.
@@ -124,6 +151,8 @@ impl ChannelHealth {
             retry_counter: AtomicU32::new(0),
             retry_base_secs: AtomicU64::new(1),
             eligible_at: AtomicU64::new(0),
+            pair_eligible_at: AtomicU64::new(0),
+            provider_eligible_at: AtomicU64::new(0),
             in_flight: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -146,8 +175,7 @@ impl Channel {
     /// True when this row may be called right now: enabled, and its backoff
     /// deadline has passed.
     pub fn eligible(&self, now_unix: u64) -> bool {
-        self.health.enabled.load(Ordering::Relaxed)
-            && self.health.eligible_at.load(Ordering::Relaxed) <= now_unix
+        self.health.enabled.load(Ordering::Relaxed) && self.health.not_before() <= now_unix
     }
 
     /// True when this row satisfies the client request's requirements, as of

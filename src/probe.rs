@@ -277,7 +277,6 @@ impl Prober {
             .get(&HealthKey::Provider(provider.name.clone()))
             .filter(|e| e.retry_counter > 0)
             .map_or(0, |e| e.eligible_at);
-        let above = pair_eligible_at.max(provider_eligible_at);
         let key_id: Arc<str> = Arc::from(key_id);
 
         models
@@ -318,9 +317,6 @@ impl Prober {
                     .health
                     .get(&HealthKey::Channel(id))
                     .unwrap_or_else(|| HealthEntry::new(self.health.retry_base_secs()));
-                // A pair or provider in backoff holds every channel under
-                // it back too.
-                let eligible_at = known.eligible_at.max(above);
 
                 Channel {
                     id,
@@ -364,7 +360,13 @@ impl Prober {
                         enabled: AtomicBool::new(true),
                         retry_counter: AtomicU32::new(known.retry_counter),
                         retry_base_secs: AtomicU64::new(known.retry_base_secs),
-                        eligible_at: AtomicU64::new(eligible_at),
+                        eligible_at: AtomicU64::new(known.eligible_at),
+                        // A pair or a provider in backoff holds every channel
+                        // under it back too, and each level keeps its own
+                        // field so a later move at one level cannot erase
+                        // another's.
+                        pair_eligible_at: AtomicU64::new(pair_eligible_at),
+                        provider_eligible_at: AtomicU64::new(provider_eligible_at),
                         // A rebuild carries the live count over from the row
                         // this one replaces, so starting at zero is right.
                         in_flight: Arc::new(AtomicU32::new(0)),
@@ -1261,10 +1263,7 @@ mod tests {
 
         let channels = prober.build_channels(&p, "gemini#0", "secret", &[probed("model-a", None)]);
         assert_eq!(
-            channels[0]
-                .health
-                .eligible_at
-                .load(std::sync::atomic::Ordering::Relaxed),
+            channels[0].health.not_before(),
             entry.eligible_at,
             "a rebuilt row carries the provider's deadline"
         );
@@ -1644,11 +1643,7 @@ mod tests {
             "a pair in backoff must not be raced"
         );
         assert!(
-            rows[0]
-                .health
-                .eligible_at
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > now + 86_400,
+            rows[0].health.not_before() > now + 86_400,
             "the row carries the pair's Retry-After as its next_eligible time"
         );
 

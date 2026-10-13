@@ -37,7 +37,7 @@
 
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -45,7 +45,7 @@ use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::catalogue::{Catalogue, Channel, ChannelFilter, ChannelId};
+use crate::catalogue::{Catalogue, Channel, ChannelFilter, ChannelHealth, ChannelId};
 use crate::config::{Config, HedgeStrategy};
 use crate::health::{HealthKey, HealthTable, StreamVerdict};
 use crate::metrics::{
@@ -149,8 +149,15 @@ pub enum RaceOutcome {
         winner: Box<StreamWinner>,
         /// Channel calls made.
         attempts: u32,
-        /// The whole walk, from the first channel call to this stream's first
-        /// token. See the note on [`RaceOutcome::Buffered::race_elapsed`].
+        /// The whole walk, from the first channel call to the moment the race
+        /// handed this stream over.
+        ///
+        /// Not the first token. Under `hedge_strategy: tps` the race holds
+        /// the decision window open past the first token and then decodes, so
+        /// this runs beyond it. Anyone adding to this number has to measure
+        /// from here, not from the first token, or the window lands in the
+        /// sum twice. See the note on
+        /// [`RaceOutcome::Buffered::race_elapsed`].
         race_elapsed: Duration,
     },
     /// Both network test calls failed. `502`, and no channel's health moved.
@@ -623,12 +630,14 @@ impl Racer {
             CopyRace::Won((index, win)) => {
                 // Which copy won, and then what the hedge actually bought.
                 // The index alone is a coin flip: two copies race and one of
-                // them wins, and a live run came back 5 against 5. The
-                // question that decides M is whether the siblings had already
-                // failed, which is what `failures` holds at this point.
+                // them wins, and a live run came back 5 against 5. What
+                // decides M is the index together with what became of the
+                // siblings, which is what `failures` holds at this point.
                 self.metrics.record_hedge_win(&channel.provider, index);
-                self.metrics
-                    .record_hedge_outcome(&channel.provider, hedge_outcome(copies, failures.len()));
+                self.metrics.record_hedge_outcome(
+                    &channel.provider,
+                    hedge_outcome(copies, index, failures.len()),
+                );
                 trial.settle(TrialOutcomeLabel::Won);
                 return self.trial_won(channel, win);
             }
@@ -1029,11 +1038,7 @@ impl Racer {
                 row.health.retry_base_secs.store(base, Ordering::Relaxed);
                 row.health.eligible_at.store(0, Ordering::Relaxed);
             });
-        // A channel answering proves its pair and its provider are alive, so
-        // whatever an earlier escalation wrote above the channel clears too.
-        self.health.record_success(&pair_key(channel));
-        self.health
-            .record_success(&HealthKey::Provider(channel.provider.to_string()));
+        write_success_above(&self.health, snapshot.as_slice(), channel);
     }
 }
 
@@ -1114,6 +1119,26 @@ fn current_row<'a>(channels: &'a [Channel], channel: &'a Channel) -> &'a Channel
         .unwrap_or(channel)
 }
 
+/// Clears the two levels above a channel that has just answered, in the table
+/// and on every row they were holding.
+///
+/// A channel answering proves its pair and its provider are alive, so an
+/// earlier escalation above it is over. This is the mirror image of
+/// `escalate_failure` and has to undo everything that wrote, or the rows it
+/// stamped stay dark with nothing left in the table to explain why.
+fn write_success_above(health: &HealthTable, channels: &[Channel], channel: &Channel) {
+    clear_hold(health, channels, &pair_key(channel), pair_level, |c| {
+        c.provider == channel.provider && c.key_id == channel.key_id
+    });
+    clear_hold(
+        health,
+        channels,
+        &HealthKey::Provider(channel.provider.to_string()),
+        provider_level,
+        |c| c.provider == channel.provider,
+    );
+}
+
 /// Records one failed trial and mirrors the result onto the channel row, so the
 /// next query sees the backoff without waiting for anything else.
 fn write_failure(
@@ -1187,7 +1212,7 @@ fn escalate_failure(
         return;
     }
     health.record_failure_then(&pair, retry_after_secs, now, |entry| {
-        hold_until(channels, entry.eligible_at, |c| {
+        set_hold(channels, pair_level, entry.eligible_at, |c| {
             c.provider == failed.provider && c.key_id == failed.key_id
         });
     });
@@ -1212,32 +1237,73 @@ fn escalate_failure(
     });
     if every_key_down {
         health.record_failure_then(&provider, retry_after_secs, now, |entry| {
-            hold_until(channels, entry.eligible_at, |c| {
+            set_hold(channels, provider_level, entry.eligible_at, |c| {
                 c.provider == failed.provider
             });
         });
     }
 }
 
-/// Pushes a deadline recorded above the channel level down onto the rows it
-/// covers.
+/// The row field the provider/key pair level writes.
+fn pair_level(health: &ChannelHealth) -> &AtomicU64 {
+    &health.pair_eligible_at
+}
+
+/// The row field the provider level writes.
+fn provider_level(health: &ChannelHealth) -> &AtomicU64 {
+    &health.provider_eligible_at
+}
+
+/// Writes a deadline recorded above the channel level onto every row it
+/// covers. A deadline of 0 lifts the hold again.
 ///
 /// `catalogue::query` decides eligibility from the row's own atomics and
 /// nothing else, so a pair or a provider marked down in the health table is
 /// invisible to the walk until the poller next rebuilds the catalogue. That
 /// gap is what let one run keep racing all 1,401 channels on a single key
 /// after the key itself had already been handed to the poller as dead.
-/// `probe::build_channels` folds the same deadlines in when it builds fresh
+/// `probe::build_channels` writes the same three fields when it builds fresh
 /// rows, so this only makes the live path agree with the rebuilt one.
 ///
-/// `fetch_max` never shortens a row: a channel serving a longer backoff of its
-/// own keeps it.
-fn hold_until(channels: &[Channel], deadline: u64, covered: impl Fn(&Channel) -> bool) {
+/// A plain `store` is right because `level` picks the one field this level
+/// owns. Nothing else writes it, so there is no other writer to race, and a
+/// lift cannot be swallowed by a `fetch_max` that only ever climbs.
+fn set_hold(
+    channels: &[Channel],
+    level: fn(&ChannelHealth) -> &AtomicU64,
+    deadline: u64,
+    covered: impl Fn(&Channel) -> bool,
+) {
     for row in channels.iter().filter(|c| covered(c)) {
-        row.health
-            .eligible_at
-            .fetch_max(deadline, Ordering::Relaxed);
+        level(&row.health).store(deadline, Ordering::Relaxed);
     }
+}
+
+/// Records a success against a level above the channel and lifts the hold
+/// that level had put on the rows it covers.
+///
+/// Both halves are owed. Dropping the table entry alone leaves every row the
+/// escalation stamped sitting in a backoff nothing will ever lift: the poller
+/// skips a pair it now reads as healthy and already known (`poll_keys`), so no
+/// rebuild comes to clear the rows, and `/healthz` shows nothing because the
+/// entry it reads has gone. A key that has just proved itself alive would go
+/// dark for the rest of its old deadline.
+///
+/// The lift is skipped when the level was not down. Every success passes
+/// through here, and a scan of every row on a provider is not worth paying
+/// when there was nothing held against it.
+fn clear_hold(
+    health: &HealthTable,
+    channels: &[Channel],
+    key: &HealthKey,
+    level: fn(&ChannelHealth) -> &AtomicU64,
+    covered: impl Fn(&Channel) -> bool,
+) {
+    if health.get(key).is_none() {
+        health.record_success(key);
+        return;
+    }
+    health.record_success_then(key, || set_hold(channels, level, 0, covered));
 }
 
 /// A failed trial's health move, waiting on the network test.
@@ -2133,18 +2199,30 @@ impl Drop for InFlight {
 
 /// What the hedge bought on a trial that won.
 ///
-/// `failed_siblings` is how many copies of this same channel had already
-/// failed when the winning copy came home. If that is every other copy, the
-/// trial would have failed without M and the hedge rescued it. If any sibling
-/// was still running, both were going to answer and the second call bought
-/// nothing but a second draw against the key's rate budget.
-fn hedge_outcome(copies: usize, failed_siblings: usize) -> HedgeOutcome {
+/// `winner` is the index the winning copy fired at, and it decides the answer
+/// before the failure count does. Copy 0 is the one that runs at `M=1`, so a
+/// win on 0 means the hedge changed nothing even if every sibling failed: the
+/// trial would have won without them.
+///
+/// Past that, `failed_siblings` separates the two ways a hedge copy can win.
+/// Every other copy dead means the trial would have failed without M, so the
+/// hedge rescued it. A sibling still running means the hedge copy simply got
+/// there first, which saved time by an amount nothing can measure, because
+/// the race kills the loser rather than letting it finish.
+fn hedge_outcome(copies: usize, winner: usize, failed_siblings: usize) -> HedgeOutcome {
     if copies <= 1 {
-        HedgeOutcome::NoHedge
-    } else if failed_siblings >= copies - 1 {
+        return HedgeOutcome::NoHedge;
+    }
+    if winner == 0 {
+        // The copy that would have run on its own at M=1 is the one that
+        // answered, so every other copy was spent for nothing, whatever
+        // became of them.
+        return HedgeOutcome::Redundant;
+    }
+    if failed_siblings >= copies - 1 {
         HedgeOutcome::Rescued
     } else {
-        HedgeOutcome::Redundant
+        HedgeOutcome::Faster
     }
 }
 
@@ -2602,11 +2680,197 @@ mod tests {
                 "a channel on a pair in backoff must not read eligible"
             );
             assert_eq!(
-                channel.health.eligible_at.load(Ordering::Relaxed),
+                channel.health.not_before(),
                 now + 600,
                 "the row carries the deadline recorded above it"
             );
         }
+    }
+
+    /// Both levels above the channel have to reach the rows, and they cover
+    /// different rows.
+    ///
+    /// A pair going down covers only its own key, which is the common case of
+    /// one expired key out of several. A provider going down covers every key
+    /// under it, including the keys the failed channel never touched, and the
+    /// walk holds one snapshot it scans in rank order, so those other keys are
+    /// exactly the rows it tries next. Neither level reaches the rows on its
+    /// own, so a run keeps racing a key or a host already written off.
+    #[test]
+    fn a_pair_and_a_provider_going_down_mid_walk_each_hold_the_rows_they_cover() {
+        let (health, _dir) = health_table();
+        let now = 1_000_000u64;
+        let channels = vec![
+            row("nvidia", "key-0", "model-a"),
+            row("nvidia", "key-1", "model-a"),
+            row("nvidia", "key-1", "model-b"),
+        ];
+        let provider = HealthKey::Provider("nvidia".to_string());
+        // Ten seconds on, every row's own one second base has long expired, so
+        // anything still held is held by a level above it.
+        let later = now + 10;
+
+        // key-0 dies and takes its own pair down for five minutes. key-1 is
+        // still live, so the provider does not move.
+        fail_channel(&health, &channels[0], now);
+        escalate_failure(&health, &channels, &channels[0], Some(300), now);
+        assert!(!is_unhealthy(&health, &provider));
+        assert!(
+            !channels[0].eligible(later),
+            "the pair level must hold the rows on its own key"
+        );
+        assert!(
+            channels[1].eligible(later) && channels[2].eligible(later),
+            "and must not touch the rows on a key that is still live"
+        );
+
+        // Now both channels on key-1 die. That is the last key, so the
+        // provider follows it down, for ten minutes.
+        fail_channel(&health, &channels[1], now);
+        fail_channel(&health, &channels[2], now);
+        escalate_failure(&health, &channels, &channels[2], Some(600), now);
+        assert_eq!(
+            health
+                .get(&provider)
+                .expect("the provider is down")
+                .eligible_at,
+            now + 600
+        );
+        for channel in &channels {
+            assert!(
+                !channel.eligible(later),
+                "the provider level must hold every key under it"
+            );
+        }
+        assert_eq!(
+            channels[0]
+                .health
+                .provider_eligible_at
+                .load(Ordering::Relaxed),
+            now + 600,
+            "including the key that did not fire the escalation"
+        );
+        assert_eq!(
+            channels[0].health.not_before(),
+            now + 600,
+            "and the longer provider deadline wins over its own pair's"
+        );
+    }
+
+    /// A pair coming back has to lift the hold off every row it stamped, not
+    /// just off the channel that proved it.
+    ///
+    /// The poller will not do it: once live traffic clears the pair entry the
+    /// poller reads the pair as healthy and already known and skips it, so no
+    /// rebuild comes. Without the lift, 1,400 rows sit dark for the rest of a
+    /// deadline whose table entry has gone, and `/healthz` has nothing left to
+    /// show. That is a worse fault than the one the hold was added for: an
+    /// unavailable key that has just proved itself alive, and no metric says so.
+    #[test]
+    fn a_pair_coming_back_lifts_the_hold_off_every_row_it_stamped() {
+        let (health, _dir) = health_table();
+        let now = 1_000_000u64;
+        let channels = vec![
+            row("nvidia", "key-0", "model-a"),
+            row("nvidia", "key-0", "model-b"),
+            row("nvidia", "key-0", "model-c"),
+        ];
+
+        for channel in &channels {
+            fail_channel(&health, channel, now);
+        }
+        escalate_failure(&health, &channels, &channels[2], Some(600), now);
+        let later = now + 10;
+        assert!(
+            channels.iter().all(|c| !c.eligible(later)),
+            "every row is held before the success"
+        );
+
+        // One trial that was already in flight comes back 2xx. The channel
+        // level clears its own row, and the levels above it clear the rest.
+        health.record_success(&HealthKey::Channel(channels[0].id));
+        channels[0].health.eligible_at.store(0, Ordering::Relaxed);
+        write_success_above(&health, &channels, &channels[0]);
+
+        for channel in &channels {
+            assert!(
+                channel.eligible(later),
+                "a pair that has proved itself alive must not leave rows dark"
+            );
+        }
+    }
+
+    /// A channel failing on its own must not shorten a deadline a level above
+    /// it is serving.
+    ///
+    /// The mirror in `write_failure` stores the channel entry's own deadline,
+    /// and that entry knows nothing about the pair or the provider. Sharing
+    /// one field let a one second base land on top of a ten minute provider
+    /// hold, which put the row back into a provider already handed to the
+    /// poller as dead, 599 seconds early. `escalate_failure` returns at its
+    /// `is_unhealthy` guard by then, so nothing re-applies the hold.
+    #[test]
+    fn a_channel_failing_alone_cannot_shorten_a_provider_hold() {
+        let (health, _dir) = health_table();
+        let catalogue = Catalogue::new();
+        // The real clock, because `write_failure` reads it itself. A made up
+        // epoch would put the channel's own deadline decades past the
+        // provider's and the test would pass without proving anything.
+        let now = now_unix();
+        catalogue.replace(vec![
+            row("nvidia", "key-0", "model-a"),
+            row("nvidia", "key-1", "model-a"),
+        ]);
+        let snapshot = catalogue.snapshot();
+        // `replace` shuffles rows of equal rank, so the rows are found by key
+        // rather than by position.
+        let find = |key_id: &str| {
+            snapshot
+                .iter()
+                .find(|c| c.key_id.as_ref() == key_id)
+                .expect("the row is in the catalogue")
+        };
+        let on_key_zero = find("key-0");
+        let on_key_one = find("key-1");
+
+        // Every key dies, so both pairs go down and the provider follows for
+        // ten minutes. Every row is held.
+        for channel in snapshot.iter() {
+            fail_channel(&health, channel, now);
+        }
+        escalate_failure(&health, &snapshot, on_key_zero, Some(600), now);
+        escalate_failure(&health, &snapshot, on_key_one, Some(600), now);
+        assert_eq!(
+            health
+                .get(&HealthKey::Provider("nvidia".to_string()))
+                .expect("the provider is down")
+                .eligible_at,
+            now + 600
+        );
+        let later = now + 10;
+        assert!(snapshot.iter().all(|c| !c.eligible(later)));
+
+        // A trial still in flight on key-0 now fails with no `Retry-After`,
+        // so its own entry gives it the one second base.
+        write_failure(&health, &catalogue, on_key_zero, None);
+
+        assert!(
+            on_key_zero.health.eligible_at.load(Ordering::Relaxed) < later,
+            "the channel level takes its own short base, which is seconds, not \
+             the provider's ten minutes"
+        );
+        assert_eq!(
+            on_key_zero
+                .health
+                .provider_eligible_at
+                .load(Ordering::Relaxed),
+            now + 600,
+            "and the provider hold above it is untouched"
+        );
+        assert!(
+            !on_key_zero.eligible(later),
+            "a channel's own short backoff must not release it from a provider hold"
+        );
     }
 
     /// A pair already with the poller must not have its re-probe pushed out by
@@ -3929,24 +4193,33 @@ mod tests {
     /// this is what tells the two apart.
     #[test]
     fn the_hedge_only_counts_as_a_rescue_when_every_sibling_had_failed() {
-        // M=1: there is no sibling to rescue anything.
-        assert_eq!(hedge_outcome(1, 0), HedgeOutcome::NoHedge);
+        // M=1: there is no hedge at all.
+        assert_eq!(hedge_outcome(1, 0, 0), HedgeOutcome::NoHedge);
 
-        // M=2, the sibling was still running: both were going to answer, so
-        // the second call bought nothing.
-        assert_eq!(hedge_outcome(2, 0), HedgeOutcome::Redundant);
+        // Copy 0 won. That is the copy that runs at M=1, so the hedge changed
+        // nothing. This holds even when the sibling failed: counting it as a
+        // rescue would credit the hedge for a trial that was going to win
+        // without it.
+        assert_eq!(hedge_outcome(2, 0, 0), HedgeOutcome::Redundant);
+        assert_eq!(hedge_outcome(2, 0, 1), HedgeOutcome::Redundant);
 
-        // M=2, the sibling had already failed: without it the trial would
-        // have failed and the walk would have moved to the next channel.
-        assert_eq!(hedge_outcome(2, 1), HedgeOutcome::Rescued);
+        // Copy 1 won with copy 0 already dead: without the hedge the trial
+        // would have failed and the walk would have moved to the next
+        // channel.
+        assert_eq!(hedge_outcome(2, 1, 1), HedgeOutcome::Rescued);
 
-        // M=3, one of the two siblings still running.
-        assert_eq!(hedge_outcome(3, 1), HedgeOutcome::Redundant);
-        assert_eq!(hedge_outcome(3, 2), HedgeOutcome::Rescued);
+        // Copy 1 won while copy 0 was still running, so it got there first.
+        assert_eq!(hedge_outcome(2, 1, 0), HedgeOutcome::Faster);
+
+        // M=3 keeps the same split: every other copy dead is a rescue, one
+        // still running is a win on speed.
+        assert_eq!(hedge_outcome(3, 2, 2), HedgeOutcome::Rescued);
+        assert_eq!(hedge_outcome(3, 2, 1), HedgeOutcome::Faster);
+        assert_eq!(hedge_outcome(3, 0, 2), HedgeOutcome::Redundant);
 
         // M=0 is not reachable through config, which clamps with `max(1)`,
-        // but the function must not divide the floor out from under itself.
-        assert_eq!(hedge_outcome(0, 0), HedgeOutcome::NoHedge);
+        // but the function must not take the floor out from under itself.
+        assert_eq!(hedge_outcome(0, 0, 0), HedgeOutcome::NoHedge);
     }
 
     /// The copy that wins is not always the one fired first, and the sibling

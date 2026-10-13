@@ -1623,8 +1623,12 @@ async fn time_spent_on_failed_channels_is_upstream_time_not_router_overhead() {
         "the walk waited 400ms on the slow channel, so the upstream half \
          carries it: upstream {upstream}s, router {router}s:\n{text}"
     );
+    // 0.2 rather than something tighter: the router's own work here is
+    // sub-millisecond, and the only way this fails is a loaded runner
+    // stealing the task between the race returning and the clock being read.
+    // The old code put 416ms in this half, so the gap stays wide either way.
     assert!(
-        router < 0.1,
+        router < 0.2,
         "the router did milliseconds of work, so its half stays small. \
          Before the fix this held the slow channel's 400ms: upstream \
          {upstream}s, router {router}s:\n{text}"
