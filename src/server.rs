@@ -340,11 +340,17 @@ async fn completion_response(
     // whichever exit writes it, says which client sent the request. The work
     // future is instrumented as well, because once the keepalive commits the
     // status line it is polled by the response body, outside this function.
+    // Counts every client request this process has taken. The copies' own
+    // telemetry lines group under the request span, and the counter on the
+    // span is what keeps ten concurrent identical requests from blurring
+    // into one in the saved log.
+    static NEXT_REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
     let span = tracing::info_span!(
         "request",
         client_key = %client_key_prefix(headers),
         format = ?client_format,
         bytes = body.len(),
+        request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
     );
     respond(state, client_format, body).instrument(span).await
 }
@@ -686,6 +692,7 @@ async fn handle_completion(
                         model = %entry.model_id,
                         channel = %entry.channel_id,
                         ms = started.elapsed().as_millis() as u64,
+                        ttft_ms = started.elapsed().as_millis() as u64,
                         "served"
                     );
                     return response;
@@ -846,6 +853,7 @@ async fn handle_completion(
                 streamed = wants_stream,
                 attempts,
                 ms = total.as_millis() as u64,
+                ttft_ms = total.as_millis() as u64,
                 "served"
             );
             reply
@@ -1023,6 +1031,8 @@ async fn handle_completion(
                         streamed = wants_stream,
                         attempts,
                         ms = total.as_millis() as u64,
+                        ttft_ms = (if wants_stream { first_token_elapsed } else { total })
+                            .as_millis() as u64,
                         "served"
                     );
                     reply
