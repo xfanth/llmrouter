@@ -26,18 +26,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// address, so the base URL is read back from compose after `up` rather than
 /// pinned here. Pinning it raced anything else holding the fixed port.
 fn base_url() -> Result<String, String> {
-    let printed = Command::new("docker")
-        .current_dir(ROOT)
-        .args([
-            "compose",
-            "-f",
-            "docker-compose.yml",
-            "-f",
-            "docker-compose.ci.yml",
-            "port",
-            "llmrouter",
-            "8080",
-        ])
+    let printed = compose_command(&["port", "llmrouter", "8080"])
         .output()
         .map_err(|error| format!("docker compose port failed: {error}"))?;
     if !printed.status.success() {
@@ -66,10 +55,32 @@ fn docker_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// `docker compose -f docker-compose.yml -f docker-compose.ci.yml <args>`.
-fn compose(args: &[&str]) -> std::process::ExitStatus {
-    Command::new("docker")
+/// The Compose project name for this checkout.
+///
+/// Compose's default is the basename of the directory holding the first
+/// compose file, lowercased with non-alphanumerics stripped, not the full
+/// path. The project name decides the image name, the container name and the
+/// named volume, so two clones both called `llmrouter` share all three: one
+/// run's `up --build` recreates the other's container mid-test and its
+/// `down -v` deletes the other's volume. Keying on the full path keeps the
+/// runs apart. ci.sh exports the same variable (keyed on the same checkout
+/// path) so its cleanup trap takes down the stack this test brought up.
+fn project_name(dir: &str) -> String {
+    std::env::var("COMPOSE_PROJECT_NAME").unwrap_or_else(|_| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dir.hash(&mut hasher);
+        format!("llmrouter-smoke-{:x}", hasher.finish())
+    })
+}
+
+/// `docker compose -f docker-compose.yml -f docker-compose.ci.yml <args>`,
+/// pinned to this checkout's own project.
+fn compose_command(args: &[&str]) -> Command {
+    let mut command = Command::new("docker");
+    command
         .current_dir(ROOT)
+        .env("COMPOSE_PROJECT_NAME", project_name(ROOT))
         .args([
             "compose",
             "-f",
@@ -77,9 +88,12 @@ fn compose(args: &[&str]) -> std::process::ExitStatus {
             "-f",
             "docker-compose.ci.yml",
         ])
-        .args(args)
-        .status()
-        .expect("docker compose runs")
+        .args(args);
+    command
+}
+
+fn compose(args: &[&str]) -> std::process::ExitStatus {
+    compose_command(args).status().expect("docker compose runs")
 }
 
 /// One stack per run, so all three endpoints are checked inside a single
@@ -103,6 +117,8 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
         return;
     }
 
+    // Always build through the compose file's own build section, so a broken
+    // context, dockerfile, target or args fails here, locally and in CI alike.
     let built = compose(&["up", "-d", "--build"]).success();
     let result = if built {
         match base_url() {
@@ -275,6 +291,47 @@ fn the_ci_overlay_replaces_the_published_ports_rather_than_adding_to_them() {
         matches!(tagged.tag.to_string().as_str(), "!override" | "!reset"),
         "unexpected tag on `ports`: {}",
         tagged.tag
+    );
+}
+
+/// Two checkouts running the smoke tier at once must not share a stack. That
+/// takes both halves: no fixed `image:` tag in the base compose file (a tag
+/// such as llmrouter:latest is global to the daemon, so one run retags it
+/// between the other's build and container create), and a project name keyed
+/// on the checkout's full path, because Compose's own default is only the
+/// directory basename and two clones of this repo almost always share one.
+/// Read from the file so it holds on a machine with no daemon.
+#[test]
+fn each_checkout_gets_its_own_image_container_and_volume() {
+    let base: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(format!("{ROOT}/docker-compose.yml")).unwrap(),
+    )
+    .expect("the base compose file is YAML");
+    let image = &base["services"]["llmrouter"]["image"];
+    assert!(
+        image.is_null(),
+        "docker-compose.yml must not set `image:`, found {image:?}: a fixed tag is shared by every checkout on the daemon"
+    );
+
+    // Same basename, different path: the names must still differ, or the two
+    // runs fight over one container and one volume. Only meaningful with the
+    // variable unset, which is how `cargo test --test smoke` runs by hand;
+    // under ci.sh it is exported and the script keys it on $PWD itself.
+    if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
+        assert_ne!(
+            project_name("/one/llmrouter"),
+            project_name("/two/llmrouter"),
+            "the project name must be keyed on the whole checkout path"
+        );
+    }
+
+    // ci.sh runs `compose down -v` from its cleanup trap, outside this
+    // process, so it has to set the same project name rather than inherit
+    // Compose's basename default.
+    let ci_sh = std::fs::read_to_string(format!("{ROOT}/ci.sh")).expect("ci.sh is readable");
+    assert!(
+        ci_sh.contains("export COMPOSE_PROJECT_NAME="),
+        "ci.sh must export COMPOSE_PROJECT_NAME, or its cleanup trap tears down whichever checkout's stack Compose's default happens to name"
     );
 }
 

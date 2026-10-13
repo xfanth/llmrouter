@@ -1777,7 +1777,9 @@ between the 3GB gate and the 4GB limit.
 ```yaml
 services:
   llmrouter:
-    image: llmrouter:latest
+    # No `image:` tag: Compose names the image after the project, so two
+    # checkouts never share one global tag.
+    build: .
     restart: unless-stopped
     ports:
       - "0.0.0.0:8080:8080"

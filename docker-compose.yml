@@ -1,6 +1,12 @@
 services:
   llmrouter:
-    image: llmrouter:latest
+    # No `image:` tag on purpose. A fixed tag such as llmrouter:latest is
+    # global to the docker daemon, so two checkouts running the smoke tier at
+    # once retag it between one another's build and container create, and a
+    # run ends up testing the other checkout's binary. Without the key Compose
+    # names the image after the project. Compose's own default project name is
+    # only the directory basename, which two clones share, so ci.sh and the
+    # smoke test both set COMPOSE_PROJECT_NAME from the full checkout path.
     build: .
     # The health table flushes every 5 minutes, so a restart costs at most 5
     # minutes of learned health. The cache is on the pool and survives.
