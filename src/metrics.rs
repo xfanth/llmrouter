@@ -83,6 +83,246 @@ impl AttemptOutcome {
     }
 }
 
+/// How one hedged copy of a channel call ended, as
+/// `router_copies_total{provider,outcome}`.
+///
+/// `AttemptOutcome` is the trial's verdict, one per channel whatever M is.
+/// This is the copy's own, M per channel. The pair that was missing before:
+/// a live run showed 150 `http_error` attempts against 92 trials and no way
+/// to tell which number counted what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// This copy produced the answer its trial returned.
+    Success,
+    /// Any status that is not a 2xx with non-empty content.
+    HttpError,
+    /// Passed `request_timeout`.
+    Timeout,
+    /// A sibling copy of the same channel won, so this one was torn down.
+    /// The hole in the old counters: nothing recorded it at all.
+    Superseded,
+    /// Another channel won the race, so the whole trial was torn down.
+    Cancelled,
+    /// A `429` this router's own sibling copy caused. Health is untouched.
+    SelfInflicted429,
+    /// A 2xx whose body would not parse or decode.
+    BodyError,
+}
+
+impl CopyOutcome {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            CopyOutcome::Success => "success",
+            CopyOutcome::HttpError => "http_error",
+            CopyOutcome::Timeout => "timeout",
+            CopyOutcome::Superseded => "superseded",
+            CopyOutcome::Cancelled => "cancelled",
+            CopyOutcome::SelfInflicted429 => "self_inflicted_429",
+            CopyOutcome::BodyError => "body_error",
+        }
+    }
+}
+
+/// How one channel trial ended, as `router_trials_total{provider,outcome}`.
+/// One per channel the walk reached, whatever M is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialOutcomeLabel {
+    /// This channel produced the winning answer.
+    Won,
+    /// Every copy failed.
+    Failed,
+    /// Another channel won first.
+    Cancelled,
+}
+
+impl TrialOutcomeLabel {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrialOutcomeLabel::Won => "won",
+            TrialOutcomeLabel::Failed => "failed",
+            TrialOutcomeLabel::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What a cache read did, as `router_cache_lookups_total{result}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLookup {
+    /// Served from the cache.
+    Hit,
+    /// No entry under this key.
+    MissAbsent,
+    /// An entry existed and was past `ttl`.
+    MissExpired,
+    /// An entry existed but the caller named a different model.
+    MissModelMismatch,
+    /// An entry existed under an older `SCHEMA_VERSION`.
+    MissSchema,
+    /// `cache.enabled` is off, so no read happened.
+    Disabled,
+}
+
+impl CacheLookup {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            CacheLookup::Hit => "hit",
+            CacheLookup::MissAbsent => "miss_absent",
+            CacheLookup::MissExpired => "miss_expired",
+            CacheLookup::MissModelMismatch => "miss_model_mismatch",
+            CacheLookup::MissSchema => "miss_schema",
+            CacheLookup::Disabled => "disabled",
+        }
+    }
+}
+
+/// What a cache write did, as `router_cache_writes_total{result}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheWrite {
+    /// Written: absent, expired, or higher intelligence than what was there.
+    Stored,
+    /// A better answer was already stored.
+    SkippedLowerIntelligence,
+    /// A cancelled or stalled stream. A partial answer is a wrong answer.
+    SkippedPartialStream,
+    /// redb refused the write.
+    Error,
+}
+
+impl CacheWrite {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            CacheWrite::Stored => "stored",
+            CacheWrite::SkippedLowerIntelligence => "skipped_lower_intelligence",
+            CacheWrite::SkippedPartialStream => "skipped_partial_stream",
+            CacheWrite::Error => "error",
+        }
+    }
+}
+
+/// Why a channel call failed, as `router_errors_total{provider,class}`.
+///
+/// Deliberately not labelled by model: this answers "what is this provider
+/// doing to us", and provider times class is 14 times 13 rather than 222
+/// models times 13.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// `401`. The key is dead.
+    Unauthorized,
+    /// `403`. The key is alive and not allowed this.
+    Forbidden,
+    /// `404`. The provider does not have this model.
+    NotFound,
+    /// `429` the provider imposed.
+    RateLimited,
+    /// `429` this router's own sibling copy caused.
+    SelfInflicted429,
+    /// `402`, `413`, or any other 4xx.
+    OtherClientError,
+    /// Any 5xx.
+    ServerError,
+    /// Passed `request_timeout`.
+    Timeout,
+    /// The connection never opened.
+    Connect,
+    /// A stream went quiet for `stream_stall_timeout`.
+    StreamStalled,
+    /// A 2xx whose body was not JSON.
+    BodyUnparseable,
+    /// A 2xx whose JSON did not decode to a response.
+    BodyUndecodable,
+    /// A 2xx with an empty content block, or anything else.
+    Other,
+}
+
+impl ErrorClass {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ErrorClass::Unauthorized => "unauthorized",
+            ErrorClass::Forbidden => "forbidden",
+            ErrorClass::NotFound => "not_found",
+            ErrorClass::RateLimited => "rate_limited",
+            ErrorClass::SelfInflicted429 => "self_inflicted_429",
+            ErrorClass::OtherClientError => "other_client_error",
+            ErrorClass::ServerError => "server_error",
+            ErrorClass::Timeout => "timeout",
+            ErrorClass::Connect => "connect",
+            ErrorClass::StreamStalled => "stream_stalled",
+            ErrorClass::BodyUnparseable => "body_unparseable",
+            ErrorClass::BodyUndecodable => "body_undecodable",
+            ErrorClass::Other => "other",
+        }
+    }
+
+    /// The class an HTTP status falls into. `self_inflicted` separates a
+    /// `429` the router caused from one the provider imposed, because only
+    /// the second is the provider telling us to slow down.
+    pub fn from_status(status: u16, self_inflicted: bool) -> Self {
+        match status {
+            401 => ErrorClass::Unauthorized,
+            403 => ErrorClass::Forbidden,
+            404 => ErrorClass::NotFound,
+            429 if self_inflicted => ErrorClass::SelfInflicted429,
+            429 => ErrorClass::RateLimited,
+            400..=499 => ErrorClass::OtherClientError,
+            500..=599 => ErrorClass::ServerError,
+            _ => ErrorClass::Other,
+        }
+    }
+}
+
+/// Which health table a backoff entry belongs to, as the `kind` label on
+/// `router_backoff_entries_total`, `router_backoff_resets_total` and
+/// `router_in_backoff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffKind {
+    /// One provider, model and key.
+    Channel,
+    /// One provider and key, so one dead key does not disable its siblings.
+    ProviderKey,
+    /// The whole provider.
+    Provider,
+}
+
+impl BackoffKind {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            BackoffKind::Channel => "channel",
+            BackoffKind::ProviderKey => "provider_key",
+            BackoffKind::Provider => "provider",
+        }
+    }
+}
+
+/// Which half of the usage block a token count came from, as the `kind` label
+/// on `router_tokens_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// Sent to the provider.
+    Prompt,
+    /// Returned as content.
+    Completion,
+    /// Returned as reasoning. Billed, usually not shown, and on the live run
+    /// it was 12 times the content tokens, so it is counted apart.
+    Reasoning,
+}
+
+impl TokenKind {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            TokenKind::Prompt => "prompt",
+            TokenKind::Completion => "completion",
+            TokenKind::Reasoning => "reasoning",
+        }
+    }
+}
+
 /// Histogram buckets for `router_latency_seconds`, in seconds.
 ///
 /// One metric name carries both stages, so Prometheus forces one bucket set
@@ -95,6 +335,51 @@ const LATENCY_BUCKETS: &[f64] = &[
     60.0, 120.0, 300.0, 600.0, 1800.0,
 ];
 
+/// Histogram buckets for `router_ttft_seconds`, in seconds.
+///
+/// Same shape as `LATENCY_BUCKETS`: on the live run the median time to first
+/// token was 730 seconds, so the top end has to reach half an hour, and a
+/// cache hit lands at 11 milliseconds, so the bottom end has to resolve
+/// single-digit milliseconds.
+const TTFT_BUCKETS: &[f64] = LATENCY_BUCKETS;
+
+/// Histogram buckets for `router_copy_latency_seconds`, in seconds.
+///
+/// One copy of one channel call. A failing nvidia call took 40 to 120
+/// seconds on the live run, which is the number this histogram exists to
+/// show, so the buckets are dense through that range.
+const COPY_LATENCY_BUCKETS: &[f64] = &[
+    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 300.0,
+    600.0, 1800.0, 3600.0,
+];
+
+/// Histogram buckets for `router_trials_per_request` and
+/// `router_copies_per_request`.
+///
+/// The live run needed 8 to 11 channel trials per request. The design's worst
+/// case walks every channel, which was 4,807 on the last live config, so the
+/// top bucket has to be above that.
+const WALK_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+];
+
+/// Histogram buckets for `router_output_tokens_per_second`.
+const TPS_BUCKETS: &[f64] = &[
+    0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0,
+];
+
+/// Histogram buckets for `router_cache_age_seconds`. The ttl is 7 days, so
+/// the top bucket sits just past it.
+const CACHE_AGE_BUCKETS: &[f64] = &[
+    1.0, 10.0, 60.0, 300.0, 3600.0, 21600.0, 86400.0, 259200.0, 604800.0,
+];
+
+/// Histogram buckets for `router_backoff_seconds`. The backoff doubles from
+/// 1 second to the 1 hour cap, so the buckets follow the same doubling.
+const BACKOFF_BUCKETS: &[f64] = &[
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 3600.0,
+];
+
 /// Every outcome, so the counters can be seeded at zero.
 const ALL_OUTCOMES: &[Outcome] = &[
     Outcome::HitCache,
@@ -104,6 +389,39 @@ const ALL_OUTCOMES: &[Outcome] = &[
     Outcome::NotAdmitted,
     Outcome::NoChannel,
 ];
+
+/// Every cache lookup result, so the counters can be seeded at zero.
+const ALL_CACHE_LOOKUPS: &[CacheLookup] = &[
+    CacheLookup::Hit,
+    CacheLookup::MissAbsent,
+    CacheLookup::MissExpired,
+    CacheLookup::MissModelMismatch,
+    CacheLookup::MissSchema,
+    CacheLookup::Disabled,
+];
+
+/// Every cache write result, so the counters can be seeded at zero.
+const ALL_CACHE_WRITES: &[CacheWrite] = &[
+    CacheWrite::Stored,
+    CacheWrite::SkippedLowerIntelligence,
+    CacheWrite::SkippedPartialStream,
+    CacheWrite::Error,
+];
+
+/// Every backoff kind, so the counters and gauges can be seeded at zero.
+const ALL_BACKOFF_KINDS: &[BackoffKind] = &[
+    BackoffKind::Channel,
+    BackoffKind::ProviderKey,
+    BackoffKind::Provider,
+];
+
+/// The two values of the `state` label on `router_channels_total`.
+const CHANNEL_STATES: &[&str] = &["eligible", "in_backoff"];
+
+/// Copy indexes that get their own series on `router_hedge_wins_total`.
+/// Anything higher collapses into the last one, so M can be raised without
+/// the label set growing with it.
+const HEDGE_INDEX_LABELS: &[&str] = &["0", "1", "2", "3+"];
 
 /// Label value for the part of `router_latency_seconds` spent waiting on the
 /// winning channel.
@@ -129,13 +447,22 @@ impl Metrics {
     /// Builds the Prometheus recorder and describes every metric, so the
     /// names appear on `/metrics` from the first scrape even at zero.
     pub fn new() -> crate::Result<Self> {
-        let recorder = PrometheusBuilder::new()
-            .set_buckets_for_metric(
-                Matcher::Full("router_latency_seconds".to_owned()),
-                LATENCY_BUCKETS,
-            )
-            .map_err(|e| crate::RouterError::Config(format!("metrics buckets: {e}")))?
-            .build_recorder();
+        let mut builder = PrometheusBuilder::new();
+        for (name, buckets) in [
+            ("router_latency_seconds", LATENCY_BUCKETS),
+            ("router_ttft_seconds", TTFT_BUCKETS),
+            ("router_copy_latency_seconds", COPY_LATENCY_BUCKETS),
+            ("router_trials_per_request", WALK_BUCKETS),
+            ("router_copies_per_request", WALK_BUCKETS),
+            ("router_output_tokens_per_second", TPS_BUCKETS),
+            ("router_cache_age_seconds", CACHE_AGE_BUCKETS),
+            ("router_backoff_seconds", BACKOFF_BUCKETS),
+        ] {
+            builder = builder
+                .set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+                .map_err(|e| crate::RouterError::Config(format!("metrics buckets {name}: {e}")))?;
+        }
+        let recorder = builder.build_recorder();
         let metrics = Self {
             handle: recorder.handle(),
             recorder: Arc::new(recorder),
@@ -179,6 +506,227 @@ impl Metrics {
                 "outcome" => outcome.label(),
             )
             .increment(1);
+        });
+    }
+
+    /// One hedged copy of one channel call finished.
+    /// `router_copies_total{provider,outcome}`.
+    ///
+    /// Called M times per channel trial, against [`record_attempt`]'s once.
+    /// `Superseded` is the one that was missing: before this, a copy whose
+    /// sibling won was dropped without a trace, so no counter could say
+    /// whether hedging ever won a race it would otherwise have lost.
+    ///
+    /// [`record_attempt`]: Self::record_attempt
+    pub fn record_copy(&self, provider: &str, outcome: CopyOutcome) {
+        self.on_recorder(|| {
+            counter!(
+                "router_copies_total",
+                "provider" => provider.to_owned(),
+                "outcome" => outcome.label(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// How long one copy ran before it won or failed.
+    /// `router_copy_latency_seconds{outcome}`.
+    ///
+    /// The number that explains a slow walk. On the live run the failures
+    /// were taking 40 to 120 seconds each, so 9 channels in sequence at N=2
+    /// came to 12 minutes, and nothing on `/metrics` said so.
+    pub fn record_copy_latency(&self, outcome: CopyOutcome, elapsed: Duration) {
+        self.on_recorder(|| {
+            histogram!("router_copy_latency_seconds", "outcome" => outcome.label())
+                .record(elapsed.as_secs_f64());
+        });
+    }
+
+    /// Which copy of a channel trial produced the answer.
+    /// `router_hedge_wins_total{provider,copy}`.
+    ///
+    /// `copy` is the index the copy was fired at, so `0` is the first and
+    /// anything above it is a hedge that beat it. Wins on `0` only means M is
+    /// costing a second call per channel and buying nothing.
+    pub fn record_hedge_win(&self, provider: &str, copy_index: usize) {
+        let label = HEDGE_INDEX_LABELS
+            .get(copy_index)
+            .copied()
+            .unwrap_or_else(|| HEDGE_INDEX_LABELS[HEDGE_INDEX_LABELS.len() - 1]);
+        self.on_recorder(|| {
+            counter!(
+                "router_hedge_wins_total",
+                "provider" => provider.to_owned(),
+                "copy" => label,
+            )
+            .increment(1);
+        });
+    }
+
+    /// One channel trial finished. `router_trials_total{provider,outcome}`.
+    /// One per channel the walk reached, whatever M is.
+    pub fn record_trial(&self, provider: &str, outcome: TrialOutcomeLabel) {
+        self.on_recorder(|| {
+            counter!(
+                "router_trials_total",
+                "provider" => provider.to_owned(),
+                "outcome" => outcome.label(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// How deep one client request had to walk.
+    /// `router_trials_per_request` and `router_copies_per_request`.
+    ///
+    /// The gap between the two is what M cost. The live run recorded 9.2
+    /// trials and 18.4 copies per request, which is the whole of M=2's
+    /// expense sitting next to a hedge-win count of zero on copy 1.
+    pub fn record_walk(&self, trials: u32, copies: u32) {
+        self.on_recorder(|| {
+            histogram!("router_trials_per_request").record(f64::from(trials));
+            histogram!("router_copies_per_request").record(f64::from(copies));
+        });
+    }
+
+    /// Channel trials in flight right now. `router_trials_inflight`.
+    ///
+    /// Across every client request at once, not per request: one `Racer` is
+    /// shared by all of them, so a per-walk reading would have each walk
+    /// publishing its own N over the others and the gauge would hold its last
+    /// non-zero value forever once traffic stopped. Against `race_width`
+    /// times the concurrent requests, this is what says whether N binds.
+    pub fn set_trials_inflight(&self, trials: u64) {
+        self.on_recorder(|| gauge!("router_trials_inflight").set(trials as f64));
+    }
+
+    /// One cache read. `router_cache_lookups_total{result}`.
+    ///
+    /// The miss reasons matter more than the hit rate: a cache missing on
+    /// `miss_model_mismatch` all day is a client naming models, not a cache
+    /// that is too small.
+    pub fn record_cache_lookup(&self, result: CacheLookup) {
+        self.on_recorder(|| {
+            counter!("router_cache_lookups_total", "result" => result.label()).increment(1);
+        });
+    }
+
+    /// How old the entry a hit served was. `router_cache_age_seconds`.
+    pub fn record_cache_age(&self, age: Duration) {
+        self.on_recorder(|| {
+            histogram!("router_cache_age_seconds").record(age.as_secs_f64());
+        });
+    }
+
+    /// One cache write. `router_cache_writes_total{result}`.
+    pub fn record_cache_write(&self, result: CacheWrite) {
+        self.on_recorder(|| {
+            counter!("router_cache_writes_total", "result" => result.label()).increment(1);
+        });
+    }
+
+    /// `router_cache_bytes`, beside `router_cache_entries`. Entries alone
+    /// cannot say whether the cache is near `max_bytes`.
+    pub fn set_cache_bytes(&self, bytes: u64) {
+        self.on_recorder(|| gauge!("router_cache_bytes").set(bytes as f64));
+    }
+
+    /// Tokens a finished request moved. `router_tokens_total{provider,kind}`.
+    ///
+    /// Reasoning is counted apart from completion because it is billed and
+    /// usually not shown: the live run returned 42 content tokens against 529
+    /// total, and a throughput figure that mixes the two says nothing useful
+    /// about either.
+    pub fn record_tokens(&self, provider: &str, kind: TokenKind, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.on_recorder(|| {
+            counter!(
+                "router_tokens_total",
+                "provider" => provider.to_owned(),
+                "kind" => kind.label(),
+            )
+            .increment(count);
+        });
+    }
+
+    /// Output tokens per second for one finished request.
+    /// `router_output_tokens_per_second`.
+    pub fn record_output_rate(&self, tokens_per_second: f64) {
+        self.on_recorder(|| {
+            histogram!("router_output_tokens_per_second").record(tokens_per_second);
+        });
+    }
+
+    /// Time from accepting the client request to its first content token.
+    /// `router_ttft_seconds`.
+    ///
+    /// Separate from `router_latency_seconds` because the two diverge: a
+    /// streamed answer can take 13 minutes to start and 1.3 seconds to
+    /// finish, and only this metric shows which half the client waited on.
+    pub fn record_ttft(&self, elapsed: Duration) {
+        self.on_recorder(|| {
+            histogram!("router_ttft_seconds").record(elapsed.as_secs_f64());
+        });
+    }
+
+    /// Why one channel call failed. `router_errors_total{provider,class}`.
+    ///
+    /// Beside `router_attempts_total{outcome="http_error"}`, which says a
+    /// call failed but not why. A provider on `unauthorized` needs a new key;
+    /// the same provider on `rate_limited` needs fewer calls; on
+    /// `self_inflicted_429` it needs a smaller M. Three different jobs behind
+    /// one number before this.
+    pub fn record_error(&self, provider: &str, class: ErrorClass) {
+        self.on_recorder(|| {
+            counter!(
+                "router_errors_total",
+                "provider" => provider.to_owned(),
+                "class" => class.label(),
+            )
+            .increment(1);
+        });
+    }
+
+    /// A channel, key or provider went into backoff.
+    /// `router_backoff_entries_total{kind}`, plus the wait that was applied
+    /// on `router_backoff_seconds`.
+    pub fn record_backoff(&self, kind: BackoffKind, wait: Duration) {
+        self.on_recorder(|| {
+            counter!("router_backoff_entries_total", "kind" => kind.label()).increment(1);
+            histogram!("router_backoff_seconds").record(wait.as_secs_f64());
+        });
+    }
+
+    /// A channel, key or provider answered, so its counter reset to zero.
+    /// `router_backoff_resets_total{kind}`.
+    ///
+    /// Against `router_backoff_entries_total` this is the churn rate. Entries
+    /// climbing with resets flat is a list going dead; the two climbing
+    /// together is a provider flapping.
+    pub fn record_backoff_reset(&self, kind: BackoffKind) {
+        self.on_recorder(|| {
+            counter!("router_backoff_resets_total", "kind" => kind.label()).increment(1);
+        });
+    }
+
+    /// How many entries of each kind are in backoff right now.
+    /// `router_in_backoff{kind}`.
+    pub fn set_in_backoff(&self, kind: BackoffKind, count: u64) {
+        self.on_recorder(|| {
+            gauge!("router_in_backoff", "kind" => kind.label()).set(count as f64);
+        });
+    }
+
+    /// The channel list split by state. `router_channels_total{state}`.
+    ///
+    /// `eligible` falling while the total holds is the list going dead under
+    /// backoff, which is the shape that preceded a `504`.
+    pub fn set_channel_states(&self, eligible: u64, in_backoff: u64) {
+        self.on_recorder(|| {
+            gauge!("router_channels_total", "state" => "eligible").set(eligible as f64);
+            gauge!("router_channels_total", "state" => "in_backoff").set(in_backoff as f64);
         });
     }
 
@@ -235,6 +783,91 @@ fn describe_everything() {
         "router_cache_entries",
         "Entries currently in the response cache."
     );
+    describe_counter!(
+        "router_copies_total",
+        "Hedged copies of channel calls finished, by provider and outcome. M per trial."
+    );
+    describe_histogram!(
+        "router_copy_latency_seconds",
+        Unit::Seconds,
+        "How long one copy of a channel call ran before it won or failed."
+    );
+    describe_counter!(
+        "router_hedge_wins_total",
+        "Channel trials won, by provider and the index of the copy that won."
+    );
+    describe_counter!(
+        "router_trials_total",
+        "Channel trials finished, by provider and outcome. One per channel, whatever M is."
+    );
+    describe_histogram!(
+        "router_trials_per_request",
+        "Channel trials one client request needed."
+    );
+    describe_histogram!(
+        "router_copies_per_request",
+        "Hedged copies one client request fired."
+    );
+    describe_gauge!(
+        "router_trials_inflight",
+        "Channel trials running right now, across every client request at once."
+    );
+    describe_counter!(
+        "router_cache_lookups_total",
+        "Cache reads, by result: a hit, or the reason it missed."
+    );
+    describe_histogram!(
+        "router_cache_age_seconds",
+        Unit::Seconds,
+        "Age of the entry a cache hit served."
+    );
+    describe_counter!(
+        "router_cache_writes_total",
+        "Cache writes, by result: stored, or the reason it was not."
+    );
+    describe_gauge!(
+        "router_cache_bytes",
+        Unit::Bytes,
+        "Bytes the response cache holds, to watch against cache.max_bytes."
+    );
+    describe_counter!(
+        "router_tokens_total",
+        "Tokens moved by finished requests, by provider and kind."
+    );
+    describe_histogram!(
+        "router_output_tokens_per_second",
+        "Output tokens per second for one finished request."
+    );
+    describe_histogram!(
+        "router_ttft_seconds",
+        Unit::Seconds,
+        "Time from accepting a client request to its first content token."
+    );
+    describe_counter!(
+        "router_errors_total",
+        "Failed channel calls, by provider and the class of the failure."
+    );
+    describe_counter!(
+        "router_backoff_entries_total",
+        "Channels, keys and providers put into backoff."
+    );
+    describe_counter!(
+        "router_backoff_resets_total",
+        "Channels, keys and providers whose retry counter reset on a success."
+    );
+    describe_histogram!(
+        "router_backoff_seconds",
+        Unit::Seconds,
+        "The wait applied when something went into backoff."
+    );
+    describe_gauge!(
+        "router_in_backoff",
+        "Channels, keys and providers in backoff right now."
+    );
+    describe_gauge!(
+        "router_channels_total",
+        "The channel list split into eligible and in backoff."
+    );
 }
 
 /// Touches every series whose labels are known up front, so an alert on a
@@ -245,8 +878,24 @@ fn seed_zero() {
     for outcome in ALL_OUTCOMES {
         counter!("router_requests_total", "outcome" => outcome.label()).increment(0);
     }
+    for result in ALL_CACHE_LOOKUPS {
+        counter!("router_cache_lookups_total", "result" => result.label()).increment(0);
+    }
+    for result in ALL_CACHE_WRITES {
+        counter!("router_cache_writes_total", "result" => result.label()).increment(0);
+    }
+    for kind in ALL_BACKOFF_KINDS {
+        counter!("router_backoff_entries_total", "kind" => kind.label()).increment(0);
+        counter!("router_backoff_resets_total", "kind" => kind.label()).increment(0);
+        gauge!("router_in_backoff", "kind" => kind.label()).set(0.0);
+    }
+    for state in CHANNEL_STATES {
+        gauge!("router_channels_total", "state" => *state).set(0.0);
+    }
     gauge!("router_rss_bytes").set(0.0);
     gauge!("router_cache_entries").set(0.0);
+    gauge!("router_cache_bytes").set(0.0);
+    gauge!("router_trials_inflight").set(0.0);
 }
 
 #[cfg(test)]

@@ -104,6 +104,7 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
             db,
             router.health_poll.retry_base,
             router.health_poll.backoff_max,
+            llmrouter::metrics::Metrics::new().expect("the recorder builds"),
         )
         .expect("the health table opens"),
     );

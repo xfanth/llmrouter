@@ -130,6 +130,7 @@ impl Harness {
                 db,
                 config.router.health_poll.retry_base,
                 config.router.health_poll.backoff_max,
+                llmrouter::metrics::Metrics::new().expect("the recorder builds"),
             )
             .expect("the health table opens"),
         );
@@ -651,8 +652,13 @@ async fn the_health_table_survives_a_restart_through_redb() {
     };
 
     let db = Arc::new(redb::Database::create(dir.path().join("state.redb")).expect("redb reopens"));
-    let reloaded = HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(3_600))
-        .expect("the health table loads");
+    let reloaded = HealthTable::open(
+        db,
+        Duration::from_secs(1),
+        Duration::from_secs(3_600),
+        llmrouter::metrics::Metrics::new().expect("the recorder builds"),
+    )
+    .expect("the health table loads");
 
     assert_eq!(
         reloaded.get(&HealthKey::Channel(expired_id)),

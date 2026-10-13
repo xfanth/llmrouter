@@ -116,6 +116,7 @@ impl Harness {
                 db,
                 config.router.health_poll.retry_base,
                 config.router.health_poll.backoff_max,
+                llmrouter::metrics::Metrics::new().expect("the recorder builds"),
             )
             .expect("the health table opens"),
         );

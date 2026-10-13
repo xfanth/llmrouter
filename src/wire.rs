@@ -58,6 +58,11 @@ pub type NeutralRequest = switchyard_translation::llm::LlmRequest;
 /// The neutral aggregated response.
 pub type NeutralResponse = switchyard_translation::llm::AggLlmResponse;
 
+/// The token counts off a neutral response. Named here so the metrics call
+/// sites can hold the usage after the response itself has been handed on to
+/// be encoded, without any other module naming the translation crate.
+pub type NeutralUsage = switchyard_translation::llm::Usage;
+
 /// Anything the translation layer can refuse.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {

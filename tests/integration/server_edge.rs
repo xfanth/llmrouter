@@ -152,13 +152,20 @@ impl Edge {
                 Arc::clone(&db),
                 router.health_poll.retry_base,
                 router.health_poll.backoff_max,
+                llmrouter::metrics::Metrics::new().expect("the recorder builds"),
             )
             .expect("the health table opens"),
         );
-        let cache = router
-            .cache
-            .enabled
-            .then(|| Arc::new(Cache::open(db, &router.cache).expect("the cache opens")));
+        let cache = router.cache.enabled.then(|| {
+            Arc::new(
+                Cache::open(
+                    db,
+                    &router.cache,
+                    llmrouter::metrics::Metrics::new().expect("the recorder builds"),
+                )
+                .expect("the cache opens"),
+            )
+        });
 
         let catalogue = Arc::new(Catalogue::new());
         catalogue.replace(channels);

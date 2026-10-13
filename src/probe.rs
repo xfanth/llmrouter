@@ -981,6 +981,7 @@ mod tests {
                 db,
                 router.health_poll.retry_base,
                 router.health_poll.backoff_max,
+                crate::metrics::Metrics::new().expect("the recorder builds"),
             )
             .expect("health table opens"),
         );
@@ -1021,6 +1022,7 @@ mod tests {
                 db,
                 router.health_poll.retry_base,
                 router.health_poll.backoff_max,
+                crate::metrics::Metrics::new().expect("the recorder builds"),
             )
             .expect("health table opens"),
         );

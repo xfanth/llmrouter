@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalogue::ChannelId;
 use crate::config::CacheConfig;
+use crate::metrics::{CacheLookup, CacheWrite, Metrics};
 use crate::wire::NeutralRequest;
 use crate::RouterError;
 
@@ -164,24 +165,33 @@ pub struct Cache {
     /// file has actually grown again, which is the backstop DESIGN.md asks
     /// for rather than a scan on every write.
     evicted_at: AtomicU64,
+    metrics: Metrics,
 }
 
 impl Cache {
     /// Opens the `responses` table in `db`.
-    pub fn open(db: Arc<Database>, config: &CacheConfig) -> crate::Result<Self> {
+    pub fn open(db: Arc<Database>, config: &CacheConfig, metrics: Metrics) -> crate::Result<Self> {
         // Creating the table once here means every later read transaction
         // finds it, rather than failing on a cold database.
         let txn = db.begin_write().map_err(|e| store("begin write", e))?;
         txn.open_table(RESPONSES)
             .map_err(|e| store("opening the responses table", e))?;
         txn.commit().map_err(|e| store("commit", e))?;
-        Ok(Self {
+        let cache = Self {
             db,
             ttl: config.ttl,
             max_bytes: config.max_bytes,
             path: config.path.clone(),
             evicted_at: AtomicU64::new(0),
-        })
+            metrics,
+        };
+        // Seed the size gauge at startup. Without this the gauge reads zero
+        // until the first write, which on a mostly-reading router could be
+        // hours and looks exactly like an empty cache.
+        if let Ok(size) = cache.size_bytes() {
+            cache.metrics.set_cache_bytes(size);
+        }
+        Ok(cache)
     }
 
     /// Reads an entry.
@@ -196,24 +206,56 @@ impl Cache {
         named_model: Option<&str>,
         now_unix: u64,
     ) -> crate::Result<Option<CacheEntry>> {
+        let (entry, outcome) = self.lookup(key, named_model, now_unix)?;
+        self.metrics.record_cache_lookup(outcome);
+        if let Some(entry) = &entry {
+            // The age of what was served, not of the newest write. A rising
+            // age on hits means the store is going stale rather than turning
+            // over, which the hit rate on its own cannot show.
+            self.metrics.record_cache_age(Duration::from_secs(
+                now_unix.saturating_sub(entry.created_at),
+            ));
+        }
+        Ok(entry)
+    }
+
+    /// The read itself, paired with the reason it ended the way it did.
+    ///
+    /// Split out from [`Cache::get`] so there is exactly one place the result
+    /// is labelled, rather than a counter bumped on each early return and the
+    /// chance of two or none. A redb or decode failure has no lookup label:
+    /// `CacheLookup` has no error variant, and a read that failed is counted
+    /// by the request outcome instead.
+    fn lookup(
+        &self,
+        key: CacheKey,
+        named_model: Option<&str>,
+        now_unix: u64,
+    ) -> crate::Result<(Option<CacheEntry>, CacheLookup)> {
         let txn = self.db.begin_read().map_err(|e| store("begin read", e))?;
         let table = txn
             .open_table(RESPONSES)
             .map_err(|e| store("opening the responses table", e))?;
         let Some(raw) = table.get(&key.0).map_err(|e| store("cache read", e))? else {
-            return Ok(None);
+            return Ok((None, CacheLookup::MissAbsent));
         };
         let entry = decode(raw.value())?;
+        // The schema check comes first so a bump of SCHEMA_VERSION reads as
+        // what it is, a deliberate invalidation, rather than the whole cache
+        // appearing to expire at once.
+        if entry.schema_version != SCHEMA_VERSION {
+            return Ok((None, CacheLookup::MissSchema));
+        }
         if !self.is_fresh(&entry, now_unix) {
-            return Ok(None);
+            return Ok((None, CacheLookup::MissExpired));
         }
         // A caller naming a model is never served another model's answer.
         if let Some(wanted) = named_model {
             if !entry.model_id.eq_ignore_ascii_case(wanted) {
-                return Ok(None);
+                return Ok((None, CacheLookup::MissModelMismatch));
             }
         }
-        Ok(Some(entry))
+        Ok((Some(entry), CacheLookup::Hit))
     }
 
     /// True when the entry is on the current schema and inside the ttl.
@@ -228,12 +270,34 @@ impl Cache {
     /// Never called for a failure. Only a 2xx with non-empty content is
     /// written, the same test the race uses to pick a winner.
     pub fn put(&self, key: CacheKey, candidate: CacheEntry, now_unix: u64) -> crate::Result<bool> {
+        let result = self.put_inner(key, candidate, now_unix);
+        self.metrics.record_cache_write(match result {
+            Ok(true) => CacheWrite::Stored,
+            // The only way the write rule declines a complete candidate is on
+            // the intelligence comparison: absent and expired both write.
+            Ok(false) => CacheWrite::SkippedLowerIntelligence,
+            Err(_) => CacheWrite::Error,
+        });
+        result
+    }
+
+    /// The write itself. Wrapped by [`Cache::put`] so one write attempt counts
+    /// once however it ends, including the redb failures that leave early.
+    fn put_inner(
+        &self,
+        key: CacheKey,
+        candidate: CacheEntry,
+        now_unix: u64,
+    ) -> crate::Result<bool> {
         // Over the cap, free space once. redb allows one write transaction at
         // a time, so eviction has to finish before this one opens. The freed
         // pages are reused inside the same file, so a second eviction only
         // earns its keep once the file has grown past the size we last evicted
         // at.
         let size = self.size_bytes()?;
+        // The write path already pays for this stat to check the cap, so the
+        // gauge is free here. Nowhere else knows the size without a new one.
+        self.metrics.set_cache_bytes(size);
         if size > self.max_bytes && size > self.evicted_at.load(Ordering::Relaxed) {
             self.evict_oldest()?;
             self.evicted_at.store(size, Ordering::Relaxed);
@@ -285,7 +349,11 @@ impl Cache {
     ) -> crate::Result<bool> {
         match end {
             // Nothing is read, nothing is compared, no transaction opens.
-            StreamEnd::Cancelled => Ok(false),
+            StreamEnd::Cancelled => {
+                self.metrics
+                    .record_cache_write(CacheWrite::SkippedPartialStream);
+                Ok(false)
+            }
             StreamEnd::Complete => self.put(key, candidate, now_unix),
         }
     }
@@ -378,6 +446,10 @@ mod tests {
     /// A cache on its own file in a throwaway directory, removed on drop.
     struct TempCache {
         cache: Cache,
+        /// The same `Metrics` the cache holds. A `Metrics` is local to itself
+        /// rather than a process-wide recorder, so a test can read back only
+        /// what its own cache recorded.
+        metrics: Metrics,
         _dir: tempfile::TempDir,
     }
 
@@ -397,8 +469,21 @@ mod tests {
             ..CacheConfig::default()
         };
         let db = Arc::new(open_database(&config).expect("create"));
-        let cache = Cache::open(db, &config).expect("open");
-        TempCache { cache, _dir: dir }
+        let metrics = Metrics::new().expect("metrics");
+        let cache = Cache::open(db, &config, metrics.clone()).expect("open");
+        TempCache {
+            cache,
+            metrics,
+            _dir: dir,
+        }
+    }
+
+    /// True when the rendered exposition carries `name{label="value"}` at
+    /// exactly `want`. Counters that never fired render at zero, so this
+    /// distinguishes "not recorded" from "recorded once".
+    fn counter_is(rendered: &str, name: &str, label: &str, value: &str, want: u64) -> bool {
+        let needle = format!("{name}{{{label}=\"{value}\"}} {want}");
+        rendered.lines().any(|line| line.trim() == needle)
     }
 
     fn key(byte: u8) -> CacheKey {
@@ -430,7 +515,9 @@ mod tests {
             ..CacheConfig::default()
         };
         let db = Arc::new(open_database(&config).expect("create"));
-        let cache = Arc::new(Cache::open(Arc::clone(&db), &config).expect("open"));
+        let cache = Arc::new(
+            Cache::open(Arc::clone(&db), &config, Metrics::new().expect("metrics")).expect("open"),
+        );
 
         // Take redb's one write lock from outside the runtime and sit on it
         // until told to let go. The holder says when it has the lock, so no
@@ -772,6 +859,7 @@ mod tests {
             max_bytes: 0,
             path: c.path.clone(),
             evicted_at: AtomicU64::new(0),
+            metrics: c.metrics.clone(),
         };
         // The first write frees space: the oldest tenth goes, the entry lands.
         assert!(over.put(key(100), entry("m", 1, now), now).unwrap());
@@ -786,5 +874,215 @@ mod tests {
             over.entry_count().unwrap() >= 15,
             "eviction repeated on writes that did not grow the file"
         );
+    }
+
+    /// The value of an unlabelled sample, such as a gauge or a histogram's
+    /// `_count`. Pass the full series name, so `_bucket` lines cannot match.
+    fn bare_value(rendered: &str, name: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(name)?.trim().parse().ok())
+    }
+
+    #[test]
+    fn a_hit_is_counted_as_a_hit_and_records_the_age_of_what_it_served() {
+        let c = temp_cache("m-hit", u64::MAX);
+        let stored_at = 10 * DAY;
+        c.put(key(1), entry("glm-5.3", 50, stored_at), stored_at)
+            .unwrap();
+
+        let served_at = stored_at + 3_600;
+        assert!(c.get(key(1), None, served_at).unwrap().is_some());
+
+        let s = c.metrics.render();
+        assert!(counter_is(
+            &s,
+            "router_cache_lookups_total",
+            "result",
+            "hit",
+            1
+        ));
+        assert_eq!(bare_value(&s, "router_cache_age_seconds_count"), Some(1.0));
+        assert_eq!(bare_value(&s, "router_cache_age_seconds_sum"), Some(3600.0));
+    }
+
+    /// The four misses the code can actually produce, each on its own cache so
+    /// one test's counters cannot be read as another's.
+    #[test]
+    fn each_miss_reason_gets_its_own_label() {
+        let absent = temp_cache("m-absent", u64::MAX);
+        assert!(absent.get(key(1), None, 1_000).unwrap().is_none());
+        assert!(counter_is(
+            &absent.metrics.render(),
+            "router_cache_lookups_total",
+            "result",
+            "miss_absent",
+            1
+        ));
+
+        let expired = temp_cache("m-expired", u64::MAX);
+        let stored_at = 1_000_000;
+        expired
+            .put(key(1), entry("glm-5.3", 50, stored_at), stored_at)
+            .unwrap();
+        assert!(expired
+            .get(key(1), None, stored_at + 7 * DAY)
+            .unwrap()
+            .is_none());
+        assert!(counter_is(
+            &expired.metrics.render(),
+            "router_cache_lookups_total",
+            "result",
+            "miss_expired",
+            1
+        ));
+
+        let mismatch = temp_cache("m-mismatch", u64::MAX);
+        let now = 10 * DAY;
+        mismatch
+            .put(key(1), entry("glm-5.3", 50, now), now)
+            .unwrap();
+        assert!(mismatch
+            .get(key(1), Some("claude-fable-5-1"), now)
+            .unwrap()
+            .is_none());
+        assert!(counter_is(
+            &mismatch.metrics.render(),
+            "router_cache_lookups_total",
+            "result",
+            "miss_model_mismatch",
+            1
+        ));
+
+        // An entry on a retired schema reads as a deliberate invalidation, not
+        // as the whole cache expiring at once.
+        let schema = temp_cache("m-schema", u64::MAX);
+        let mut old = entry("glm-5.3", 50, now);
+        old.schema_version = SCHEMA_VERSION.wrapping_sub(1);
+        schema.put(key(1), old, now).unwrap();
+        assert!(schema.get(key(1), None, now).unwrap().is_none());
+        assert!(counter_is(
+            &schema.metrics.render(),
+            "router_cache_lookups_total",
+            "result",
+            "miss_schema",
+            1
+        ));
+    }
+
+    /// A miss records no age: an age sample is only meaningful for an entry
+    /// that was actually served. A histogram nothing has recorded into renders
+    /// no samples at all, so the count line is absent rather than zero.
+    #[test]
+    fn a_miss_records_no_age() {
+        let c = temp_cache("m-miss-age", u64::MAX);
+        assert!(c.get(key(1), None, 1_000).unwrap().is_none());
+        assert_eq!(
+            bare_value(&c.metrics.render(), "router_cache_age_seconds_count"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stored_write_is_counted_and_sets_the_size_gauge() {
+        let c = temp_cache("m-store", u64::MAX);
+        let now = 10 * DAY;
+        assert!(c.put(key(1), entry("glm-5.3", 50, now), now).unwrap());
+
+        let s = c.metrics.render();
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "stored",
+            1
+        ));
+        assert!(bare_value(&s, "router_cache_bytes").unwrap() > 0.0);
+    }
+
+    #[test]
+    fn a_write_that_loses_the_intelligence_comparison_is_counted_as_skipped() {
+        let c = temp_cache("m-skip-intelligence", u64::MAX);
+        let now = 10 * DAY;
+        assert!(c.put(key(1), entry("glm-5.3", 50, now), now).unwrap());
+        assert!(!c.put(key(1), entry("tiny", 10, now), now).unwrap());
+
+        let s = c.metrics.render();
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "skipped_lower_intelligence",
+            1
+        ));
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "stored",
+            1
+        ));
+    }
+
+    /// A cancelled stream is its own write reason. Counting it as a lost
+    /// intelligence comparison would hide the difference between a cache that
+    /// keeps the better answer and one that is cancelling every stream.
+    #[test]
+    fn a_cancelled_stream_is_counted_as_a_partial_stream_not_as_a_lost_comparison() {
+        let c = temp_cache("m-skip-stream", u64::MAX);
+        let now = 10 * DAY;
+        assert!(!c
+            .put_stream(key(1), entry("glm-5.3", 90, now), StreamEnd::Cancelled, now)
+            .unwrap());
+
+        let s = c.metrics.render();
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "skipped_partial_stream",
+            1
+        ));
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "skipped_lower_intelligence",
+            0
+        ));
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "stored",
+            0
+        ));
+    }
+
+    /// A complete stream goes through `put`, so it must count once as an
+    /// ordinary write rather than twice or as a stream-specific one.
+    #[test]
+    fn a_complete_stream_counts_once_as_an_ordinary_write() {
+        let c = temp_cache("m-stream-complete", u64::MAX);
+        let now = 10 * DAY;
+        assert!(c
+            .put_stream(key(1), entry("glm-5.3", 50, now), StreamEnd::Complete, now)
+            .unwrap());
+
+        let s = c.metrics.render();
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "stored",
+            1
+        ));
+        assert!(counter_is(
+            &s,
+            "router_cache_writes_total",
+            "result",
+            "skipped_partial_stream",
+            0
+        ));
     }
 }

@@ -42,7 +42,7 @@ use crate::cache::{Cache, CacheEntry};
 use crate::catalogue::{Catalogue, ChannelFilter};
 use crate::config::{Config, RouterConfig};
 use crate::health::HealthTable;
-use crate::metrics::{Metrics, Outcome};
+use crate::metrics::{Metrics, Outcome, TokenKind};
 use crate::race::{RaceInput, RaceOutcome, Racer};
 use crate::wire::{EventStream, Format};
 
@@ -249,6 +249,38 @@ pub async fn healthz(state: axum::extract::State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// Tokens and the output rate for one finished request.
+///
+/// Reasoning is counted apart from completion because it is billed and
+/// usually never shown. On the first live run a 42 token answer carried 487
+/// reasoning tokens with it, so a single "completion" figure would have
+/// described neither the bill nor what the client actually read.
+///
+/// The rate uses completion tokens alone against the whole request, reasoning
+/// excluded, because that is the number a caller feels.
+fn record_usage(
+    metrics: &Metrics,
+    provider: &str,
+    usage: &crate::wire::NeutralUsage,
+    elapsed: Duration,
+) {
+    let input = usage.input_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    let reasoning = usage.reasoning_tokens.unwrap_or(0);
+
+    metrics.record_tokens(provider, TokenKind::Prompt, input);
+    metrics.record_tokens(provider, TokenKind::Completion, output);
+    metrics.record_tokens(provider, TokenKind::Reasoning, reasoning);
+
+    // A provider that reports no usage at all leaves the rate out rather than
+    // recording a zero: a zero would pull the histogram down and read as a
+    // slow answer, when in fact nothing was measured.
+    let seconds = elapsed.as_secs_f64();
+    if output > 0 && seconds > 0.0 {
+        metrics.record_output_rate(output as f64 / seconds);
+    }
+}
+
 /// `GET /metrics`. Prometheus text.
 pub async fn metrics_endpoint(state: axum::extract::State<Arc<AppState>>) -> Response {
     if let Ok(rss) = crate::admission::read_rss_bytes() {
@@ -258,7 +290,23 @@ pub async fn metrics_endpoint(state: axum::extract::State<Arc<AppState>>) -> Res
         if let Ok(entries) = cache.entry_count() {
             state.metrics.set_cache_entries(entries);
         }
+        // Read on the scrape rather than on the request path, for the same
+        // reason the entry count is: both walk redb's own metadata, and a
+        // scrape happens on Prometheus's schedule rather than the client's.
+        if let Ok(bytes) = cache.size_bytes() {
+            state.metrics.set_cache_bytes(bytes);
+        }
     }
+    // The same split `/healthz` reports, so the two pages cannot disagree.
+    // `eligible` is the channel's own view, which already folds in its key's
+    // and its provider's backoff, so it cannot be derived by counting health
+    // table rows.
+    let now = now_unix();
+    let channels = state.catalogue.snapshot();
+    let eligible = channels.iter().filter(|c| c.eligible(now)).count() as u64;
+    state
+        .metrics
+        .set_channel_states(eligible, channels.len() as u64 - eligible);
 
     (
         StatusCode::OK,
@@ -619,6 +667,11 @@ async fn handle_completion(
                     cached_response(&entry, client_format, named_model.as_deref(), wants_stream)
                 {
                     state.metrics.record_request(Outcome::HitCache);
+                    // A hit has its whole answer already, so the client's
+                    // first token and its last arrive together. Recorded all
+                    // the same: leaving hits out would make the time to first
+                    // token histogram describe only the slow half of traffic.
+                    state.metrics.record_ttft(started.elapsed());
                     tracing::info!(
                         outcome = "hit_cache",
                         model = %entry.model_id,
@@ -725,6 +778,9 @@ async fn handle_completion(
             let served = named_model
                 .clone()
                 .unwrap_or_else(|| winner.model_id.clone());
+            // Taken before the branch below, which hands the response on to
+            // be encoded and in the streaming case moves it outright.
+            let usage = winner.response.usage.clone();
             let reply = if wants_stream {
                 // The client asked for a stream and the answer arrived whole,
                 // which is what `streaming: false` in `router.yml` gives. The
@@ -761,6 +817,10 @@ async fn handle_completion(
             state
                 .metrics
                 .record_latency(winner.latency, total.saturating_sub(winner.latency));
+            // Nothing streamed, so the client's first token is its whole
+            // answer and the two timings are the same reading.
+            state.metrics.record_ttft(total);
+            record_usage(&state.metrics, &winner.provider, &usage, total);
             state.metrics.record_request(Outcome::Success);
             tracing::info!(
                 outcome = "success",
@@ -792,6 +852,11 @@ async fn handle_completion(
             // path below adds the time the provider spent generating after
             // that first token: it is upstream time, not time the router added.
             let mut upstream = latency;
+            // The first token's arrival, as a distance from the start of the
+            // request. `first_token_at` is a tokio Instant and `started` is a
+            // std one, so the two cannot be subtracted; going via each one's
+            // own elapsed time gets there without a clock conversion.
+            let first_token_elapsed = started.elapsed().saturating_sub(first_token_at.elapsed());
             let reply = if wants_stream {
                 // Forwarded as it arrives, with a copy taken on the way past.
                 // The copy only lands once the stream has run to the end, so a
@@ -813,6 +878,8 @@ async fn handle_completion(
                     _ => (chunks, None),
                 };
                 if let Some((cache, key, mut winner, complete)) = complete {
+                    let metrics = state.metrics.clone();
+                    let started_at = started;
                     tokio::spawn(async move {
                         let Ok(copy) = complete.await else {
                             return;
@@ -820,6 +887,18 @@ async fn handle_completion(
                         match crate::wire::aggregate_stream(copy).await {
                             Ok(response) => {
                                 winner.response = response;
+                                // The usage block only exists once the stream
+                                // has run to the end, and for a streaming
+                                // client that happens here rather than on the
+                                // request's own task. Counted from the copy
+                                // the cache already takes, so the tokens cost
+                                // no second fold.
+                                record_usage(
+                                    &metrics,
+                                    &winner.provider,
+                                    &winner.response.usage,
+                                    started_at.elapsed(),
+                                );
                                 write_cache(
                                     &cache,
                                     key,
@@ -854,6 +933,15 @@ async fn handle_completion(
                             response,
                             latency,
                         };
+                        // The fold on this path happens on the request's own
+                        // task, so the usage block is in hand here rather
+                        // than on the cache's spawned copy.
+                        record_usage(
+                            &state.metrics,
+                            &winner.provider,
+                            &winner.response.usage,
+                            started.elapsed(),
+                        );
                         if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
                             write_cache(
                                 cache,
@@ -882,6 +970,16 @@ async fn handle_completion(
                     state
                         .metrics
                         .record_latency(upstream, total.saturating_sub(upstream));
+                    // A streaming client saw its first token when the channel
+                    // produced it. A plain client saw nothing until the fold
+                    // was done, so for it the first token and the last are
+                    // the same moment. Recording one number for both would
+                    // make the histogram describe neither.
+                    state.metrics.record_ttft(if wants_stream {
+                        first_token_elapsed
+                    } else {
+                        total
+                    });
                     state.metrics.record_request(Outcome::Success);
                     tracing::info!(
                         outcome = "success",
@@ -2300,6 +2398,7 @@ mod tests {
                 db,
                 config.router.health_poll.retry_base,
                 config.router.health_poll.backoff_max,
+                crate::metrics::Metrics::new().expect("the recorder builds"),
             )
             .expect("the health table opens"),
         );

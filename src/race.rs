@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::catalogue::{Catalogue, Channel, ChannelFilter, ChannelId};
 use crate::config::{Config, HedgeStrategy};
 use crate::health::{HealthKey, HealthTable, StreamVerdict};
-use crate::metrics::{AttemptOutcome, Metrics};
+use crate::metrics::{AttemptOutcome, CopyOutcome, ErrorClass, Metrics, TrialOutcomeLabel};
 use crate::net::{LinkState, NetTest};
 use crate::server::PromptBody;
 use crate::upstream::{CallError, SharedBody, Upstream};
@@ -164,6 +164,11 @@ pub struct Racer {
     upstream: Upstream,
     net: NetTest,
     metrics: Arc<Metrics>,
+    /// Channel trials in flight across every walk at once, which is what
+    /// `router_trials_inflight` reports. One walk's own set is the wrong
+    /// number: the racer is shared, so a second client request would
+    /// overwrite the first's gauge with its own.
+    trials_inflight: AtomicU32,
 }
 
 impl Racer {
@@ -183,6 +188,7 @@ impl Racer {
             upstream,
             net,
             metrics,
+            trials_inflight: AtomicU32::new(0),
         }
     }
 
@@ -201,13 +207,36 @@ impl Racer {
     /// `cancel` is the client-disconnect token. Firing it tears down every
     /// channel call at once.
     pub async fn run(&self, input: RaceInput, cancel: CancellationToken) -> RaceOutcome {
+        let mut copies_fired: u32 = 0;
+        let outcome = self.walk(input, cancel, &mut copies_fired).await;
+        // The copy count divided by M is the trial count, because every trial
+        // fires M copies. The gap between the two is what M cost: the live run
+        // came back with 9.2 trials and 18.4 copies for each client request,
+        // and nothing on `/metrics` said so.
+        let per_trial = self.config.router.max_per_channel.max(1) as u32;
+        self.metrics
+            .record_walk(copies_fired / per_trial, copies_fired);
+        outcome
+    }
+
+    /// The walk itself.
+    ///
+    /// `copies` comes back carrying the count, so [`Racer::run`] records the
+    /// walk once on every way out of here, the client hanging up and a dead
+    /// link included. There are ten of those, and a counter written at each
+    /// one is a counter that will be missed off the eleventh.
+    async fn walk(
+        &self,
+        input: RaceInput,
+        cancel: CancellationToken,
+        attempts: &mut u32,
+    ) -> RaceOutcome {
         let snapshot = self.catalogue.snapshot();
         // A child token, so the race can tear its own calls down on a win
         // without touching the client's token.
         let race_cancel = cancel.child_token();
 
         let mut excluded: Excluded = HashSet::new();
-        let mut attempts: u32 = 0;
         let mut last_error: Option<String> = None;
         // Health moves owed by trials that failed before the network test
         // answered. They land only once the link is proven up, and are dropped
@@ -221,7 +250,7 @@ impl Racer {
             &snapshot,
             &input,
             &mut excluded,
-            &mut attempts,
+            attempts,
             &race_cancel,
         );
 
@@ -267,7 +296,7 @@ impl Racer {
 
                 else => {
                     let outcome =
-                        exhausted(net_check.as_mut(), net_done, attempts, last_error).await;
+                        exhausted(net_check.as_mut(), net_done, *attempts, last_error).await;
                     self.settle_held(&mut held, &outcome);
                     return outcome;
                 }
@@ -303,7 +332,7 @@ impl Racer {
                     return RaceOutcome::Buffered {
                         winner,
                         also_finished,
-                        attempts,
+                        attempts: *attempts,
                     };
                 }
                 TrialOutcome::WonStreaming(ready) => {
@@ -349,12 +378,13 @@ impl Racer {
                             &snapshot,
                             &input,
                             &mut excluded,
-                            &mut attempts,
+                            attempts,
                             &race_cancel,
                         );
                         if inflight.is_empty() {
                             let outcome =
-                                exhausted(net_check.as_mut(), net_done, attempts, last_error).await;
+                                exhausted(net_check.as_mut(), net_done, *attempts, last_error)
+                                    .await;
                             self.settle_held(&mut held, &outcome);
                             return outcome;
                         }
@@ -377,7 +407,7 @@ impl Racer {
                         Ok(winner) => {
                             return RaceOutcome::Streamed {
                                 winner: Box::new(winner),
-                                attempts,
+                                attempts: *attempts,
                             }
                         }
                         // The decoder refused the stream. Everything else is
@@ -385,7 +415,8 @@ impl Racer {
                         Err(error) => {
                             last_error = Some(error);
                             let outcome =
-                                exhausted(net_check.as_mut(), net_done, attempts, last_error).await;
+                                exhausted(net_check.as_mut(), net_done, *attempts, last_error)
+                                    .await;
                             self.settle_held(&mut held, &outcome);
                             return outcome;
                         }
@@ -411,14 +442,14 @@ impl Racer {
                         &snapshot,
                         &input,
                         &mut excluded,
-                        &mut attempts,
+                        attempts,
                         &race_cancel,
                     );
                 }
             }
 
             if inflight.is_empty() {
-                let outcome = exhausted(net_check.as_mut(), net_done, attempts, last_error).await;
+                let outcome = exhausted(net_check.as_mut(), net_done, *attempts, last_error).await;
                 self.settle_held(&mut held, &outcome);
                 return outcome;
             }
@@ -484,15 +515,30 @@ impl Racer {
         // Our own open copies, so a `429` can tell a sibling copy apart from
         // another client request hitting the same channel.
         let own = Arc::new(AtomicU32::new(0));
+        // Raised before the copies still running are dropped, so each one can
+        // tell which of the two tear-downs took it: a sibling copy of its own
+        // channel winning, or another channel winning the whole race. They
+        // look identical from inside the copy and mean opposite things to
+        // whoever is reading the counters.
+        let lost_the_race = Arc::new(AtomicBool::new(false));
+        let _gauge = TrialGauge::open(&self.trials_inflight, &self.metrics);
 
         let mut running = FuturesUnordered::new();
         for index in 0..copies {
             let body = Arc::clone(&body);
             let own = own.clone();
             let offset = hedge_offset(index, delay);
+            let mut record = CopyRecord::open(
+                Arc::clone(&self.metrics),
+                &channel.provider,
+                Arc::clone(&lost_the_race),
+            );
             running.push(async move {
                 if !offset.is_zero() {
                     tokio::time::sleep(offset).await;
+                    // The stagger is the router's own wait, not the
+                    // provider's, so the clock starts when the call does.
+                    record.restart();
                 }
                 // Read as late as possible and dropped as soon as the upload
                 // is done, so a spilled body is only resident for the upload.
@@ -501,17 +547,33 @@ impl Racer {
                     Err(error) => {
                         // A scratch disk fault is ours, not the channel's, so
                         // it must not move the channel's health.
-                        return Err(CopyFailure {
+                        let failure = CopyFailure {
                             error: format!("outbound body could not be read back: {error}"),
                             retry_after_secs: None,
                             self_inflicted: true,
-                        });
+                            class: Some(ErrorClass::Other),
+                        };
+                        record.failed(&failure);
+                        return Err(failure);
                     }
                 };
-                if streaming {
+                let called = if streaming {
                     self.copy_streamed(channel, body, &own).await
                 } else {
                     self.copy_buffered(channel, body, &own).await
+                };
+                match called {
+                    Ok(win) => {
+                        record.finish(CopyOutcome::Success);
+                        // The index travels with the win, because which copy
+                        // won is the only thing that says whether M bought
+                        // anything at all.
+                        Ok((index, win))
+                    }
+                    Err(failure) => {
+                        record.failed(&failure);
+                        Err(failure)
+                    }
                 }
             });
         }
@@ -523,17 +585,34 @@ impl Racer {
         })
         .await;
         match raced {
-            CopyRace::Won(win) => return self.trial_won(channel, win),
+            CopyRace::Won((index, win)) => {
+                // Copy 0 is the one fired first, so wins on 0 alone mean M is
+                // buying a second call per channel and nothing else. A
+                // streamed win can still lose the decision window later; the
+                // trial is counted on what it produced, not on what the walk
+                // did with it afterwards.
+                self.metrics.record_hedge_win(&channel.provider, index);
+                self.metrics
+                    .record_trial(&channel.provider, TrialOutcomeLabel::Won);
+                return self.trial_won(channel, win);
+            }
             CopyRace::Cancelled => {
+                // Before the set is dropped, so the copies still running are
+                // recorded as cancelled rather than superseded.
+                lost_the_race.store(true, Ordering::Relaxed);
                 self.metrics.record_attempt(
                     &channel.provider,
                     &channel.model_id,
                     AttemptOutcome::Cancelled,
                 );
+                self.metrics
+                    .record_trial(&channel.provider, TrialOutcomeLabel::Cancelled);
                 return TrialOutcome::Cancelled;
             }
             CopyRace::AllFailed => {}
         }
+        self.metrics
+            .record_trial(&channel.provider, TrialOutcomeLabel::Failed);
 
         // Every copy failed, which is one failure against health, not M. The
         // health write itself is the walk's to make, not the trial's: until
@@ -660,6 +739,7 @@ impl Racer {
                 error: "429 caused by this router's own concurrency".to_string(),
                 retry_after_secs: None,
                 self_inflicted: true,
+                class: Some(ErrorClass::from_status(429, true)),
             });
         }
 
@@ -674,6 +754,7 @@ impl Racer {
                 error: failure_reason(call.status, &call.body),
                 retry_after_secs: call.retry_after_secs,
                 self_inflicted: false,
+                class: Some(ErrorClass::from_status(call.status, false)),
             });
         }
 
@@ -691,6 +772,7 @@ impl Racer {
                     error: format!("unparseable body: {error}"),
                     retry_after_secs: call.retry_after_secs,
                     self_inflicted: false,
+                    class: Some(ErrorClass::BodyUnparseable),
                 });
             }
         };
@@ -707,6 +789,7 @@ impl Racer {
                     error: format!("undecodable body: {error}"),
                     retry_after_secs: call.retry_after_secs,
                     self_inflicted: false,
+                    class: Some(ErrorClass::BodyUndecodable),
                 });
             }
         };
@@ -763,6 +846,7 @@ impl Racer {
                 error: "429 caused by this router's own concurrency".to_string(),
                 retry_after_secs: None,
                 self_inflicted: true,
+                class: Some(ErrorClass::from_status(429, true)),
             });
         }
 
@@ -784,6 +868,7 @@ impl Racer {
                 error: failure_reason(call.status, &body),
                 retry_after_secs: call.retry_after_secs,
                 self_inflicted: false,
+                class: Some(ErrorClass::from_status(call.status, false)),
             });
         }
 
@@ -798,27 +883,35 @@ impl Racer {
                 Ok(start) => start,
                 Err(failure) => {
                     channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                    let (outcome, error, retry_after_secs) = match failure {
+                    let (outcome, class, error, retry_after_secs) = match failure {
                         // A prefill deadline is a timeout, not a bad key. The
                         // operator reads `http_error` as a dead channel, so a
                         // provider that is merely slow must not land there.
                         StreamStartError::Timeout(error) => {
-                            (AttemptOutcome::Timeout, error, None)
+                            (AttemptOutcome::Timeout, ErrorClass::Timeout, error, None)
                         }
                         // The stream died before anything reached the client, so
                         // this is an ordinary failed trial and the walk carries on.
+                        // The socket opened and the status was a 2xx, so this is
+                        // not a connect failure and not a stall either.
                         StreamStartError::Transport(error) => {
-                            (AttemptOutcome::HttpError, error, None)
+                            (AttemptOutcome::HttpError, ErrorClass::Other, error, None)
                         }
-                        StreamStartError::NotAnAnswer(error) => {
-                            (AttemptOutcome::HttpError, error, call.retry_after_secs)
-                        }
+                        // A 2xx carrying no answer, which is the `Other` case the
+                        // class list was written for.
+                        StreamStartError::NotAnAnswer(error) => (
+                            AttemptOutcome::HttpError,
+                            ErrorClass::Other,
+                            error,
+                            call.retry_after_secs,
+                        ),
                     };
                     self.metrics.record_attempt(&channel.provider, &channel.model_id, outcome);
                     return Err(CopyFailure {
                         error,
                         retry_after_secs,
                         self_inflicted: false,
+                        class: Some(class),
                     });
                 }
             };
@@ -863,10 +956,12 @@ impl Racer {
     /// A transport failure or a timeout on one copy.
     fn copy_failed(&self, channel: &Channel, error: CallError) -> CopyFailure {
         channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-        let outcome = match error {
-            CallError::Timeout(_) => AttemptOutcome::Timeout,
-            CallError::Cancelled => AttemptOutcome::Cancelled,
-            CallError::Transport(_) => AttemptOutcome::HttpError,
+        let (outcome, class) = match error {
+            CallError::Timeout(_) => (AttemptOutcome::Timeout, Some(ErrorClass::Timeout)),
+            // The call was torn down, so the provider did nothing wrong here
+            // and owes `router_errors_total` nothing.
+            CallError::Cancelled => (AttemptOutcome::Cancelled, None),
+            CallError::Transport(_) => (AttemptOutcome::HttpError, Some(ErrorClass::Connect)),
         };
         self.metrics
             .record_attempt(&channel.provider, &channel.model_id, outcome);
@@ -874,6 +969,7 @@ impl Racer {
             error: error.to_string(),
             retry_after_secs: None,
             self_inflicted: false,
+            class,
         }
     }
 
@@ -1132,6 +1228,129 @@ struct CopyFailure {
     /// True for a `429` this router's own concurrency caused. Health does not
     /// move for those: a burst must not push the best channels out of the list.
     self_inflicted: bool,
+    /// Why it failed, for `router_errors_total`. Carried as a class rather
+    /// than read back out of `error`, which is prose written for a human
+    /// reading a `504` and would break the first time somebody reworded one.
+    /// `None` is the one ending that is not the channel's doing: the call was
+    /// cancelled out from under it.
+    class: Option<ErrorClass>,
+}
+
+/// Which copy counter a failure class belongs on.
+///
+/// Deliberately lossy: a connect failure and a `502` are both `http_error` on
+/// `router_copies_total` and stay apart on `router_errors_total`. The coarse
+/// counter is the one an operator reads first, so it has few enough values to
+/// read at a glance.
+fn copy_outcome_for(class: ErrorClass) -> CopyOutcome {
+    match class {
+        ErrorClass::Timeout => CopyOutcome::Timeout,
+        ErrorClass::SelfInflicted429 => CopyOutcome::SelfInflicted429,
+        ErrorClass::BodyUnparseable | ErrorClass::BodyUndecodable => CopyOutcome::BodyError,
+        _ => CopyOutcome::HttpError,
+    }
+}
+
+/// One copy's own counters, including the copy nobody ever awaits.
+///
+/// A copy whose sibling wins is dropped mid-await when the trial's set goes,
+/// so its own code never runs again. That is how the live run came back with
+/// 150 `http_error` records against 92 trials and no count whatever of the
+/// copies that were torn down: nothing was watching the drop. This watches it.
+struct CopyRecord {
+    metrics: Arc<Metrics>,
+    provider: String,
+    started: tokio::time::Instant,
+    /// Set once the copy has recorded its own ending. One that reaches `Drop`
+    /// still clear was torn down rather than finished.
+    reported: bool,
+    /// The trial's flag: true once another channel won the race, false while
+    /// the only thing that can take this copy is a sibling of its own.
+    lost_the_race: Arc<AtomicBool>,
+}
+
+impl CopyRecord {
+    fn open(metrics: Arc<Metrics>, provider: &str, lost_the_race: Arc<AtomicBool>) -> Self {
+        Self {
+            metrics,
+            provider: provider.to_string(),
+            started: tokio::time::Instant::now(),
+            reported: false,
+            lost_the_race,
+        }
+    }
+
+    /// Restarts the clock for a hedge copy that has just waited out its
+    /// offset. The stagger is the router's own wait, and folding it into the
+    /// latency would make every copy above 0 look slower than the first.
+    fn restart(&mut self) {
+        self.started = tokio::time::Instant::now();
+    }
+
+    /// The copy ended on its own terms.
+    fn finish(&mut self, outcome: CopyOutcome) {
+        if self.reported {
+            return;
+        }
+        self.reported = true;
+        self.metrics.record_copy(&self.provider, outcome);
+        self.metrics
+            .record_copy_latency(outcome, self.started.elapsed());
+    }
+
+    /// The copy failed, with the class off the failure itself.
+    fn failed(&mut self, failure: &CopyFailure) {
+        match failure.class {
+            Some(class) => {
+                self.metrics.record_error(&self.provider, class);
+                self.finish(copy_outcome_for(class));
+            }
+            None => self.finish(CopyOutcome::Cancelled),
+        }
+    }
+}
+
+impl Drop for CopyRecord {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        let outcome = if self.lost_the_race.load(Ordering::Relaxed) {
+            CopyOutcome::Cancelled
+        } else {
+            CopyOutcome::Superseded
+        };
+        self.finish(outcome);
+    }
+}
+
+/// Channel trials in flight, as `router_trials_inflight`.
+///
+/// Counted on the shared racer rather than off one walk's own set, because
+/// several client requests race at once: a walk publishing its own N would
+/// overwrite whatever its neighbours were showing. A trial that is cancelled
+/// is dropped rather than finished, so the decrement has to ride on the drop.
+struct TrialGauge<'a> {
+    inflight: &'a AtomicU32,
+    metrics: &'a Metrics,
+}
+
+impl<'a> TrialGauge<'a> {
+    fn open(inflight: &'a AtomicU32, metrics: &'a Metrics) -> Self {
+        let open = inflight.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        metrics.set_trials_inflight(u64::from(open));
+        Self { inflight, metrics }
+    }
+}
+
+impl Drop for TrialGauge<'_> {
+    fn drop(&mut self) {
+        let open = self
+            .inflight
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        self.metrics.set_trials_inflight(u64::from(open));
+    }
 }
 
 /// A channel's raw reply bytes, still in that provider's framing.
@@ -1918,6 +2137,8 @@ mod tests {
     use super::*;
 
     use crate::catalogue::{ChannelHealth, ChannelTelemetry};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A row on one provider/key pair. Only the fields escalation reads vary.
     fn row(provider: &str, key_id: &str, model: &str) -> Channel {
@@ -1973,6 +2194,7 @@ mod tests {
             std::sync::Arc::new(db),
             Duration::from_secs(1),
             Duration::from_secs(3600),
+            Metrics::new().expect("the prometheus recorder builds"),
         )
         .unwrap();
         (table, dir)
@@ -3028,6 +3250,7 @@ mod tests {
             error: "429".to_string(),
             retry_after_secs,
             self_inflicted: false,
+            class: Some(ErrorClass::RateLimited),
         }
     }
 
@@ -3095,6 +3318,318 @@ mod tests {
         drop(winner);
         assert_eq!(channel.health.in_flight.load(Ordering::Relaxed), 0);
         assert_eq!(own.load(Ordering::Relaxed), 0);
+    }
+
+    /// A racer over one wiremock upstream, driving `run_trial` on its own.
+    ///
+    /// Its `Metrics` is its own instance rather than a process-wide recorder,
+    /// so every assertion below reads the counters this trial wrote and
+    /// nothing a test running beside it did.
+    struct TrialHarness {
+        racer: Racer,
+        metrics: Arc<Metrics>,
+        channel: Channel,
+        /// Held so the upstream outlives the trial that calls it.
+        _server: Option<MockServer>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TrialHarness {
+        fn build(
+            copies: usize,
+            hedge_delay_ms: u64,
+            base_url: &str,
+            server: Option<MockServer>,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let metrics = Arc::new(Metrics::new().expect("the prometheus recorder builds"));
+            let config = Arc::new(Config {
+                router: crate::config::RouterConfig {
+                    max_per_channel: copies,
+                    hedge_delay_ms,
+                    spill_path: dir.path().to_path_buf(),
+                    ..Default::default()
+                },
+                providers: Vec::new(),
+                models: Vec::new(),
+                intelligence: Vec::new(),
+                keys: std::collections::HashMap::new(),
+                capabilities: std::collections::HashMap::new(),
+            });
+            let db = std::sync::Arc::new(
+                redb::Database::create(dir.path().join("state.redb")).expect("the store opens"),
+            );
+            let health = Arc::new(
+                HealthTable::open(
+                    db,
+                    Duration::from_secs(1),
+                    Duration::from_secs(3600),
+                    (*metrics).clone(),
+                )
+                .expect("the health table opens"),
+            );
+            let upstream = Upstream::new(&config.router).expect("the client builds");
+            // No URLs, so the network test is never the thing under test here.
+            let net = NetTest::with_urls(
+                upstream.client().clone(),
+                Duration::from_secs(1),
+                Vec::new(),
+            );
+            let mut channel = test_channel();
+            channel.base_url = base_url.into();
+
+            Self {
+                racer: Racer::new(
+                    config,
+                    Arc::new(Catalogue::new()),
+                    health,
+                    upstream,
+                    net,
+                    Arc::clone(&metrics),
+                ),
+                metrics,
+                channel,
+                _server: server,
+                _dir: dir,
+            }
+        }
+
+        async fn trial(&self, cancel: CancellationToken) -> TrialOutcome<'_> {
+            let body = Arc::new(PromptBody::Memory(bytes::Bytes::from_static(
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":16}"#,
+            )));
+            self.racer
+                .run_trial(&self.channel, body, false, cancel)
+                .await
+        }
+    }
+
+    /// A whole OpenAI chat reply.
+    fn chat_reply(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-fake",
+            "object": "chat.completion",
+            "model": "fake",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": text },
+                "finish_reason": "stop",
+            }],
+        })
+    }
+
+    /// One sample's value out of a rendered scrape, found by the labels it
+    /// carries rather than by an exact line: the exporter orders labels as it
+    /// likes, and a missing series reads as the zero it stands for.
+    fn sample(render: &str, metric: &str, labels: &[&str]) -> f64 {
+        render
+            .lines()
+            .filter(|line| line.starts_with(metric))
+            .find(|line| labels.iter().all(|label| line.contains(label)))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// The copy that wins is not always the one fired first, and the sibling
+    /// it beats used to vanish: dropped mid-await, its own code never ran
+    /// again, so nothing counted it. Those two numbers together are the whole
+    /// case for M, and neither was on `/metrics` before.
+    #[tokio::test]
+    async fn a_hedge_copy_winning_is_counted_and_its_sibling_is_superseded() {
+        let server = MockServer::start().await;
+        // Good for one request only, so the copy fired first takes it and is
+        // still waiting on it when its sibling answers.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_reply("slow"))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_reply("quick")))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+
+        // 100ms apart, so which copy reaches the upstream first is not a race.
+        let harness = TrialHarness::build(2, 100, &uri, Some(server));
+        let outcome = harness.trial(CancellationToken::new()).await;
+        assert!(
+            matches!(outcome, TrialOutcome::Won(_)),
+            "the hedge answered"
+        );
+
+        let render = harness.metrics.render();
+        assert_eq!(
+            sample(&render, "router_hedge_wins_total", &[r#"copy="1""#]),
+            1.0,
+            "the second copy fired is the one that won"
+        );
+        assert_eq!(
+            sample(&render, "router_hedge_wins_total", &[r#"copy="0""#]),
+            0.0
+        );
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="success""#]),
+            1.0
+        );
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="superseded""#]),
+            1.0,
+            "the copy its sibling beat is counted, not dropped in silence"
+        );
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="cancelled""#]),
+            0.0,
+            "a sibling winning is not another channel winning"
+        );
+        assert_eq!(
+            sample(&render, "router_trials_total", &[r#"outcome="won""#]),
+            1.0
+        );
+        // Two copies, two latency observations: a copy that is never counted
+        // is a copy whose time nobody can see either.
+        assert_eq!(
+            sample(
+                &render,
+                "router_copy_latency_seconds_count",
+                &[r#"outcome="success""#]
+            ) + sample(
+                &render,
+                "router_copy_latency_seconds_count",
+                &[r#"outcome="superseded""#]
+            ),
+            2.0
+        );
+    }
+
+    /// Every copy failing is M copy records and one trial, which is the pair
+    /// the live run could not tell apart: 150 `http_error` records against 92
+    /// trials, and no way to say which number counted what.
+    #[tokio::test]
+    async fn every_copy_failing_is_counted_once_each_and_the_trial_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream is down"))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+
+        let harness = TrialHarness::build(2, 0, &uri, Some(server));
+        let outcome = harness.trial(CancellationToken::new()).await;
+        assert!(matches!(outcome, TrialOutcome::Failed { .. }));
+
+        let render = harness.metrics.render();
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="http_error""#]),
+            2.0
+        );
+        assert_eq!(
+            sample(&render, "router_trials_total", &[r#"outcome="failed""#]),
+            1.0,
+            "M copies are one trial, not M"
+        );
+        assert_eq!(
+            sample(&render, "router_errors_total", &[r#"class="server_error""#]),
+            2.0,
+            "each failed copy says why it failed"
+        );
+        assert_eq!(
+            sample(
+                &render,
+                "router_copy_latency_seconds_count",
+                &[r#"outcome="http_error""#]
+            ),
+            2.0
+        );
+    }
+
+    /// Another channel winning the race is not a sibling copy winning, and an
+    /// operator reading `superseded` where the truth is `cancelled` would
+    /// take a working hedge for a wasted one.
+    #[tokio::test]
+    async fn a_trial_another_channel_beat_counts_its_copies_as_cancelled() {
+        // Port 1 is never listening, but no call is made: the token has
+        // already fired, so the copies are torn down before they are polled.
+        let harness = TrialHarness::build(2, 0, "http://127.0.0.1:1", None);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = harness.trial(cancel).await;
+        assert!(matches!(outcome, TrialOutcome::Cancelled));
+
+        let render = harness.metrics.render();
+        assert_eq!(
+            sample(&render, "router_trials_total", &[r#"outcome="cancelled""#]),
+            1.0
+        );
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="cancelled""#]),
+            2.0
+        );
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="superseded""#]),
+            0.0
+        );
+        assert_eq!(
+            sample(&render, "router_trials_total", &[r#"outcome="won""#]),
+            0.0
+        );
+    }
+
+    /// The classes an operator acts on. A dead key, a provider refusing us and
+    /// our own M refusing us are three different jobs, and before this they
+    /// were one number.
+    #[test]
+    fn an_http_status_maps_to_the_class_that_says_what_to_do_about_it() {
+        assert_eq!(
+            ErrorClass::from_status(401, false),
+            ErrorClass::Unauthorized
+        );
+        assert_eq!(ErrorClass::from_status(403, false), ErrorClass::Forbidden);
+        assert_eq!(ErrorClass::from_status(404, false), ErrorClass::NotFound);
+        assert_eq!(ErrorClass::from_status(429, false), ErrorClass::RateLimited);
+        assert_eq!(
+            ErrorClass::from_status(429, true),
+            ErrorClass::SelfInflicted429
+        );
+        assert_eq!(
+            ErrorClass::from_status(402, false),
+            ErrorClass::OtherClientError
+        );
+        assert_eq!(ErrorClass::from_status(503, false), ErrorClass::ServerError);
+        // A 2xx reaches a class only when its body was not an answer.
+        assert_eq!(ErrorClass::from_status(200, false), ErrorClass::Other);
+    }
+
+    /// The copy counter is the coarse view, so several classes share one
+    /// value there and stay apart on `router_errors_total`.
+    #[test]
+    fn a_failure_class_lands_on_the_copy_counter_it_belongs_to() {
+        assert_eq!(copy_outcome_for(ErrorClass::Timeout), CopyOutcome::Timeout);
+        assert_eq!(
+            copy_outcome_for(ErrorClass::SelfInflicted429),
+            CopyOutcome::SelfInflicted429
+        );
+        assert_eq!(
+            copy_outcome_for(ErrorClass::BodyUnparseable),
+            CopyOutcome::BodyError
+        );
+        assert_eq!(
+            copy_outcome_for(ErrorClass::BodyUndecodable),
+            CopyOutcome::BodyError
+        );
+        assert_eq!(
+            copy_outcome_for(ErrorClass::Unauthorized),
+            CopyOutcome::HttpError
+        );
+        assert_eq!(
+            copy_outcome_for(ErrorClass::Connect),
+            CopyOutcome::HttpError
+        );
     }
 
     fn test_channel() -> Channel {
