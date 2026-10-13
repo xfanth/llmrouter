@@ -247,6 +247,15 @@ pub enum ErrorClass {
     /// `stream_truncated`, which is a clean close with the answer unfinished.
     /// Nobody said anything and the bytes stopped.
     StreamTransport,
+    /// The socket broke after a 2xx but before a single token arrived, so the
+    /// answer never started. Distinct from `connect`, where the socket never
+    /// opened, and from `stream_transport`, where it broke part way through
+    /// an answer that had begun.
+    ///
+    /// It has its own class because it stopped being rare: on a live run it
+    /// was 70 of 140 failures, the largest group on the page, and the
+    /// catch-all it shared with two other cases could not say so.
+    PrefillTransport,
     /// A 2xx whose body was not JSON.
     BodyUnparseable,
     /// A 2xx whose JSON did not decode to a response.
@@ -272,6 +281,7 @@ impl ErrorClass {
             ErrorClass::StreamError => "stream_error",
             ErrorClass::StreamTruncated => "stream_truncated",
             ErrorClass::StreamTransport => "stream_transport",
+            ErrorClass::PrefillTransport => "prefill_transport",
             ErrorClass::BodyUnparseable => "body_unparseable",
             ErrorClass::BodyUndecodable => "body_undecodable",
             ErrorClass::Other => "other",

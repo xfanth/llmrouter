@@ -924,28 +924,15 @@ impl Racer {
                 Ok(start) => start,
                 Err(failure) => {
                     channel.telemetry.failures.fetch_add(1, Ordering::Relaxed);
-                    let (outcome, class, error, retry_after_secs) = match failure {
-                        // A prefill deadline is a timeout, not a bad key. The
-                        // operator reads `http_error` as a dead channel, so a
-                        // provider that is merely slow must not land there.
-                        StreamStartError::Timeout(error) => {
-                            (AttemptOutcome::Timeout, ErrorClass::Timeout, error, None)
+                    let (outcome, class) = prefill_failure_class(&failure);
+                    let (error, retry_after_secs) = match failure {
+                        StreamStartError::Timeout(error)
+                        | StreamStartError::Transport(error) => (error, None),
+                        // Only the provider's own refusal carries a
+                        // `Retry-After`: the other two never heard back.
+                        StreamStartError::NotAnAnswer(error) => {
+                            (error, call.retry_after_secs)
                         }
-                        // The stream died before anything reached the client, so
-                        // this is an ordinary failed trial and the walk carries on.
-                        // The socket opened and the status was a 2xx, so this is
-                        // not a connect failure and not a stall either.
-                        StreamStartError::Transport(error) => {
-                            (AttemptOutcome::HttpError, ErrorClass::Other, error, None)
-                        }
-                        // A 2xx carrying no answer, which is the `Other` case the
-                        // class list was written for.
-                        StreamStartError::NotAnAnswer(error) => (
-                            AttemptOutcome::HttpError,
-                            ErrorClass::Other,
-                            error,
-                            call.retry_after_secs,
-                        ),
                     };
                     self.metrics.record_attempt(&channel.provider, &channel.model_id, outcome);
                     return Err(CopyFailure {
@@ -1369,6 +1356,33 @@ struct CopyFailure {
 /// `router_copies_total` and stay apart on `router_errors_total`. The coarse
 /// counter is the one an operator reads first, so it has few enough values to
 /// read at a glance.
+/// How a stream that died before its first token maps onto the counters.
+///
+/// Split out of the match it came from so the mapping can be pinned by a test:
+/// the three cases look alike from the call site and mean three different
+/// things to whoever reads the page.
+fn prefill_failure_class(failure: &StreamStartError) -> (AttemptOutcome, ErrorClass) {
+    match failure {
+        // A prefill deadline is a timeout, not a bad key. The operator reads
+        // `http_error` as a dead channel, so a provider that is merely slow
+        // must not land there.
+        StreamStartError::Timeout(_) => (AttemptOutcome::Timeout, ErrorClass::Timeout),
+        // The socket broke after a 2xx and before a single token, so the
+        // answer never started. Not a connect failure, because the socket
+        // opened, and not a stall, because nothing went quiet: it went away.
+        //
+        // Its own class rather than the catch-all. On a live run this was 70
+        // of 140 failures, the largest group on the page, sharing one bin
+        // with a 2xx that carried no answer and with the router's own scratch
+        // disk faults. Three different problems under one name that was meant
+        // for the rare leftover.
+        StreamStartError::Transport(_) => (AttemptOutcome::HttpError, ErrorClass::PrefillTransport),
+        // A 2xx carrying no answer, which is the `Other` case the class list
+        // was written for.
+        StreamStartError::NotAnAnswer(_) => (AttemptOutcome::HttpError, ErrorClass::Other),
+    }
+}
+
 fn copy_outcome_for(class: ErrorClass) -> CopyOutcome {
     match class {
         ErrorClass::Timeout => CopyOutcome::Timeout,
@@ -3125,6 +3139,48 @@ mod tests {
     /// ordinary failed trial, so the deadline is still a deadline. It is a
     /// timeout: `router_attempts_total{outcome="http_error"}` means a dead
     /// key, and a provider sitting on a full GPU queue is not that.
+    /// A socket that breaks before the first token was the largest group of
+    /// failures on a live run, 70 of 140, and it shared `other` with a 2xx
+    /// carrying no answer and with the router's own scratch disk faults. Three
+    /// problems under one name that was meant for the rare leftover, so an
+    /// operator reading `other` learned nothing from it.
+    #[test]
+    fn a_stream_that_dies_before_its_first_token_is_not_the_catch_all() {
+        assert_eq!(
+            prefill_failure_class(&StreamStartError::Transport("reset".into())),
+            (AttemptOutcome::HttpError, ErrorClass::PrefillTransport)
+        );
+
+        // The other two keep what they had. A slow provider is a timeout and
+        // must not read as a dead channel, and a 2xx with nothing in it is
+        // the case `other` was written for.
+        assert_eq!(
+            prefill_failure_class(&StreamStartError::Timeout("too slow".into())),
+            (AttemptOutcome::Timeout, ErrorClass::Timeout)
+        );
+        assert_eq!(
+            prefill_failure_class(&StreamStartError::NotAnAnswer("empty".into())),
+            (AttemptOutcome::HttpError, ErrorClass::Other)
+        );
+    }
+
+    /// The byte stream is what produces the transport case, so the mapping
+    /// above is only worth anything if a broken stream really lands there.
+    #[tokio::test(start_paused = true)]
+    async fn a_broken_byte_stream_produces_the_transport_case() {
+        let mut rest: ByteStream = Box::pin(futures::stream::iter(vec![Err(
+            crate::upstream::CallError::Transport("connection reset".to_string()),
+        )]));
+        let Err(failure) = read_stream_start(&mut rest, STALL).await else {
+            panic!("a broken stream cannot start");
+        };
+        assert!(matches!(failure, StreamStartError::Transport(_)));
+        assert_eq!(
+            prefill_failure_class(&failure).1,
+            ErrorClass::PrefillTransport
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_channel_that_misses_the_prefill_budget_fails_the_trial() {
         let mut rest: ByteStream = Box::pin(futures::stream::pending());
@@ -3654,6 +3710,7 @@ mod tests {
             "stream_error",
             "stream_stalled",
             "stream_transport",
+            "prefill_transport",
             "other",
         ] {
             assert_eq!(
