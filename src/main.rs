@@ -43,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
         providers = config.providers.len(),
         ranked_models = config.intelligence.len(),
         capabilities = config.capabilities.len(),
+        race_width = config.router.race_width,
+        max_per_channel = config.router.max_per_channel,
+        hedge_delay_ms = config.router.hedge_delay_ms,
         "config loaded"
     );
 

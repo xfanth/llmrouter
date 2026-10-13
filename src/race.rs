@@ -264,6 +264,10 @@ impl Racer {
         cancel: CancellationToken,
         fired: &WalkCount,
     ) -> RaceOutcome {
+        // One clock for every copy's telemetry offset: start_ms on each
+        // channel_copy line is measured from here, so a saved run's copies
+        // line up on one timeline for any (N, M) rebuild.
+        let walk_started = tokio::time::Instant::now();
         let snapshot = self.catalogue.snapshot();
         // A child token, so the race can tear its own calls down on a win
         // without touching the client's token.
@@ -285,6 +289,7 @@ impl Racer {
             &mut excluded,
             &race_cancel,
             fired,
+            walk_started,
         );
 
         if inflight.is_empty() {
@@ -417,6 +422,7 @@ impl Racer {
                             &mut excluded,
                             &race_cancel,
                             fired,
+                            walk_started,
                         );
                         if inflight.is_empty() {
                             let outcome =
@@ -483,6 +489,7 @@ impl Racer {
                         &mut excluded,
                         &race_cancel,
                         fired,
+                        walk_started,
                     );
                 }
             }
@@ -502,6 +509,7 @@ impl Racer {
     /// broke pulls in untried channels exactly as a buffered failure does. A
     /// query that comes back short leaves the set smaller, and an empty one
     /// ends the walk at the caller's `inflight.is_empty()` check.
+    #[allow(clippy::too_many_arguments)] // walk_started rides the same list
     fn top_up<'a>(
         &'a self,
         inflight: &mut Trials<'a>,
@@ -510,6 +518,7 @@ impl Racer {
         excluded: &mut Excluded,
         cancel: &CancellationToken,
         fired: &'a WalkCount,
+        walk_started: tokio::time::Instant,
     ) {
         let copies = self.config.router.max_per_channel.max(1) as u32;
         let wanted = self
@@ -535,6 +544,7 @@ impl Racer {
                 input.streaming,
                 cancel.child_token(),
                 fired,
+                walk_started,
             )));
         }
     }
@@ -551,6 +561,7 @@ impl Racer {
         streaming: bool,
         cancel: CancellationToken,
         fired: &'a WalkCount,
+        walk_started: tokio::time::Instant,
     ) -> TrialOutcome<'a> {
         let copies = self.config.router.max_per_channel.max(1);
         let delay = Duration::from_millis(self.config.router.hedge_delay_ms);
@@ -573,8 +584,14 @@ impl Racer {
             let body = Arc::clone(&body);
             let own = own.clone();
             let offset = hedge_offset(index, delay);
-            let mut record =
-                CopyRecord::open(Arc::clone(&self.metrics), &channel.provider, &cancel, fired);
+            let mut record = CopyRecord::open(
+                Arc::clone(&self.metrics),
+                channel,
+                &cancel,
+                fired,
+                walk_started,
+                index as u32,
+            );
             running.push(async move {
                 if !offset.is_zero() {
                     tokio::time::sleep(offset).await;
@@ -606,7 +623,10 @@ impl Racer {
                 };
                 match called {
                     Ok(win) => {
-                        record.finish(CopyOutcome::Success);
+                        if let CopyWin::Streamed(stream) = &win {
+                            record.note_first_token(stream.content_at);
+                        }
+                        record.finish(CopyOutcome::Success, None);
                         // The index travels with the win, because which copy
                         // won is the only thing that says whether M bought
                         // anything at all.
@@ -1434,6 +1454,19 @@ struct CopyRecord {
     metrics: Arc<Metrics>,
     provider: String,
     started: tokio::time::Instant,
+    /// Identity and clock for the per-copy telemetry line. Every offset the
+    /// line carries is measured on the walk's own clock, so a saved log can
+    /// rebuild any (N, M) no larger than the configuration that ran.
+    channel_id: ChannelId,
+    model_id: String,
+    copy_index: u32,
+    walk_started: tokio::time::Instant,
+    /// Set when this copy's stream produced its first content, as an offset
+    /// from `fired_at`, so the line can say when the first token would have
+    /// reached a client. A buffered copy leaves it unset: its content arrives
+    /// at the end, so its ttft is its lifetime.
+    fired_at: tokio::time::Instant,
+    first_token: Option<Duration>,
     /// Set once the copy has recorded its own ending. One that reaches `Drop`
     /// still clear was torn down rather than finished.
     reported: bool,
@@ -1448,31 +1481,50 @@ struct CopyRecord {
 }
 
 impl CopyRecord {
+    #[allow(clippy::too_many_arguments)] // the telemetry identity rides on open()
     fn open(
         metrics: Arc<Metrics>,
-        provider: &str,
+        channel: &Channel,
         cancel: &CancellationToken,
         fired: &WalkCount,
+        walk_started: tokio::time::Instant,
+        copy_index: u32,
     ) -> Self {
         fired.copies.fetch_add(1, Ordering::Relaxed);
+        let fired_at = tokio::time::Instant::now();
         Self {
             metrics,
-            provider: provider.to_string(),
-            started: tokio::time::Instant::now(),
+            provider: channel.provider.to_string(),
+            channel_id: channel.id,
+            model_id: channel.model_id.to_string(),
+            copy_index,
+            walk_started,
+            fired_at,
+            first_token: None,
+            started: fired_at,
             reported: false,
             cancel: cancel.clone(),
         }
     }
 
-    /// Restarts the clock for a hedge copy that has just waited out its
+    /// Restarts the clock for a hedge copy that has waited out its
     /// offset. The stagger is the router's own wait, and folding it into the
     /// latency would make every copy above 0 look slower than the first.
     fn restart(&mut self) {
         self.started = tokio::time::Instant::now();
     }
 
-    /// The copy ended on its own terms.
-    fn finish(&mut self, outcome: CopyOutcome) {
+    /// Records when this copy's stream produced its first content, as an
+    /// offset from the copy's own fire moment, so the ending line can say
+    /// when the first token would have reached a client.
+    fn note_first_token(&mut self, at: tokio::time::Instant) {
+        self.first_token = Some(at.saturating_duration_since(self.fired_at));
+    }
+
+    /// The copy ended on its own terms, or its Drop caught a torn-down one.
+    /// The log line is the per-copy telemetry: one line per copy, all offsets
+    /// on the walk's clock, so a saved run rebuilds any smaller (N, M).
+    fn finish(&mut self, outcome: CopyOutcome, class: Option<ErrorClass>) {
         if self.reported {
             return;
         }
@@ -1480,6 +1532,23 @@ impl CopyRecord {
         self.metrics.record_copy(&self.provider, outcome);
         self.metrics
             .record_copy_latency(outcome, self.started.elapsed());
+        tracing::info!(
+            channel = %self.channel_id,
+            provider = %self.provider,
+            model = %self.model_id,
+            copy_index = self.copy_index,
+            start_ms = self
+                .fired_at
+                .saturating_duration_since(self.walk_started)
+                .as_millis() as u64,
+            ms = self.started.elapsed().as_millis() as u64,
+            ttft_ms = self
+                .first_token
+                .map(|offset| offset.as_millis() as u64),
+            outcome = outcome.label(),
+            class = class.map(|c| c.label()),
+            "channel_copy"
+        );
     }
 
     /// The copy failed, with the class off the failure itself.
@@ -1487,9 +1556,9 @@ impl CopyRecord {
         match failure.class {
             Some(class) => {
                 self.metrics.record_error(&self.provider, class);
-                self.finish(copy_outcome_for(class));
+                self.finish(copy_outcome_for(class), Some(class));
             }
-            None => self.finish(CopyOutcome::Cancelled),
+            None => self.finish(CopyOutcome::Cancelled, None),
         }
     }
 }
@@ -1504,7 +1573,7 @@ impl Drop for CopyRecord {
         } else {
             CopyOutcome::Superseded
         };
-        self.finish(outcome);
+        self.finish(outcome, None);
     }
 }
 
@@ -4134,7 +4203,14 @@ mod tests {
                 br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":16}"#,
             )));
             self.racer
-                .run_trial(&self.channel, body, false, cancel, &self.fired)
+                .run_trial(
+                    &self.channel,
+                    body,
+                    false,
+                    cancel,
+                    &self.fired,
+                    tokio::time::Instant::now(),
+                )
                 .await
         }
     }
