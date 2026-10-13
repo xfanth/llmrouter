@@ -2,18 +2,41 @@
 # seconds what reading logs answers in minutes, and musl's malloc performs
 # badly on this allocation pattern: a large JSON document parsed per client
 # request across many threads.
-FROM rust:slim-bookworm AS build
+#
+# cargo-chef splits the build so the dependencies get their own cached layer.
+# The planner reduces the manifest to recipe.json, which changes only when the
+# dependency set does, so a source-only change skips straight to compiling the
+# crate. The image is rust:slim-bookworm with cargo-chef on top: the same
+# toolchain as before, so the binary that ships is built the same way. The Rust
+# version in the tag matches rust-toolchain.toml, which .dockerignore keeps out
+# of the build context, so bump the two together.
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.0-slim-bookworm AS chef
 
-# tikv-jemalloc-sys compiles jemalloc from C source, so the build stage needs a
-# C toolchain. rust:slim-bookworm ships rustc and cargo but no cc and no make,
-# which is why `cargo build --release` exited 101 here before.
+# tikv-jemalloc-sys compiles jemalloc from C source, so the build needs a C
+# toolchain. The base image has cc but no make, which is why
+# `cargo build --release` exited 101 here before. Installed in the shared base
+# because the cook stage is where jemalloc actually compiles.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential \
  && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /src
+
+FROM chef AS planner
 COPY . .
-RUN cargo build --release
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /src/recipe.json recipe.json
+# Same release profile as the final build, so the cooked dependencies are
+# reused as-is rather than rebuilt. Only the llmrouter bin ships, so only it is
+# built: llmrouter-make-config would otherwise get its own slow LTO link here
+# and then be thrown away. --bin on the cook keeps the cooked set matching.
+# That leaves make-config with no release build here, so the gate builds it
+# itself with `cargo build --release --bin llmrouter-make-config`: see
+# job_clippy in ci.sh and the matching step in .github/workflows/ci.yml.
+RUN cargo chef cook --release --bin llmrouter --recipe-path recipe.json
+COPY . .
+RUN cargo build --release --bin llmrouter
 
 FROM debian:bookworm-slim
 RUN apt-get update \

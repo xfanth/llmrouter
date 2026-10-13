@@ -1,0 +1,8 @@
+# One Rust for ci.sh, GitHub Actions and the image. rustup reads this file on
+# every cargo call, so a laptop on an older or newer stable cannot pass clippy
+# -D warnings locally and fail it in CI. Bump it on purpose, in its own commit,
+# together with the cargo-chef image tag in the Dockerfile.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+profile = "minimal"

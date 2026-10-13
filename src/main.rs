@@ -357,7 +357,120 @@ mod tests {
                 seen += 1;
             }
         }
-        assert_eq!(seen, 2, "both jobs should cache the build");
+        assert_eq!(
+            seen, 3,
+            "clippy, coverage and smoke should each cache the build"
+        );
+    }
+
+    /// The tests read files from all over the repo (DESIGN.md, .gitignore,
+    /// build_providers.py, the CSVs), so an allow-list paths filter lets a
+    /// change to one of them skip the tests and go green. The filter must be a
+    /// deny-list, and nothing it skips may be named anywhere in src/ or tests/.
+    #[test]
+    fn the_ci_paths_filter_skips_only_files_nothing_reads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect(".github/workflows/ci.yml is missing");
+        let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
+        let with = &ci["jobs"]["changes"]["steps"][1]["with"];
+        assert_eq!(with["predicate-quantifier"].as_str(), Some("every"));
+        let filters: serde_yaml::Value =
+            serde_yaml::from_str(with["filters"].as_str().expect("filters"))
+                .expect("filters parse");
+        let rust: Vec<&str> = filters["rust"]
+            .as_sequence()
+            .expect("a rust filter")
+            .iter()
+            .map(|p| p.as_str().expect("a pattern"))
+            .collect();
+        assert_eq!(
+            rust.first(),
+            Some(&"**"),
+            "the filter must start from every file"
+        );
+
+        let mut sources = String::new();
+        let mut dirs = vec![root.join("src"), root.join("tests")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("readable") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    sources += &std::fs::read_to_string(&path).unwrap_or_default();
+                }
+            }
+        }
+        for skipped in &rust[1..] {
+            let path = skipped
+                .strip_prefix('!')
+                .expect("only exclusions after '**'");
+            let name = path.rsplit('/').next().expect("a file name");
+            // git reads .gitignore itself (check-ignore, ls-files), so no test
+            // names it and the grep below cannot see that it is an input.
+            assert!(
+                !name.starts_with(".git"),
+                "the paths filter skips {path}, but the git tests read it"
+            );
+            assert!(
+                !sources.contains(&format!("\"{name}\""))
+                    && !sources.contains(&format!("/{name}\"")),
+                "the paths filter skips {path}, but the code reads it"
+            );
+        }
+    }
+
+    /// ci.sh and ci.yml install the test runner and the coverage
+    /// instrumenter separately, so a bump in one file quietly changes what a
+    /// local pass proves about CI. The two lists must stay identical.
+    #[test]
+    fn the_test_tools_are_pinned_to_the_same_versions_in_ci_sh_and_ci_yml() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sh = std::fs::read_to_string(root.join("ci.sh")).expect("ci.sh is missing");
+        let version = |name: &str| {
+            sh.lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("ci.sh must set {name}"))
+                .trim()
+                .to_string()
+        };
+        let mut want = vec![
+            format!("cargo-nextest@{}", version("NEXTEST_VERSION")),
+            format!("cargo-llvm-cov@{}", version("LLVM_COV_VERSION")),
+        ];
+        want.sort();
+
+        let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+            .expect(".github/workflows/ci.yml is missing");
+        let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
+        let mut seen = 0;
+        for (name, job) in ci["jobs"].as_mapping().expect("jobs") {
+            let Some(steps) = job["steps"].as_sequence() else {
+                continue;
+            };
+            for step in steps {
+                if !step["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("taiki-e/install-action@"))
+                {
+                    continue;
+                }
+                let mut tools: Vec<String> = step["with"]["tool"]
+                    .as_str()
+                    .expect("the install step must name its tools")
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .collect();
+                tools.sort();
+                assert_eq!(
+                    tools, want,
+                    "job {name:?} installs tool versions that ci.sh does not pin"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "ci.yml must install the pinned test tools once");
     }
 
     /// Scratch directories named after the process id collide between runs: a
