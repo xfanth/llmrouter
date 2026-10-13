@@ -321,6 +321,53 @@ pub async fn aggregate_stream(
 /// the caller can fold it and offer it to the cache. A stream that fails or is
 /// dropped part way sends nothing, which is the cache rule: only a complete
 /// stream goes in.
+/// Passes a stream through untouched and hands back the usage block the
+/// provider reported, once the stream has run to its end.
+///
+/// Separate from [`tee_stream`], which keeps a copy of every event so the
+/// whole answer can be folded for the cache. Counting tokens does not need
+/// the answer, only its last usage chunk, and hanging the count off the
+/// cache's copy made it depend on an unrelated config flag: with
+/// `cache.enabled: false` a streaming client was counting no tokens at all.
+/// Teeing a second copy to fix that would put every streamed body in RAM
+/// twice, and memory is what killed omniroute, so this watches the stream go
+/// past and keeps five numbers.
+///
+/// Nothing is sent when the provider reported no usage, so a receiver that
+/// resolves to an error means there was nothing to count.
+pub fn tap_usage(
+    chunks: ChunkStream,
+) -> (ChunkStream, tokio::sync::oneshot::Receiver<NeutralUsage>) {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut inner = chunks.0;
+    let forwarded = async_stream::stream! {
+        let mut usage: Option<NeutralUsage> = None;
+        while let Some(item) = inner.next().await {
+            if let Ok(event) = &item {
+                // The last one wins. A provider may report usage more than
+                // once over a stream, and the final figure is the whole
+                // answer's rather than a running part of it.
+                for chunk in event.normalized().iter() {
+                    if let switchyard_protocol::stream::LlmResponseChunk::Usage(reported) = chunk {
+                        usage = Some(reported.clone());
+                    }
+                }
+            }
+            let failed = item.is_err();
+            yield item;
+            if failed {
+                // A broken stream is a partial answer, and counting its
+                // tokens would read as a complete one.
+                return;
+            }
+        }
+        if let Some(usage) = usage {
+            let _ = sender.send(usage);
+        }
+    };
+    (ChunkStream(Box::pin(forwarded)), receiver)
+}
+
 pub fn tee_stream(
     chunks: ChunkStream,
 ) -> (ChunkStream, tokio::sync::oneshot::Receiver<ChunkStream>) {

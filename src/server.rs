@@ -660,6 +660,15 @@ async fn handle_completion(
         Some(_) => crate::cache::cache_key(&request).ok(),
         None => None,
     };
+    // Recorded here rather than in `cache.rs`, because a `Cache` only exists
+    // when `cache.enabled` is true: from inside it the disabled case is
+    // unreachable, and the counter would sit at a permanent zero that reads
+    // exactly like a cache that is on and never asked.
+    if state.cache.is_none() {
+        state
+            .metrics
+            .record_cache_lookup(crate::metrics::CacheLookup::Disabled);
+    }
     if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
         match cache.get(key, named_model.as_deref(), now) {
             Ok(Some(entry)) => {
@@ -878,8 +887,6 @@ async fn handle_completion(
                     _ => (chunks, None),
                 };
                 if let Some((cache, key, mut winner, complete)) = complete {
-                    let metrics = state.metrics.clone();
-                    let started_at = started;
                     tokio::spawn(async move {
                         let Ok(copy) = complete.await else {
                             return;
@@ -887,18 +894,6 @@ async fn handle_completion(
                         match crate::wire::aggregate_stream(copy).await {
                             Ok(response) => {
                                 winner.response = response;
-                                // The usage block only exists once the stream
-                                // has run to the end, and for a streaming
-                                // client that happens here rather than on the
-                                // request's own task. Counted from the copy
-                                // the cache already takes, so the tokens cost
-                                // no second fold.
-                                record_usage(
-                                    &metrics,
-                                    &winner.provider,
-                                    &winner.response.usage,
-                                    started_at.elapsed(),
-                                );
                                 write_cache(
                                     &cache,
                                     key,
@@ -914,6 +909,22 @@ async fn handle_completion(
                         }
                     });
                 }
+                // Counted off the stream on its way to the client, not off
+                // the cache's copy of it. Hanging the count on the cache made
+                // token accounting depend on `cache.enabled`, so a streaming
+                // client with the cache off counted nothing at all. Reading
+                // the clock when the stream ends also makes the rate the one
+                // the client felt, rather than one that includes a fold the
+                // client never waited for.
+                let (chunks, reported_usage) = crate::wire::tap_usage(chunks);
+                let usage_metrics = state.metrics.clone();
+                let usage_provider = provider.clone();
+                tokio::spawn(async move {
+                    if let Ok(usage) = reported_usage.await {
+                        record_usage(&usage_metrics, &usage_provider, &usage, started.elapsed());
+                    }
+                });
+
                 crate::wire::encode_stream(chunks, client_format, Some(served.clone()))
                     .map(|events| Served::Events(sse_frames(events, client_format)))
                     .map_err(|err| err.to_string())

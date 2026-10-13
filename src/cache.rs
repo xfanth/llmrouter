@@ -206,8 +206,12 @@ impl Cache {
         named_model: Option<&str>,
         now_unix: u64,
     ) -> crate::Result<Option<CacheEntry>> {
-        let (entry, outcome) = self.lookup(key, named_model, now_unix)?;
-        self.metrics.record_cache_lookup(outcome);
+        let result = self.lookup(key, named_model, now_unix);
+        self.metrics.record_cache_lookup(match &result {
+            Ok((_, outcome)) => *outcome,
+            Err(_) => CacheLookup::Error,
+        });
+        let (entry, _) = result?;
         if let Some(entry) = &entry {
             // The age of what was served, not of the newest write. A rising
             // age on hits means the store is going stale rather than turning
@@ -223,9 +227,9 @@ impl Cache {
     ///
     /// Split out from [`Cache::get`] so there is exactly one place the result
     /// is labelled, rather than a counter bumped on each early return and the
-    /// chance of two or none. A redb or decode failure has no lookup label:
-    /// `CacheLookup` has no error variant, and a read that failed is counted
-    /// by the request outcome instead.
+    /// chance of two or none. A redb or decode failure comes back as an error
+    /// and [`Cache::get`] labels it [`CacheLookup::Error`], so the lookups
+    /// total always reconciles to the number of reads.
     fn lookup(
         &self,
         key: CacheKey,
@@ -274,7 +278,11 @@ impl Cache {
         self.metrics.record_cache_write(match result {
             Ok(true) => CacheWrite::Stored,
             // The only way the write rule declines a complete candidate is on
-            // the intelligence comparison: absent and expired both write.
+            // the intelligence comparison: absent and expired both write. A
+            // draw counts here too, since the rule keeps what is already
+            // stored on a tie. Lower and equal are not worth separate labels:
+            // both say the cache already held an answer at least as good, and
+            // the operator's next move is the same either way.
             Ok(false) => CacheWrite::SkippedLowerIntelligence,
             Err(_) => CacheWrite::Error,
         });
@@ -295,13 +303,17 @@ impl Cache {
         // earns its keep once the file has grown past the size we last evicted
         // at.
         let size = self.size_bytes()?;
-        // The write path already pays for this stat to check the cap, so the
-        // gauge is free here. Nowhere else knows the size without a new one.
-        self.metrics.set_cache_bytes(size);
         if size > self.max_bytes && size > self.evicted_at.load(Ordering::Relaxed) {
             self.evict_oldest()?;
             self.evicted_at.store(size, Ordering::Relaxed);
         }
+        // The write path already pays for this stat to check the cap, so the
+        // gauge is free here, and nowhere else knows the size without a new
+        // one. Set after the eviction rather than before it, so the ordering
+        // says what it means. The number is the same either way: redb reuses
+        // the freed pages inside the file and never shrinks it, which is the
+        // whole reason `evicted_at` exists.
+        self.metrics.set_cache_bytes(size);
 
         let encoded = encode(&candidate)?;
         let txn = self.db.begin_write().map_err(|e| store("begin write", e))?;
@@ -966,6 +978,35 @@ mod tests {
             "router_cache_lookups_total",
             "result",
             "miss_schema",
+            1
+        ));
+    }
+
+    /// A read that fails still counts, so `sum(router_cache_lookups_total)`
+    /// stays the number of reads. Without this a redb outage leaves every
+    /// cache series flat and reads as a cache nobody is asking for.
+    #[test]
+    fn a_read_that_fails_is_counted_as_an_error_not_as_nothing() {
+        let c = temp_cache("m-error", u64::MAX);
+
+        // A truncated value is the one read failure a test can stage without
+        // breaking the file underneath redb: the row is found, the framing
+        // then refuses to decode.
+        let txn = c.cache.db.begin_write().expect("begin write");
+        {
+            let mut table = txn.open_table(RESPONSES).expect("open");
+            table
+                .insert(&key(1).0, [1u8, 2].as_slice())
+                .expect("insert");
+        }
+        txn.commit().expect("commit");
+
+        assert!(c.get(key(1), None, 1_000).is_err());
+        assert!(counter_is(
+            &c.metrics.render(),
+            "router_cache_lookups_total",
+            "result",
+            "error",
             1
         ));
     }

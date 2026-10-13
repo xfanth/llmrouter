@@ -1724,7 +1724,7 @@ there.
 
 | Metric | Why |
 |---|---|
-| `router_trials_total{provider,outcome}` | One per channel the walk reached, whatever M is: `won`, `failed`, `cancelled`. |
+| `router_trials_total{provider,outcome}` | One per channel the walk reached, whatever M is: `won`, `failed`, `cancelled`. `won` means the trial produced a usable answer, which under the `tps` strategy more than one channel can do for a single client request: the window exists so several can be judged against each other, and recording the losers as `cancelled` would deny that they answered. The count of answers that reached a client is `router_requests_total`. |
 | `router_attempts_total{provider,model,outcome}` | `success`, `http_error`, `timeout`, `cancelled`. Per trial, kept for model-level diagnosis: a provider and model that flips to all `http_error` overnight is dead. Labelled by provider and model, not by channel id: a channel id is per key, which would put tens of thousands of series on the page. |
 | `router_trials_inflight` | Gauge, against `race_width`. Says whether N is the binding constraint. |
 
@@ -1740,7 +1740,7 @@ there.
 
 | Metric | Why |
 |---|---|
-| `router_errors_total{provider,class}` | Why a channel call failed: `unauthorized`, `forbidden`, `not_found`, `rate_limited`, `self_inflicted_429`, `other_client_error`, `server_error`, `timeout`, `connect`, `stream_stalled`, `body_unparseable`, `body_undecodable`, `other`. Three different jobs hid behind one `http_error` count: a provider on `unauthorized` needs a new key, on `rate_limited` needs fewer calls, on `self_inflicted_429` needs a smaller M. Not labelled by model, so this is 14 providers times 13 classes rather than 222 models times 13. |
+| `router_errors_total{provider,class}` | Why a channel call failed: `unauthorized`, `forbidden`, `not_found`, `rate_limited`, `self_inflicted_429`, `other_client_error`, `server_error`, `timeout`, `connect`, `stream_stalled`, `stream_error`, `stream_truncated`, `stream_transport`, `body_unparseable`, `body_undecodable`, `other`. The four stream classes are separate on purpose: a stall, a provider reporting a failure mid-answer, a body cut short, and a socket that simply broke are four different faults, and only health saw any of them before. Three different jobs hid behind one `http_error` count: a provider on `unauthorized` needs a new key, on `rate_limited` needs fewer calls, on `self_inflicted_429` needs a smaller M. Not labelled by model, so this is 14 providers times 13 classes rather than 222 models times 13. |
 
 ### Backoff
 
@@ -1755,7 +1755,7 @@ there.
 
 | Metric | Why |
 |---|---|
-| `router_cache_lookups_total{result}` | `hit`, `miss_absent`, `miss_expired`, `miss_model_mismatch`, `miss_schema`, `disabled`. The miss reason matters more than the hit rate: a cache missing all day on `miss_model_mismatch` is a client naming models, not a cache that is cold. |
+| `router_cache_lookups_total{result}` | `hit`, `miss_absent`, `miss_expired`, `miss_model_mismatch`, `miss_schema`, `disabled`, `error`. The miss reason matters more than the hit rate: a cache missing all day on `miss_model_mismatch` is a client naming models, not a cache that is cold. Every read lands on exactly one of these, `error` included, so the sum is the number of reads and a redb outage cannot hide behind a flat hit rate. |
 | `router_cache_writes_total{result}` | `stored`, `skipped_lower_intelligence`, `skipped_partial_stream`, `error`. |
 | `router_cache_age_seconds` | Histogram, how old the entry a hit served was. |
 | `router_cache_entries`, `router_cache_bytes` | Against `cache.max_bytes`. Entries alone cannot say how close the cap is. |

@@ -162,6 +162,10 @@ pub enum CacheLookup {
     MissSchema,
     /// `cache.enabled` is off, so no read happened.
     Disabled,
+    /// redb refused the read, so there is no answer either way. Counted so
+    /// the lookups total stays the number of reads: without it a redb outage
+    /// leaves every cache series flat and reads as a quiet cache.
+    Error,
 }
 
 impl CacheLookup {
@@ -174,6 +178,7 @@ impl CacheLookup {
             CacheLookup::MissModelMismatch => "miss_model_mismatch",
             CacheLookup::MissSchema => "miss_schema",
             CacheLookup::Disabled => "disabled",
+            CacheLookup::Error => "error",
         }
     }
 }
@@ -230,6 +235,18 @@ pub enum ErrorClass {
     Connect,
     /// A stream went quiet for `stream_stall_timeout`.
     StreamStalled,
+    /// The provider reported a failure inside an otherwise healthy stream, as
+    /// an error frame part way through an answer.
+    StreamError,
+    /// The provider closed the body part way through an answer. The transport
+    /// saw a clean end of stream and the decoder is the first thing that knows
+    /// there was no terminal event.
+    StreamTruncated,
+    /// The socket itself broke part way through an answer. Distinct from
+    /// `connect`, which is a connection that never opened, and from
+    /// `stream_truncated`, which is a clean close with the answer unfinished.
+    /// Nobody said anything and the bytes stopped.
+    StreamTransport,
     /// A 2xx whose body was not JSON.
     BodyUnparseable,
     /// A 2xx whose JSON did not decode to a response.
@@ -252,6 +269,9 @@ impl ErrorClass {
             ErrorClass::Timeout => "timeout",
             ErrorClass::Connect => "connect",
             ErrorClass::StreamStalled => "stream_stalled",
+            ErrorClass::StreamError => "stream_error",
+            ErrorClass::StreamTruncated => "stream_truncated",
+            ErrorClass::StreamTransport => "stream_transport",
             ErrorClass::BodyUnparseable => "body_unparseable",
             ErrorClass::BodyUndecodable => "body_undecodable",
             ErrorClass::Other => "other",
@@ -398,6 +418,7 @@ const ALL_CACHE_LOOKUPS: &[CacheLookup] = &[
     CacheLookup::MissModelMismatch,
     CacheLookup::MissSchema,
     CacheLookup::Disabled,
+    CacheLookup::Error,
 ];
 
 /// Every cache write result, so the counters can be seeded at zero.
@@ -798,7 +819,9 @@ fn describe_everything() {
     );
     describe_counter!(
         "router_trials_total",
-        "Channel trials finished, by provider and outcome. One per channel, whatever M is."
+        "Channel trials finished, by provider and outcome. One per channel, whatever M is. \
+         `won` means the trial produced a usable answer, which under the `tps` hedge strategy \
+         more than one channel can do for a single client request."
     );
     describe_histogram!(
         "router_trials_per_request",

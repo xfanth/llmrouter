@@ -38,7 +38,7 @@
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
@@ -167,8 +167,10 @@ pub struct Racer {
     /// Channel trials in flight across every walk at once, which is what
     /// `router_trials_inflight` reports. One walk's own set is the wrong
     /// number: the racer is shared, so a second client request would
-    /// overwrite the first's gauge with its own.
-    trials_inflight: AtomicU32,
+    /// overwrite the first's gauge with its own. A lock rather than an
+    /// atomic because the count and the gauge have to move together, and
+    /// this is the number read at the moment of peak concurrency.
+    trials_inflight: Mutex<u32>,
 }
 
 impl Racer {
@@ -188,7 +190,7 @@ impl Racer {
             upstream,
             net,
             metrics,
-            trials_inflight: AtomicU32::new(0),
+            trials_inflight: Mutex::new(0),
         }
     }
 
@@ -207,29 +209,27 @@ impl Racer {
     /// `cancel` is the client-disconnect token. Firing it tears down every
     /// channel call at once.
     pub async fn run(&self, input: RaceInput, cancel: CancellationToken) -> RaceOutcome {
-        let mut copies_fired: u32 = 0;
-        let outcome = self.walk(input, cancel, &mut copies_fired).await;
-        // The copy count divided by M is the trial count, because every trial
-        // fires M copies. The gap between the two is what M cost: the live run
-        // came back with 9.2 trials and 18.4 copies for each client request,
-        // and nothing on `/metrics` said so.
-        let per_trial = self.config.router.max_per_channel.max(1) as u32;
-        self.metrics
-            .record_walk(copies_fired / per_trial, copies_fired);
+        let fired = WalkCount::default();
+        let outcome = self.walk(input, cancel, &fired).await;
+        // The gap between the two is what M cost: the live run came back with
+        // 9.2 trials and 18.4 copies for each client request, and nothing on
+        // `/metrics` said so.
+        self.metrics.record_walk(fired.trials(), fired.copies());
         outcome
     }
 
     /// The walk itself.
     ///
-    /// `copies` comes back carrying the count, so [`Racer::run`] records the
-    /// walk once on every way out of here, the client hanging up and a dead
-    /// link included. There are ten of those, and a counter written at each
-    /// one is a counter that will be missed off the eleventh.
+    /// `fired` comes back carrying what the walk actually started, so
+    /// [`Racer::run`] records the walk once on every way out of here, the
+    /// client hanging up and a dead link included. There are ten of those,
+    /// and a counter written at each one is a counter that will be missed off
+    /// the eleventh.
     async fn walk(
         &self,
         input: RaceInput,
         cancel: CancellationToken,
-        attempts: &mut u32,
+        fired: &WalkCount,
     ) -> RaceOutcome {
         let snapshot = self.catalogue.snapshot();
         // A child token, so the race can tear its own calls down on a win
@@ -250,8 +250,8 @@ impl Racer {
             &snapshot,
             &input,
             &mut excluded,
-            attempts,
             &race_cancel,
+            fired,
         );
 
         if inflight.is_empty() {
@@ -296,7 +296,7 @@ impl Racer {
 
                 else => {
                     let outcome =
-                        exhausted(net_check.as_mut(), net_done, *attempts, last_error).await;
+                        exhausted(net_check.as_mut(), net_done, fired.queued(), last_error).await;
                     self.settle_held(&mut held, &outcome);
                     return outcome;
                 }
@@ -332,7 +332,7 @@ impl Racer {
                     return RaceOutcome::Buffered {
                         winner,
                         also_finished,
-                        attempts: *attempts,
+                        attempts: fired.queued(),
                     };
                 }
                 TrialOutcome::WonStreaming(ready) => {
@@ -378,12 +378,12 @@ impl Racer {
                             &snapshot,
                             &input,
                             &mut excluded,
-                            attempts,
                             &race_cancel,
+                            fired,
                         );
                         if inflight.is_empty() {
                             let outcome =
-                                exhausted(net_check.as_mut(), net_done, *attempts, last_error)
+                                exhausted(net_check.as_mut(), net_done, fired.queued(), last_error)
                                     .await;
                             self.settle_held(&mut held, &outcome);
                             return outcome;
@@ -407,7 +407,7 @@ impl Racer {
                         Ok(winner) => {
                             return RaceOutcome::Streamed {
                                 winner: Box::new(winner),
-                                attempts: *attempts,
+                                attempts: fired.queued(),
                             }
                         }
                         // The decoder refused the stream. Everything else is
@@ -415,7 +415,7 @@ impl Racer {
                         Err(error) => {
                             last_error = Some(error);
                             let outcome =
-                                exhausted(net_check.as_mut(), net_done, *attempts, last_error)
+                                exhausted(net_check.as_mut(), net_done, fired.queued(), last_error)
                                     .await;
                             self.settle_held(&mut held, &outcome);
                             return outcome;
@@ -442,14 +442,15 @@ impl Racer {
                         &snapshot,
                         &input,
                         &mut excluded,
-                        attempts,
                         &race_cancel,
+                        fired,
                     );
                 }
             }
 
             if inflight.is_empty() {
-                let outcome = exhausted(net_check.as_mut(), net_done, *attempts, last_error).await;
+                let outcome =
+                    exhausted(net_check.as_mut(), net_done, fired.queued(), last_error).await;
                 self.settle_held(&mut held, &outcome);
                 return outcome;
             }
@@ -468,8 +469,8 @@ impl Racer {
         snapshot: &'a [Channel],
         input: &RaceInput,
         excluded: &mut Excluded,
-        attempts: &mut u32,
         cancel: &CancellationToken,
+        fired: &'a WalkCount,
     ) {
         let copies = self.config.router.max_per_channel.max(1) as u32;
         let wanted = self
@@ -488,12 +489,13 @@ impl Racer {
             crate::catalogue::query(snapshot, &input.filter, excluded, wanted, now_unix())
         {
             excluded.insert(channel.id);
-            *attempts = attempts.saturating_add(copies);
+            fired.queued.fetch_add(copies, Ordering::Relaxed);
             inflight.push(Box::pin(self.run_trial(
                 channel,
                 Arc::clone(&input.outbound),
                 input.streaming,
                 cancel.child_token(),
+                fired,
             )));
         }
     }
@@ -509,30 +511,31 @@ impl Racer {
         body: Arc<PromptBody>,
         streaming: bool,
         cancel: CancellationToken,
+        fired: &'a WalkCount,
     ) -> TrialOutcome<'a> {
         let copies = self.config.router.max_per_channel.max(1);
         let delay = Duration::from_millis(self.config.router.hedge_delay_ms);
         // Our own open copies, so a `429` can tell a sibling copy apart from
         // another client request hitting the same channel.
         let own = Arc::new(AtomicU32::new(0));
-        // Raised before the copies still running are dropped, so each one can
-        // tell which of the two tear-downs took it: a sibling copy of its own
-        // channel winning, or another channel winning the whole race. They
-        // look identical from inside the copy and mean opposite things to
-        // whoever is reading the counters.
-        let lost_the_race = Arc::new(AtomicBool::new(false));
-        let _gauge = TrialGauge::open(&self.trials_inflight, &self.metrics);
+        // This trial's verdict and its share of the in-flight gauge. Both
+        // ride on a guard because three of the walk's endings tear a trial
+        // down by dropping its future rather than polling it, and nothing
+        // written in the body below would run at all.
+        let mut trial = TrialRecord::open(
+            &self.metrics,
+            &self.trials_inflight,
+            &channel.provider,
+            fired,
+        );
 
         let mut running = FuturesUnordered::new();
         for index in 0..copies {
             let body = Arc::clone(&body);
             let own = own.clone();
             let offset = hedge_offset(index, delay);
-            let mut record = CopyRecord::open(
-                Arc::clone(&self.metrics),
-                &channel.provider,
-                Arc::clone(&lost_the_race),
-            );
+            let mut record =
+                CopyRecord::open(Arc::clone(&self.metrics), &channel.provider, &cancel, fired);
             running.push(async move {
                 if !offset.is_zero() {
                     tokio::time::sleep(offset).await;
@@ -592,27 +595,21 @@ impl Racer {
                 // trial is counted on what it produced, not on what the walk
                 // did with it afterwards.
                 self.metrics.record_hedge_win(&channel.provider, index);
-                self.metrics
-                    .record_trial(&channel.provider, TrialOutcomeLabel::Won);
+                trial.settle(TrialOutcomeLabel::Won);
                 return self.trial_won(channel, win);
             }
             CopyRace::Cancelled => {
-                // Before the set is dropped, so the copies still running are
-                // recorded as cancelled rather than superseded.
-                lost_the_race.store(true, Ordering::Relaxed);
                 self.metrics.record_attempt(
                     &channel.provider,
                     &channel.model_id,
                     AttemptOutcome::Cancelled,
                 );
-                self.metrics
-                    .record_trial(&channel.provider, TrialOutcomeLabel::Cancelled);
+                trial.settle(TrialOutcomeLabel::Cancelled);
                 return TrialOutcome::Cancelled;
             }
             CopyRace::AllFailed => {}
         }
-        self.metrics
-            .record_trial(&channel.provider, TrialOutcomeLabel::Failed);
+        trial.settle(TrialOutcomeLabel::Failed);
 
         // Every copy failed, which is one failure against health, not M. The
         // health write itself is the walk's to make, not the trial's: until
@@ -664,6 +661,7 @@ impl Racer {
             self.config.router.stream_stall_timeout,
             Arc::clone(&self.health),
             Arc::clone(&self.catalogue),
+            Arc::clone(&self.metrics),
         )
     }
 
@@ -1251,6 +1249,38 @@ fn copy_outcome_for(class: ErrorClass) -> CopyOutcome {
     }
 }
 
+/// What one client request actually fired, for `router_trials_per_request`
+/// and `router_copies_per_request`.
+///
+/// Counted when a trial and its copies start, not when the walk queues them.
+/// A trial pushed onto the set and never polled once, which is what a client
+/// that hung up before the first poll leaves behind, fires nothing: counting
+/// it would put M copies into the histogram that never left the box and leave
+/// it disagreeing with `router_copies_total`.
+#[derive(Default)]
+struct WalkCount {
+    /// Channel calls queued, which is the number the `504` body reports. Not
+    /// the same as `copies`: a trial queued and never polled is counted here
+    /// and fires nothing.
+    queued: AtomicU32,
+    trials: AtomicU32,
+    copies: AtomicU32,
+}
+
+impl WalkCount {
+    fn queued(&self) -> u32 {
+        self.queued.load(Ordering::Relaxed)
+    }
+
+    fn trials(&self) -> u32 {
+        self.trials.load(Ordering::Relaxed)
+    }
+
+    fn copies(&self) -> u32 {
+        self.copies.load(Ordering::Relaxed)
+    }
+}
+
 /// One copy's own counters, including the copy nobody ever awaits.
 ///
 /// A copy whose sibling wins is dropped mid-await when the trial's set goes,
@@ -1264,19 +1294,30 @@ struct CopyRecord {
     /// Set once the copy has recorded its own ending. One that reaches `Drop`
     /// still clear was torn down rather than finished.
     reported: bool,
-    /// The trial's flag: true once another channel won the race, false while
-    /// the only thing that can take this copy is a sibling of its own.
-    lost_the_race: Arc<AtomicBool>,
+    /// This trial's own token, a child of the walk's. Cancelled means the
+    /// walk tore the whole trial down, so a copy dropped under it was
+    /// cancelled; clear means the only thing that can have taken this copy is
+    /// a sibling of its own winning. Reading the token rather than a flag the
+    /// trial raises is the point: three of the walk's endings drop the trial
+    /// future without polling it again, so no flag the trial sets itself
+    /// would ever be raised on them.
+    cancel: CancellationToken,
 }
 
 impl CopyRecord {
-    fn open(metrics: Arc<Metrics>, provider: &str, lost_the_race: Arc<AtomicBool>) -> Self {
+    fn open(
+        metrics: Arc<Metrics>,
+        provider: &str,
+        cancel: &CancellationToken,
+        fired: &WalkCount,
+    ) -> Self {
+        fired.copies.fetch_add(1, Ordering::Relaxed);
         Self {
             metrics,
             provider: provider.to_string(),
             started: tokio::time::Instant::now(),
             reported: false,
-            lost_the_race,
+            cancel: cancel.clone(),
         }
     }
 
@@ -1315,7 +1356,7 @@ impl Drop for CopyRecord {
         if self.reported {
             return;
         }
-        let outcome = if self.lost_the_race.load(Ordering::Relaxed) {
+        let outcome = if self.cancel.is_cancelled() {
             CopyOutcome::Cancelled
         } else {
             CopyOutcome::Superseded
@@ -1324,33 +1365,75 @@ impl Drop for CopyRecord {
     }
 }
 
-/// Channel trials in flight, as `router_trials_inflight`.
+/// One trial's verdict and its share of `router_trials_inflight`.
 ///
-/// Counted on the shared racer rather than off one walk's own set, because
-/// several client requests race at once: a walk publishing its own N would
-/// overwrite whatever its neighbours were showing. A trial that is cancelled
-/// is dropped rather than finished, so the decrement has to ride on the drop.
-struct TrialGauge<'a> {
-    inflight: &'a AtomicU32,
+/// Both ride on the drop, because three of the walk's endings tear a trial
+/// down by dropping its future rather than polling it: a streaming win, the
+/// client hanging up and the link proving to be down. Recorded in the trial's
+/// own body, those three would record nothing at all, and the sum that this
+/// whole change exists for, M copies to one trial, would stop reconciling.
+///
+/// The gauge is counted on the shared racer rather than off one walk's own
+/// set, because several client requests race at once and a walk publishing
+/// its own N would overwrite whatever its neighbours were showing.
+struct TrialRecord<'a> {
     metrics: &'a Metrics,
+    inflight: &'a Mutex<u32>,
+    provider: &'a str,
+    /// Set once the trial has recorded its verdict, so `Drop` knows whether
+    /// it ended or was torn down.
+    settled: bool,
 }
 
-impl<'a> TrialGauge<'a> {
-    fn open(inflight: &'a AtomicU32, metrics: &'a Metrics) -> Self {
-        let open = inflight.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        metrics.set_trials_inflight(u64::from(open));
-        Self { inflight, metrics }
+impl<'a> TrialRecord<'a> {
+    fn open(
+        metrics: &'a Metrics,
+        inflight: &'a Mutex<u32>,
+        provider: &'a str,
+        fired: &WalkCount,
+    ) -> Self {
+        fired.trials.fetch_add(1, Ordering::Relaxed);
+        move_gauge(metrics, inflight, 1);
+        Self {
+            metrics,
+            inflight,
+            provider,
+            settled: false,
+        }
+    }
+
+    /// The trial reached a verdict of its own.
+    fn settle(&mut self, outcome: TrialOutcomeLabel) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        self.metrics.record_trial(self.provider, outcome);
     }
 }
 
-impl Drop for TrialGauge<'_> {
+impl Drop for TrialRecord<'_> {
     fn drop(&mut self) {
-        let open = self
-            .inflight
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-        self.metrics.set_trials_inflight(u64::from(open));
+        // Torn down mid-flight, which is only ever another channel winning,
+        // the client leaving, or a dead link. All three are the same thing to
+        // this counter: this channel never got to finish.
+        self.settle(TrialOutcomeLabel::Cancelled);
+        move_gauge(self.metrics, self.inflight, -1);
     }
+}
+
+/// Moves the trials-in-flight count and publishes it under one lock.
+///
+/// Counting and publishing as two steps lets two trials opening at once
+/// interleave and latch the gauge below the true count until the next trial
+/// moves it. This is the number read against `race_width` at the moment of
+/// peak concurrency, which is exactly the moment it would be wrong.
+fn move_gauge(metrics: &Metrics, inflight: &Mutex<u32>, by: i32) {
+    let mut open = inflight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *open = open.saturating_add_signed(by);
+    metrics.set_trials_inflight(u64::from(*open));
 }
 
 /// A channel's raw reply bytes, still in that provider's framing.
@@ -1701,6 +1784,7 @@ fn watch_for_stalls<S>(
     stall: Duration,
     on_death: DeathHook,
     finished: Arc<AtomicBool>,
+    death: StreamDeath,
 ) -> impl Stream<Item = Result<Vec<u8>, wire::WireError>> + Send
 where
     S: Stream<Item = Result<Vec<u8>, CallError>> + Send + 'static,
@@ -1729,15 +1813,36 @@ where
                 Err(_) if complete => return,
                 Err(_) => {
                     on_death.fire();
+                    // The one failure the client sees half an answer of. It
+                    // is counted here rather than on the copy counters
+                    // because the copy won its trial minutes ago: by now this
+                    // is the winning stream dying mid-answer.
+                    death.record(ErrorClass::StreamStalled);
                     yield Err(wire::WireError::Stream(format!(
                         "no token for {}s",
                         stall.as_secs()
                     )));
                     return;
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    // A body that ends with no terminal event is an answer cut
+                    // off part way through. The decoder is what fails on it,
+                    // further down, but by then it cannot tell a truncation
+                    // from an error frame, and here the terminal flag says
+                    // plainly which this was. Health is still the decoder's to
+                    // move: this only names the failure.
+                    if !finished.load(Ordering::Relaxed) {
+                        death.record(ErrorClass::StreamTruncated);
+                    }
+                    return;
+                }
                 Ok(Some(Err(error))) => {
                     on_death.fire();
+                    // The socket itself went part way through an answer.
+                    // Nobody said anything and the bytes stopped: not a
+                    // connection that never opened, and not the clean close
+                    // that `stream_truncated` is.
+                    death.record(ErrorClass::StreamTransport);
                     yield Err(wire::WireError::Stream(error.to_string()));
                     return;
                 }
@@ -1780,6 +1885,37 @@ impl DeathHook {
     fn fire(&self) {
         if !self.0.fired.swap(true, Ordering::Relaxed) {
             (self.0.act)();
+        }
+    }
+}
+
+/// Why a winning stream died, as `router_errors_total`, once per stream.
+///
+/// A dying stream reaches two watchers: the byte stream sees the socket stop,
+/// and the decoder sees the answer stop part way through. Health already
+/// dedupes across the pair through [`DeathHook`], and the class has to dedupe
+/// for the same reason, or one death is two numbers. Whichever watcher can
+/// name the failure gets there first, and the byte stream always sees its own
+/// end before the decoder reaches it.
+#[derive(Clone)]
+struct StreamDeath {
+    metrics: Arc<Metrics>,
+    provider: Arc<str>,
+    told: Arc<AtomicBool>,
+}
+
+impl StreamDeath {
+    fn new(metrics: Arc<Metrics>, provider: &str) -> Self {
+        Self {
+            metrics,
+            provider: Arc::from(provider),
+            told: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn record(&self, class: ErrorClass) {
+        if !self.told.swap(true, Ordering::Relaxed) {
+            self.metrics.record_error(&self.provider, class);
         }
     }
 }
@@ -1856,15 +1992,18 @@ impl ReadyStream {
         stall: Duration,
         health: Arc<HealthTable>,
         catalogue: Arc<Catalogue>,
+        metrics: Arc<Metrics>,
     ) -> Result<StreamWinner, String> {
         let open = self.open;
         let channel_id = self.channel_id;
+        let death = StreamDeath::new(metrics, &self.provider);
+        let classified = death.clone();
         let replayed = futures::stream::iter(self.buffered.into_iter().map(Ok)).chain(self.rest);
         let hook = DeathHook::new(move || fail_mid_stream(&health, &catalogue, channel_id));
         let decoded = hook.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let complete = Arc::clone(&finished);
-        let bytes = watch_for_stalls(replayed, stall, hook, finished).map(move |item| {
+        let bytes = watch_for_stalls(replayed, stall, hook, finished, death).map(move |item| {
             // The closure owns the guard, so it lives exactly as long as the
             // stream the client is reading.
             let _open = &open;
@@ -1879,7 +2018,14 @@ impl ReadyStream {
             // the news that the answer is over travels back up to the stall
             // timer from here.
             .on_terminal(move || complete.store(true, Ordering::Relaxed))
-            .on_error(move || decoded.fire());
+            .on_error(move || {
+                decoded.fire();
+                // Whatever the byte stream saw, it saw first and has already
+                // said so. Reaching here unclassified means the bytes were
+                // fine and the answer was not: an error frame part way
+                // through, or a frame the decoder could not read at all.
+                classified.record(ErrorClass::StreamError);
+            });
         Ok(StreamWinner {
             channel_id: self.channel_id,
             provider: self.provider,
@@ -2724,7 +2870,12 @@ mod tests {
     async fn stream_winner_carries_the_time_to_first_bytes() {
         let (health, _dir) = health_table();
         let winner = ready(120)
-            .into_winner(STALL, Arc::new(health), Arc::new(Catalogue::new()))
+            .into_winner(
+                STALL,
+                Arc::new(health),
+                Arc::new(Catalogue::new()),
+                Arc::new(Metrics::new().expect("the prometheus recorder builds")),
+            )
             .expect("decoder built");
         assert_eq!(winner.latency, Duration::from_millis(120));
     }
@@ -2925,6 +3076,7 @@ mod tests {
     async fn a_winning_stream_that_stalls_ends_and_backs_the_channel_off() {
         let deaths = Arc::new(AtomicU32::new(0));
         let counted = Arc::clone(&deaths);
+        let metrics = Arc::new(Metrics::new().expect("the prometheus recorder builds"));
         let live: ByteStream =
             Box::pin(futures::stream::iter(vec![Ok(token("x"))]).chain(futures::stream::pending()));
         let watched = watch_for_stalls(
@@ -2934,6 +3086,7 @@ mod tests {
                 counted.fetch_add(1, Ordering::Relaxed);
             }),
             Arc::new(AtomicBool::new(false)),
+            StreamDeath::new(Arc::clone(&metrics), "groq"),
         );
         futures::pin_mut!(watched);
 
@@ -2943,22 +3096,36 @@ mod tests {
         let stalled = watched.next().await.expect("the stall shows up as an item");
         assert!(stalled.is_err(), "a stalled stream ends the request");
         assert_eq!(deaths.load(Ordering::Relaxed), 1);
+        // The failure the client sees half an answer of, and the only one
+        // `router_errors_total` had no way to show.
+        assert_eq!(
+            sample(
+                &metrics.render(),
+                "router_errors_total",
+                &[r#"class="stream_stalled""#]
+            ),
+            1.0
+        );
     }
 
     /// Drives `rest` through `ReadyStream::into_winner`, the production path,
-    /// to the end, and returns whether the client saw an error and the health
-    /// entry the router wrote for the channel, if any.
-    async fn run_winner_to_end(rest: ByteStream) -> (bool, Option<crate::health::HealthEntry>) {
+    /// to the end, and returns whether the client saw an error, the health
+    /// entry the router wrote for the channel, if any, and the scrape, so a
+    /// caller can read what the death was recorded as.
+    async fn run_winner_to_end(
+        rest: ByteStream,
+    ) -> (bool, Option<crate::health::HealthEntry>, String) {
         let (health, _dir) = health_table();
         let health = Arc::new(health);
         let catalogue = Arc::new(Catalogue::new());
+        let metrics = Arc::new(Metrics::new().expect("the prometheus recorder builds"));
         let channel = row("groq", "key-0", "model-a");
         let id = channel.id;
         catalogue.replace(vec![channel]);
         let mut ready = ready_with(0, 1, rest);
         ready.channel_id = id;
         let winner = ready
-            .into_winner(STALL, Arc::clone(&health), catalogue)
+            .into_winner(STALL, Arc::clone(&health), catalogue, Arc::clone(&metrics))
             .expect("decoder built");
         let mut events = wire::encode_stream(winner.chunks, wire::Format::OpenAiChat, None)
             .expect("the encoder starts");
@@ -2966,7 +3133,11 @@ mod tests {
         while let Some(item) = events.next().await {
             failed |= item.is_err();
         }
-        (failed, health.get(&HealthKey::Channel(id)))
+        (
+            failed,
+            health.get(&HealthKey::Channel(id)),
+            metrics.render(),
+        )
     }
 
     /// A provider can report a failure inside an otherwise healthy stream: an
@@ -2982,12 +3153,26 @@ mod tests {
             Ok(token("hello")),
             Ok(b"data: {\"error\":{\"message\":\"quota exhausted\"}}\n\n".to_vec()),
         ]));
-        let (failed, entry) = run_winner_to_end(live).await;
+        let (failed, entry, render) = run_winner_to_end(live).await;
 
         assert!(failed, "the error frame reaches the client as an error");
         let entry = entry.expect("the channel is marked unhealthy");
         assert_eq!(entry.retry_counter, 1, "exactly once");
         assert!(entry.eligible_at > 0);
+        // The provider said why, so the class says so too rather than
+        // reporting the clean end of body that followed it.
+        assert_eq!(
+            sample(&render, "router_errors_total", &[r#"class="stream_error""#]),
+            1.0
+        );
+        assert_eq!(
+            sample(
+                &render,
+                "router_errors_total",
+                &[r#"class="stream_truncated""#]
+            ),
+            0.0
+        );
     }
 
     /// A provider that closes the body part way through an answer ends the
@@ -2998,12 +3183,96 @@ mod tests {
     async fn a_truncated_stream_backs_the_channel_off() {
         // Half an answer, then a clean end of body: no `[DONE]`, no error.
         let live: ByteStream = Box::pin(futures::stream::iter(vec![Ok(token("half"))]));
-        let (failed, entry) = run_winner_to_end(live).await;
+        let (failed, entry, render) = run_winner_to_end(live).await;
 
         assert!(failed, "the truncation reaches the client as an error");
         let entry = entry.expect("the channel is marked unhealthy");
         assert_eq!(entry.retry_counter, 1, "exactly once");
         assert!(entry.eligible_at > 0);
+        assert_eq!(
+            sample(
+                &render,
+                "router_errors_total",
+                &[r#"class="stream_truncated""#]
+            ),
+            1.0
+        );
+        assert_eq!(
+            sample(&render, "router_errors_total", &[r#"class="stream_error""#]),
+            0.0,
+            "nothing reported a failure: the body simply stopped"
+        );
+    }
+
+    /// A socket that breaks part way through an answer. The provider
+    /// reported nothing and the body did not close, so this is neither of the
+    /// two above, and a provider whose sockets break mid-answer is its own
+    /// operational fault rather than a share of a catch-all.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_whose_socket_breaks_mid_answer_is_recorded_as_transport() {
+        // Half an answer, then the connection goes.
+        let live: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(token("half")),
+            Err(CallError::Transport("connection reset".to_string())),
+        ]));
+        let (failed, entry, render) = run_winner_to_end(live).await;
+
+        assert!(failed, "the break reaches the client as an error");
+        let entry = entry.expect("the channel is marked unhealthy");
+        assert_eq!(entry.retry_counter, 1, "exactly once");
+        assert_eq!(
+            sample(
+                &render,
+                "router_errors_total",
+                &[r#"class="stream_transport""#]
+            ),
+            1.0
+        );
+        for other in ["stream_truncated", "stream_error", "stream_stalled"] {
+            assert_eq!(
+                sample(
+                    &render,
+                    "router_errors_total",
+                    &[&format!(r#"class="{other}""#)]
+                ),
+                0.0,
+                "a broken socket recorded {other}"
+            );
+        }
+    }
+
+    /// The guard on the three above. A complete answer also ends its body, so a
+    /// truncation test that only reads the end of the stream would mark every
+    /// healthy channel in the fleet as truncated. The terminal event is the
+    /// whole difference.
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_answer_is_not_recorded_as_a_death() {
+        let live: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(token("all")),
+            Ok(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec()),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ]));
+        let (failed, entry, render) = run_winner_to_end(live).await;
+
+        assert!(!failed, "a complete answer is not an error");
+        assert!(entry.is_none(), "and does not back the channel off");
+        for class in [
+            "stream_truncated",
+            "stream_error",
+            "stream_stalled",
+            "stream_transport",
+            "other",
+        ] {
+            assert_eq!(
+                sample(
+                    &render,
+                    "router_errors_total",
+                    &[&format!(r#"class="{class}""#)]
+                ),
+                0.0,
+                "a complete answer recorded {class}"
+            );
+        }
     }
 
     /// A complete answer is not a stall, however long the socket stays open.
@@ -3032,7 +3301,12 @@ mod tests {
         ready.channel_id = id;
         ready.wire = crate::config::WireName::Anthropic;
         let winner = ready
-            .into_winner(STALL, Arc::clone(&health), catalogue)
+            .into_winner(
+                STALL,
+                Arc::clone(&health),
+                catalogue,
+                Arc::new(Metrics::new().expect("the prometheus recorder builds")),
+            )
             .expect("decoder built");
         let mut events = wire::encode_stream(winner.chunks, wire::Format::AnthropicMessages, None)
             .expect("the encoder starts");
@@ -3109,6 +3383,10 @@ mod tests {
                 counted.fetch_add(1, Ordering::Relaxed);
             }),
             Arc::new(AtomicBool::new(false)),
+            StreamDeath::new(
+                Arc::new(Metrics::new().expect("the prometheus recorder builds")),
+                "groq",
+            ),
         );
         futures::pin_mut!(watched);
 
@@ -3305,7 +3583,12 @@ mod tests {
             open: InFlight::open(&channel, &own),
         };
         let winner = ready
-            .into_winner(STALL, Arc::new(health), Arc::new(Catalogue::new()))
+            .into_winner(
+                STALL,
+                Arc::new(health),
+                Arc::new(Catalogue::new()),
+                Arc::new(Metrics::new().expect("the prometheus recorder builds")),
+            )
             .expect("decoder built");
 
         assert_eq!(
@@ -3329,6 +3612,7 @@ mod tests {
         racer: Racer,
         metrics: Arc<Metrics>,
         channel: Channel,
+        fired: WalkCount,
         /// Held so the upstream outlives the trial that calls it.
         _server: Option<MockServer>,
         _dir: tempfile::TempDir,
@@ -3389,6 +3673,7 @@ mod tests {
                 ),
                 metrics,
                 channel,
+                fired: WalkCount::default(),
                 _server: server,
                 _dir: dir,
             }
@@ -3399,9 +3684,87 @@ mod tests {
                 br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":16}"#,
             )));
             self.racer
-                .run_trial(&self.channel, body, false, cancel)
+                .run_trial(&self.channel, body, false, cancel, &self.fired)
                 .await
         }
+    }
+
+    /// The tear-down the common endings actually use. A streaming win, a
+    /// client hanging up and a dead link all drop the trial's future rather
+    /// than polling it again, so nothing written inside `run_trial` runs at
+    /// all. `streaming` is the default, so this is the path most trials take,
+    /// and a copy recorded as `superseded` here would read as hedging beating
+    /// its own sibling when another channel actually won.
+    #[tokio::test]
+    async fn a_trial_dropped_mid_flight_is_cancelled_not_superseded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(chat_reply("too late"))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+
+        let harness = TrialHarness::build(2, 0, &uri, Some(server));
+        let cancel = CancellationToken::new();
+        let mut trial = Box::pin(harness.trial(cancel.clone()));
+        // Polled until both copies are out on the wire and waiting.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut trial)
+                .await
+                .is_err(),
+            "the upstream is slow, so the trial is still running"
+        );
+
+        // Another channel won: the walk cancels the race and drops the set
+        // without draining it, which is what `concede_to_stream` leaves.
+        cancel.cancel();
+        drop(trial);
+
+        let render = harness.metrics.render();
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="cancelled""#]),
+            2.0
+        );
+        assert_eq!(
+            sample(&render, "router_copies_total", &[r#"outcome="superseded""#]),
+            0.0,
+            "another channel won, not a sibling copy"
+        );
+        assert_eq!(
+            sample(&render, "router_trials_total", &[r#"outcome="cancelled""#]),
+            1.0,
+            "a trial nobody polls again still owes a verdict"
+        );
+        assert_eq!(
+            sample(&render, "router_trials_inflight", &[]),
+            0.0,
+            "the gauge comes back down on the drop"
+        );
+    }
+
+    /// A trial queued and never polled fires nothing. Counting it at queue
+    /// time would put M copies into `router_copies_per_request` that never
+    /// left the box, and leave the histogram disagreeing with
+    /// `router_copies_total`.
+    #[tokio::test]
+    async fn a_trial_that_is_never_polled_fires_nothing() {
+        let harness = TrialHarness::build(2, 0, "http://127.0.0.1:1", None);
+        drop(harness.trial(CancellationToken::new()));
+
+        assert_eq!(harness.fired.copies(), 0);
+        assert_eq!(harness.fired.trials(), 0);
+        assert_eq!(
+            sample(
+                &harness.metrics.render(),
+                "router_copies_total",
+                &[r#"outcome="cancelled""#]
+            ),
+            0.0
+        );
     }
 
     /// A whole OpenAI chat reply.
