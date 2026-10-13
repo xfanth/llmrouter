@@ -424,6 +424,7 @@ async fn the_fastest_of_two_channels_wins_and_the_loser_is_cancelled() {
             winner,
             also_finished,
             attempts,
+            ..
         } => {
             assert_eq!(winner.channel_id, fast_id, "the first answer home wins");
             assert_eq!(text_of(&winner.response), "fast");
@@ -622,7 +623,9 @@ async fn the_tps_window_picks_the_stream_that_produced_the_most_tokens() {
     let (outcome, _) = harness.run(input(true)).await;
 
     let winner = match outcome {
-        RaceOutcome::Streamed { winner, attempts } => {
+        RaceOutcome::Streamed {
+            winner, attempts, ..
+        } => {
             assert_eq!(attempts, 2, "both streams were opened and judged");
             winner
         }
@@ -955,7 +958,9 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
     let (outcome, elapsed) = harness.run(input(true)).await;
 
     let winner = match outcome {
-        RaceOutcome::Streamed { winner, attempts } => {
+        RaceOutcome::Streamed {
+            winner, attempts, ..
+        } => {
             assert_eq!(attempts, 2, "the broken channel and its replacement");
             winner
         }

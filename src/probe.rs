@@ -268,6 +268,15 @@ impl Prober {
             })
             .filter(|e| e.retry_counter > 0)
             .map_or(0, |e| e.eligible_at);
+        // A provider in backoff holds its channels back too. Reading only the
+        // pair left a provider marked unreachable with every one of its rows
+        // still eligible, so the walk kept racing channels on a host the
+        // poller had already written off.
+        let provider_eligible_at = self
+            .health
+            .get(&HealthKey::Provider(provider.name.clone()))
+            .filter(|e| e.retry_counter > 0)
+            .map_or(0, |e| e.eligible_at);
         let key_id: Arc<str> = Arc::from(key_id);
 
         models
@@ -308,8 +317,6 @@ impl Prober {
                     .health
                     .get(&HealthKey::Channel(id))
                     .unwrap_or_else(|| HealthEntry::new(self.health.retry_base_secs()));
-                // A pair in backoff holds every channel on it back too.
-                let eligible_at = known.eligible_at.max(pair_eligible_at);
 
                 Channel {
                     id,
@@ -353,7 +360,13 @@ impl Prober {
                         enabled: AtomicBool::new(true),
                         retry_counter: AtomicU32::new(known.retry_counter),
                         retry_base_secs: AtomicU64::new(known.retry_base_secs),
-                        eligible_at: AtomicU64::new(eligible_at),
+                        eligible_at: AtomicU64::new(known.eligible_at),
+                        // A pair or a provider in backoff holds every channel
+                        // under it back too, and each level keeps its own
+                        // field so a later move at one level cannot erase
+                        // another's.
+                        pair_eligible_at: AtomicU64::new(pair_eligible_at),
+                        provider_eligible_at: AtomicU64::new(provider_eligible_at),
                         // A rebuild carries the live count over from the row
                         // this one replaces, so starting at zero is right.
                         in_flight: Arc::new(AtomicU32::new(0)),
@@ -1234,6 +1247,29 @@ mod tests {
         assert_eq!(channels[0].limit_context, 8_000);
     }
 
+    /// The poller rebuilds the catalogue every tick, and a rebuild that read
+    /// only the pair handed back fresh rows with the provider's own backoff
+    /// thrown away. The walk then raced a host the keyless probe had already
+    /// found unreachable.
+    #[test]
+    fn a_rebuild_keeps_a_provider_level_backoff_on_the_new_rows() {
+        let (prober, _dir) = prober_ranked(Vec::new(), Vec::new(), Vec::new());
+        let p = provider("https://example.invalid", "/models");
+        let entry = prober.health.record_failure(
+            &HealthKey::Provider("gemini".to_string()),
+            Some(600),
+            1_000,
+        );
+
+        let channels = prober.build_channels(&p, "gemini#0", "secret", &[probed("model-a", None)]);
+        assert_eq!(
+            channels[0].health.not_before(),
+            entry.eligible_at,
+            "a rebuilt row carries the provider's deadline"
+        );
+        assert!(!channels[0].eligible(1_010));
+    }
+
     fn provider(base_url: &str, models_path: &str) -> Provider {
         Provider {
             name: "gemini".to_string(),
@@ -1607,11 +1643,7 @@ mod tests {
             "a pair in backoff must not be raced"
         );
         assert!(
-            rows[0]
-                .health
-                .eligible_at
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > now + 86_400,
+            rows[0].health.not_before() > now + 86_400,
             "the row carries the pair's Retry-After as its next_eligible time"
         );
 

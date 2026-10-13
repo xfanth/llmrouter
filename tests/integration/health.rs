@@ -198,6 +198,12 @@ impl Harness {
     /// Finds a row by its id and clears the backoff the catalogue mirrors, so
     /// the next walk picks it up again. The health table is left alone: this
     /// stands in for the backoff deadline passing, not for a recovery.
+    /// Stands in for every deadline on the row passing.
+    ///
+    /// A row carries one deadline per level, and a failure that took the
+    /// channel down usually took its pair and its provider with it, so
+    /// clearing the channel's own deadline alone leaves the row held by the
+    /// two above it and the walk never calls it.
     fn reopen_row(&self, id: ChannelId) {
         let snapshot = self.catalogue.snapshot();
         let row = snapshot
@@ -205,6 +211,12 @@ impl Harness {
             .find(|c| c.id == id)
             .expect("the row is in the catalogue");
         row.health.eligible_at.store(0, AtomicOrdering::Relaxed);
+        row.health
+            .pair_eligible_at
+            .store(0, AtomicOrdering::Relaxed);
+        row.health
+            .provider_eligible_at
+            .store(0, AtomicOrdering::Relaxed);
     }
 
     fn row_counters(&self, id: ChannelId) -> (u32, u64) {

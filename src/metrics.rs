@@ -343,6 +343,47 @@ impl TokenKind {
     }
 }
 
+/// What the hedge bought on a won trial, as
+/// `router_hedge_outcome_total{provider,result}`.
+///
+/// The counter that was missing. `router_hedge_wins_total` says which copy
+/// index won, and on its own that is a coin flip: two copies race, one wins,
+/// and a live run came back 5 against 5. `router_copy_latency_seconds` cannot
+/// settle it either, because a superseded copy is killed at the instant its
+/// sibling wins, so its recorded latency equals the winner's by construction.
+///
+/// This asks the question that decides M instead: when this trial won, had
+/// its siblings already failed, or were they still running?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HedgeOutcome {
+    /// A hedge copy won and the first copy had already failed. Without the
+    /// hedge the whole trial would have failed and the walk would have moved
+    /// to the next channel. This is M earning its keep.
+    Rescued,
+    /// A hedge copy won while the first copy was still running, so it beat
+    /// the first copy on speed. M saved time here. How much is not knowable
+    /// without letting the loser finish, which the race kills on purpose.
+    Faster,
+    /// The first copy won. Every other copy was a second call against the
+    /// key's rate budget that changed nothing, because the copy that would
+    /// have run at M=1 is the one that answered.
+    Redundant,
+    /// There was no hedge, because `max_per_channel` is 1.
+    NoHedge,
+}
+
+impl HedgeOutcome {
+    /// The label value written to `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            HedgeOutcome::Rescued => "rescued",
+            HedgeOutcome::Faster => "faster",
+            HedgeOutcome::Redundant => "redundant",
+            HedgeOutcome::NoHedge => "no_hedge",
+        }
+    }
+}
+
 /// Histogram buckets for `router_latency_seconds`, in seconds.
 ///
 /// One metric name carries both stages, so Prometheus forces one bucket set
@@ -584,6 +625,24 @@ impl Metrics {
         });
     }
 
+    /// What the hedge bought on one won trial.
+    /// `router_hedge_outcome_total{provider,result}`.
+    ///
+    /// Read this against `router_copies_total{outcome="self_inflicted_429"}`,
+    /// which is what M costs. Mostly `redundant` with self-inflicted 429s
+    /// climbing means `max_per_channel` should come down, or
+    /// `hedge_delay_ms` should come up off 0.
+    pub fn record_hedge_outcome(&self, provider: &str, result: HedgeOutcome) {
+        self.on_recorder(|| {
+            counter!(
+                "router_hedge_outcome_total",
+                "provider" => provider.to_owned(),
+                "result" => result.label(),
+            )
+            .increment(1);
+        });
+    }
+
     /// One channel trial finished. `router_trials_total{provider,outcome}`.
     /// One per channel the walk reached, whatever M is.
     pub fn record_trial(&self, provider: &str, outcome: TrialOutcomeLabel) {
@@ -811,11 +870,22 @@ fn describe_everything() {
     describe_histogram!(
         "router_copy_latency_seconds",
         Unit::Seconds,
-        "How long one copy of a channel call ran before it won or failed."
+        "How long one copy of a channel call ran before it won, failed or was \
+         stopped. A superseded or cancelled copy is stopped at the instant \
+         the race ends, so those two outcomes measure when the race ended, \
+         not how long the copy would have taken."
     );
     describe_counter!(
         "router_hedge_wins_total",
-        "Channel trials won, by provider and the index of the copy that won."
+        "Channel trials won, by provider and the index of the copy that won. \
+         On its own this is a coin flip and says nothing about whether \
+         hedging helped: read router_hedge_outcome_total for that."
+    );
+    describe_counter!(
+        "router_hedge_outcome_total",
+        "Won trials by what the hedge bought: rescued when a hedge copy won \
+         after the first copy failed, faster when a hedge copy beat a first \
+         copy still running, redundant when the first copy won anyway."
     );
     describe_counter!(
         "router_trials_total",

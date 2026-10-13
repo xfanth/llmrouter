@@ -201,7 +201,7 @@ fn summarise(group: &[&Channel], now_unix: u64) -> ChannelSummary {
 
     for channel in group {
         let enabled = channel.health.enabled.load(Ordering::Relaxed);
-        let eligible_at = channel.health.eligible_at.load(Ordering::Relaxed);
+        let eligible_at = channel.health.not_before();
         if eligible_at > now_unix {
             in_backoff += 1;
             next_eligible = Some(next_eligible.map_or(eligible_at, |n: u64| n.min(eligible_at)));
