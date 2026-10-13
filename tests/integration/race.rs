@@ -108,6 +108,11 @@ impl Harness {
             capabilities: HashMap::new(),
         });
 
+        // One `Metrics` across the harness, as `main.rs` builds it, so the
+        // health table's backoff counters land in the same set the racer
+        // writes to and a test can read both together.
+        let metrics = crate::test_metrics();
+
         let db = Arc::new(
             redb::Database::create(dir.path().join("state.redb")).expect("the store opens"),
         );
@@ -116,6 +121,7 @@ impl Harness {
                 db,
                 config.router.health_poll.retry_base,
                 config.router.health_poll.backoff_max,
+                (*metrics).clone(),
             )
             .expect("the health table opens"),
         );
@@ -164,7 +170,7 @@ impl Harness {
             Arc::clone(&health),
             upstream,
             net,
-            crate::test_metrics(),
+            metrics,
         );
 
         Self {

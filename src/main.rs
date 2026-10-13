@@ -129,13 +129,24 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
             .with_context(|| format!("opening {}", router.cache.path.display()))?,
     );
 
+    // Built before the health table and the cache, because both of them
+    // record through it. Each `Metrics` owns its recorder rather than
+    // installing a process-wide one, so the clones below all write to this
+    // set of counters and a test can hold its own.
+    let metrics = Arc::new(Metrics::new()?);
+
     let health = Arc::new(HealthTable::open(
         Arc::clone(&db),
         router.health_poll.retry_base,
         router.health_poll.backoff_max,
+        (*metrics).clone(),
     )?);
     let cache = if router.cache.enabled {
-        Some(Arc::new(Cache::open(db, &router.cache)?))
+        Some(Arc::new(Cache::open(
+            db,
+            &router.cache,
+            (*metrics).clone(),
+        )?))
     } else {
         None
     };
@@ -147,8 +158,6 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
         router.health_poll.network_test_timeout,
     );
     let catalogue = Arc::new(Catalogue::new());
-    // metrics::set_global_recorder is process-wide, so Metrics::new runs once.
-    let metrics = Arc::new(Metrics::new()?);
 
     let racer = Arc::new(Racer::new(
         Arc::clone(&config),

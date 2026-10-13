@@ -22,6 +22,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::catalogue::ChannelId;
+use crate::metrics::{BackoffKind, Metrics};
 use crate::RouterError;
 
 /// The redb table holding the health rows. Key and value are both JSON, which
@@ -48,6 +49,17 @@ pub enum HealthKey {
     },
     /// One provider. Polled with the keyless reachability probe.
     Provider(String),
+}
+
+impl HealthKey {
+    /// The `kind` label this key's backoff is counted under on `/metrics`.
+    fn backoff_kind(&self) -> BackoffKind {
+        match self {
+            HealthKey::Channel(_) => BackoffKind::Channel,
+            HealthKey::ProviderKey { .. } => BackoffKind::ProviderKey,
+            HealthKey::Provider(_) => BackoffKind::Provider,
+        }
+    }
 }
 
 /// The three numbers every unhealthy thing carries.
@@ -81,6 +93,7 @@ pub struct HealthTable {
     db: Arc<Database>,
     retry_base: Duration,
     backoff_max: Duration,
+    metrics: Metrics,
 }
 
 impl HealthTable {
@@ -89,6 +102,7 @@ impl HealthTable {
         db: Arc<Database>,
         retry_base: Duration,
         backoff_max: Duration,
+        metrics: Metrics,
     ) -> crate::Result<Self> {
         // Opening the table inside a write transaction creates it on a fresh
         // file, so every later read finds it.
@@ -120,6 +134,7 @@ impl HealthTable {
             db,
             retry_base,
             backoff_max,
+            metrics,
         })
     }
 
@@ -166,30 +181,43 @@ impl HealthTable {
         now_unix: u64,
         mirror: impl FnOnce(&HealthEntry),
     ) -> HealthEntry {
-        let mut entry = self
-            .entries
-            .entry(key.clone())
-            .or_insert_with(|| HealthEntry::new(self.retry_base_secs()));
-        entry.retry_counter = entry.retry_counter.saturating_add(1);
-        if let Some(secs) = retry_after_secs {
-            // A date already past parses to 0. Floor the base at 1 second, or
-            // the thing would be eligible again at once and never back off.
-            entry.retry_base_secs = secs.max(1);
-        }
-        let wait = wait_seconds(
-            entry.retry_counter,
-            entry.retry_base_secs,
-            self.backoff_max.as_secs(),
-        );
-        entry.eligible_at = now_unix.saturating_add(wait);
-        mirror(&entry);
-        *entry
+        let (applied, wait) = {
+            let mut entry = self
+                .entries
+                .entry(key.clone())
+                .or_insert_with(|| HealthEntry::new(self.retry_base_secs()));
+            entry.retry_counter = entry.retry_counter.saturating_add(1);
+            if let Some(secs) = retry_after_secs {
+                // A date already past parses to 0. Floor the base at 1 second, or
+                // the thing would be eligible again at once and never back off.
+                entry.retry_base_secs = secs.max(1);
+            }
+            let wait = wait_seconds(
+                entry.retry_counter,
+                entry.retry_base_secs,
+                self.backoff_max.as_secs(),
+            );
+            entry.eligible_at = now_unix.saturating_add(wait);
+            mirror(&entry);
+            (*entry, wait)
+        };
+        // Recorded outside the shard lock, and taken from the same `wait` the
+        // deadline was built from, so the metric cannot drift from the
+        // behaviour it is meant to describe.
+        self.metrics
+            .record_backoff(key.backoff_kind(), Duration::from_secs(wait));
+        applied
     }
 
     /// Records a success. Drops the entry, so the next failure starts from
     /// the configured base again.
     pub fn record_success(&self, key: &HealthKey) {
-        self.entries.remove(key);
+        // Only an entry that was actually there counts as a reset. A success
+        // against something that was never in backoff is the normal case, and
+        // counting it would bury the churn signal in noise.
+        if self.entries.remove(key).is_some() {
+            self.metrics.record_backoff_reset(key.backoff_kind());
+        }
     }
 
     /// `record_success`, running `mirror` while the entry's lock is held, for
@@ -197,12 +225,21 @@ impl HealthTable {
     /// there is no entry, so a failure cannot write one between the removal
     /// and the copy. `mirror` must not touch this table.
     pub fn record_success_then(&self, key: &HealthKey, mirror: impl FnOnce()) {
-        match self.entries.entry(key.clone()) {
+        let reset = match self.entries.entry(key.clone()) {
             dashmap::Entry::Occupied(entry) => {
                 mirror();
                 entry.remove();
+                true
             }
-            dashmap::Entry::Vacant(_guard) => mirror(),
+            dashmap::Entry::Vacant(_guard) => {
+                mirror();
+                false
+            }
+        };
+        // Same rule as `record_success`: no entry, no reset. Recorded after
+        // the lock is let go.
+        if reset {
+            self.metrics.record_backoff_reset(key.backoff_kind());
         }
     }
 
@@ -216,6 +253,20 @@ impl HealthTable {
             .collect();
         // Soonest due first, so `/healthz` reads in the order things recover.
         out.sort_by_key(|(_, e)| e.eligible_at);
+
+        // The gauge rides on the walk that already happens here (the `/healthz`
+        // handler and the prober summary both call this) rather than adding a
+        // second pass over the table on the request path. Every kind is set,
+        // including the empty ones, or a kind that recovered would sit at its
+        // last non-zero reading forever.
+        for kind in [
+            BackoffKind::Channel,
+            BackoffKind::ProviderKey,
+            BackoffKind::Provider,
+        ] {
+            let count = out.iter().filter(|(k, _)| k.backoff_kind() == kind).count();
+            self.metrics.set_in_backoff(kind, count as u64);
+        }
         out
     }
 
@@ -657,15 +708,40 @@ mod tests {
         retry_base_secs: u64,
         backoff_max_secs: u64,
     ) -> (HealthTable, tempfile::TempDir) {
+        let (t, _m, dir) = table_with_metrics(retry_base_secs, backoff_max_secs);
+        (t, dir)
+    }
+
+    /// The same table, with a handle on its `Metrics` so a test can read the
+    /// rendered counters back. The recorder is per-instance, not global, so
+    /// one test's numbers cannot leak into another's.
+    fn table_with_metrics(
+        retry_base_secs: u64,
+        backoff_max_secs: u64,
+    ) -> (HealthTable, Metrics, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("scratch dir");
         let db = Database::create(dir.path().join("health.redb")).unwrap();
+        let metrics = Metrics::new().expect("metrics");
         let t = HealthTable::open(
             Arc::new(db),
             Duration::from_secs(retry_base_secs),
             Duration::from_secs(backoff_max_secs),
+            metrics.clone(),
         )
         .unwrap();
-        (t, dir)
+        (t, metrics, dir)
+    }
+
+    /// The value of one rendered Prometheus sample, found by its full series
+    /// name. The match runs up to the space before the value, or
+    /// `kind="provider"` would also match the `kind="provider_key"` line.
+    fn sample(rendered: &str, prefix: &str) -> Option<f64> {
+        let prefix = format!("{prefix} ");
+        rendered
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
     }
 
     #[test]
@@ -812,8 +888,13 @@ mod tests {
 
         {
             let db = Arc::new(Database::create(&path).unwrap());
-            let t =
-                HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+            let t = HealthTable::open(
+                db,
+                Duration::from_secs(1),
+                Duration::from_secs(HOUR),
+                Metrics::new().expect("metrics"),
+            )
+            .unwrap();
             t.record_failure(&k, Some(600), 1_000);
             t.record_failure(&provider("dead"), None, 1_000);
             t.record_success(&provider("dead"));
@@ -821,7 +902,13 @@ mod tests {
         }
 
         let db = Arc::new(Database::create(&path).unwrap());
-        let t = HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+        let t = HealthTable::open(
+            db,
+            Duration::from_secs(1),
+            Duration::from_secs(HOUR),
+            Metrics::new().expect("metrics"),
+        )
+        .unwrap();
         let e = t.get(&k).unwrap();
         assert_eq!(e.retry_counter, 1);
         assert_eq!(e.retry_base_secs, 600);
@@ -843,13 +930,24 @@ mod tests {
         let k = HealthKey::Channel(ChannelId(0xdead_beef_u64));
         {
             let db = Arc::new(Database::create(&path).unwrap());
-            let t =
-                HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+            let t = HealthTable::open(
+                db,
+                Duration::from_secs(1),
+                Duration::from_secs(HOUR),
+                Metrics::new().expect("metrics"),
+            )
+            .unwrap();
             t.record_failure(&k, None, 500);
             t.flush().unwrap();
         }
         let db = Arc::new(Database::create(&path).unwrap());
-        let t = HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+        let t = HealthTable::open(
+            db,
+            Duration::from_secs(1),
+            Duration::from_secs(HOUR),
+            Metrics::new().expect("metrics"),
+        )
+        .unwrap();
         assert_eq!(t.get(&k).unwrap().eligible_at, 501);
     }
 
@@ -868,6 +966,7 @@ mod tests {
                 Arc::clone(&db),
                 Duration::from_secs(1),
                 Duration::from_secs(HOUR),
+                Metrics::new().expect("metrics"),
             )
             .unwrap(),
         );
@@ -881,8 +980,13 @@ mod tests {
         // shutdown, so a read after cancel would pass even if no periodic
         // tick ever fired, and a crash between ticks would then lose every
         // backoff written since boot.
-        let reopened =
-            HealthTable::open(db, Duration::from_secs(1), Duration::from_secs(HOUR)).unwrap();
+        let reopened = HealthTable::open(
+            db,
+            Duration::from_secs(1),
+            Duration::from_secs(HOUR),
+            Metrics::new().expect("metrics"),
+        )
+        .unwrap();
         assert_eq!(
             reopened.get(&k).map(|e| e.eligible_at),
             Some(501),
@@ -893,5 +997,152 @@ mod tests {
         loop_task
             .await
             .expect("the flush loop survives a zero interval");
+    }
+
+    #[test]
+    fn a_failure_records_a_backoff_entry_with_the_wait_that_was_applied() {
+        // The live run showed 150 upstream failures against two entries on
+        // `/healthz`, with nothing on `/metrics` to say whether the counters
+        // were resetting or the failures were going unrecorded.
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        t.record_failure(&provider("groq"), Some(60), 0);
+        let r = m.render();
+        assert_eq!(
+            sample(&r, r#"router_backoff_entries_total{kind="provider"}"#),
+            Some(1.0)
+        );
+        assert_eq!(sample(&r, "router_backoff_seconds_sum"), Some(60.0));
+        // Nothing else was touched. The recorder describes every kind up
+        // front, so the untouched ones read zero rather than going absent,
+        // which is what makes a flat line on the dashboard mean "none" rather
+        // than "not wired up".
+        assert_eq!(
+            sample(&r, r#"router_backoff_entries_total{kind="channel"}"#),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn each_kind_of_key_lands_under_its_own_label() {
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        t.record_failure(&HealthKey::Channel(ChannelId(7)), None, 0);
+        t.record_failure(
+            &HealthKey::ProviderKey {
+                provider: "gemini".to_string(),
+                key_id: "key-3".to_string(),
+            },
+            None,
+            0,
+        );
+        t.record_failure(&provider("groq"), None, 0);
+        let r = m.render();
+        for kind in ["channel", "provider_key", "provider"] {
+            assert_eq!(
+                sample(
+                    &r,
+                    &format!(r#"router_backoff_entries_total{{kind="{kind}"}}"#)
+                ),
+                Some(1.0),
+                "{kind} entry missing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_doubling_backoff_records_the_doubled_wait() {
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        let k = provider("groq");
+        t.record_failure(&k, None, 0);
+        t.record_failure(&k, None, 0);
+        t.record_failure(&k, None, 0);
+        let r = m.render();
+        assert_eq!(
+            sample(&r, r#"router_backoff_entries_total{kind="provider"}"#),
+            Some(3.0)
+        );
+        // 1 + 2 + 4: the metric follows the entry's own doubling rather than
+        // a second copy of the maths that could drift from it.
+        assert_eq!(sample(&r, "router_backoff_seconds_sum"), Some(7.0));
+    }
+
+    #[test]
+    fn a_success_after_a_failure_records_exactly_one_reset() {
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        let k = provider("groq");
+        t.record_failure(&k, None, 0);
+        t.record_success(&k);
+        assert_eq!(
+            sample(
+                &m.render(),
+                r#"router_backoff_resets_total{kind="provider"}"#
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn a_success_against_a_healthy_thing_records_no_reset() {
+        // Every successful request would otherwise count as a reset, and the
+        // churn rate would read as noise rather than as recovery.
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        t.record_success(&provider("groq"));
+        t.record_success_then(&provider("zai"), || {});
+        assert_eq!(
+            sample(
+                &m.render(),
+                r#"router_backoff_resets_total{kind="provider"}"#
+            ),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn the_mirroring_pair_record_the_same_numbers() {
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        let k = provider("groq");
+        t.record_failure_then(&k, Some(30), 0, |_| {});
+        t.record_success_then(&k, || {});
+        let r = m.render();
+        assert_eq!(sample(&r, "router_backoff_seconds_sum"), Some(30.0));
+        assert_eq!(
+            sample(&r, r#"router_backoff_resets_total{kind="provider"}"#),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn the_in_backoff_gauge_matches_the_table() {
+        let (t, m, _d) = table_with_metrics(1, HOUR);
+        let slow = provider("slow");
+        t.record_failure(&slow, Some(600), 0);
+        t.record_failure(&HealthKey::Channel(ChannelId(1)), Some(10), 0);
+
+        assert_eq!(t.in_backoff(0).len(), 2);
+        let r = m.render();
+        assert_eq!(
+            sample(&r, r#"router_in_backoff{kind="provider"}"#),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample(&r, r#"router_in_backoff{kind="channel"}"#),
+            Some(1.0)
+        );
+        // A kind with nothing in backoff reads zero rather than going absent.
+        assert_eq!(
+            sample(&r, r#"router_in_backoff{kind="provider_key"}"#),
+            Some(0.0)
+        );
+
+        // Past the channel's deadline the gauge follows the table down.
+        assert_eq!(t.in_backoff(100).len(), 1);
+        let r = m.render();
+        assert_eq!(
+            sample(&r, r#"router_in_backoff{kind="channel"}"#),
+            Some(0.0)
+        );
+        assert_eq!(
+            sample(&r, r#"router_in_backoff{kind="provider"}"#),
+            Some(1.0)
+        );
     }
 }

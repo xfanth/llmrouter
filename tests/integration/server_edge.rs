@@ -145,6 +145,13 @@ impl Edge {
         });
         let router = &config.router;
 
+        // One `Metrics` across the whole harness, as `main.rs` builds it.
+        // A fresh recorder per component would leave the cache's and the
+        // health table's counters unreachable from this state's `/metrics`,
+        // so a test could assert a cache series and never see what the cache
+        // actually wrote.
+        let metrics = crate::test_metrics();
+
         let db =
             Arc::new(llmrouter::cache::open_database(&router.cache).expect("the redb file opens"));
         let health = Arc::new(
@@ -152,18 +159,16 @@ impl Edge {
                 Arc::clone(&db),
                 router.health_poll.retry_base,
                 router.health_poll.backoff_max,
+                (*metrics).clone(),
             )
             .expect("the health table opens"),
         );
-        let cache = router
-            .cache
-            .enabled
-            .then(|| Arc::new(Cache::open(db, &router.cache).expect("the cache opens")));
+        let cache = router.cache.enabled.then(|| {
+            Arc::new(Cache::open(db, &router.cache, (*metrics).clone()).expect("the cache opens"))
+        });
 
         let catalogue = Arc::new(Catalogue::new());
         catalogue.replace(channels);
-
-        let metrics = crate::test_metrics();
         let upstream = Upstream::new(router).expect("the http client builds");
         let racer = Arc::new(Racer::new(
             Arc::clone(&config),
@@ -341,6 +346,43 @@ fn sse(text: &str, count: usize) -> String {
     });
     body.push_str(&format!("data: {done}\n\ndata: [DONE]\n\n"));
     body
+}
+
+/// `count` content deltas, a terminal frame, then the usage frame OpenAI
+/// sends last when a client asks for it.
+///
+/// Separate from [`sse`] because most tests do not care about token counts and
+/// the extra frame would only be noise in their bodies.
+fn sse_with_usage(text: &str, count: usize, completion_tokens: u64) -> String {
+    let mut body = sse(text, count);
+    // Dropped back in ahead of the done marker: a frame after `[DONE]` is
+    // past the end of the stream and no decoder is obliged to read it.
+    let marker = "data: [DONE]\n\n";
+    body.truncate(body.len() - marker.len());
+    let usage = json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "model": "fake-model",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 11 + completion_tokens,
+        },
+    });
+    body.push_str(&format!("data: {usage}\n\n{marker}"));
+    body
+}
+
+/// A provider answering with events and reporting its token usage at the end.
+fn stream_with_usage_template(
+    text: &str,
+    frames: usize,
+    completion_tokens: u64,
+) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(sse_with_usage(text, frames, completion_tokens))
 }
 
 /// A provider answering with server-sent events rather than one whole body.
@@ -1214,6 +1256,73 @@ async fn healthz_counts_only_the_channels_that_can_be_called_right_now() {
     assert_eq!(
         body["channels"]["eligible"], 1,
         "a channel waiting out a backoff is counted but not eligible"
+    );
+}
+
+/// Token counting used to hang off the cache's copy of the stream, so a
+/// streaming client with `cache.enabled: false` counted nothing at all and
+/// `router_tokens_total` quietly depended on an unrelated config flag. The
+/// count now comes off the stream on its way to the client.
+#[tokio::test]
+async fn a_streaming_client_counts_tokens_with_the_cache_switched_off() {
+    let server = upstream_serving(stream_with_usage_template("tick", 3, 17)).await;
+    let config = RouterConfig {
+        cache: CacheConfig {
+            enabled: false,
+            ..CacheConfig::default()
+        },
+        ..streaming_config()
+    };
+    let edge = Edge::new(
+        config,
+        vec![channel(&base_url(&server), "fake-model", FAKE_KEY, 200_000)],
+        Link::Up,
+    )
+    .await;
+    assert!(
+        edge.state.cache.is_none(),
+        "this test is only meaningful with the cache off"
+    );
+
+    let streamed = edge.post_chat(&chat_request("ping", true)).await;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let body = text_body(streamed).await;
+    assert_eq!(
+        body.matches("tick").count(),
+        3,
+        "the client still gets every delta: {body}"
+    );
+
+    // The count lands on a spawned task once the stream has run out, so it
+    // arrives a moment after the client's last frame. Same two second ceiling
+    // the other spawned-task assertions in this file settled on.
+    let series = "router_tokens_total{provider=\"fakeprovider\",kind=\"completion\"}";
+    let mut counted = 0.0;
+    for _ in 0..200 {
+        counted = series_value(&text_body(edge.get("/metrics").await).await, series);
+        if counted > 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        counted, 17.0,
+        "the provider's own completion count reaches the counter with no cache in the path"
+    );
+
+    let text = text_body(edge.get("/metrics").await).await;
+    assert_eq!(
+        series_value(
+            &text,
+            "router_tokens_total{provider=\"fakeprovider\",kind=\"prompt\"}"
+        ),
+        11.0,
+        "the prompt half is counted too"
+    );
+    assert_eq!(
+        series_value(&text, "router_cache_lookups_total{result=\"disabled\"}"),
+        1.0,
+        "a disabled cache says so rather than sitting at a zero that reads as a cache nobody asked"
     );
 }
 

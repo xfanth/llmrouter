@@ -28,7 +28,12 @@ fn store(max_bytes: u64, ttl: Duration) -> (TempDir, Cache) {
         ..CacheConfig::default()
     };
     let db = Arc::new(open_database(&config).expect("open the database"));
-    let cache = Cache::open(db, &config).expect("open the responses table");
+    let cache = Cache::open(
+        db,
+        &config,
+        llmrouter::metrics::Metrics::new().expect("the recorder builds"),
+    )
+    .expect("open the responses table");
     (dir, cache)
 }
 
@@ -311,7 +316,12 @@ fn a_write_over_max_bytes_evicts_the_oldest_tenth_first() {
         ..CacheConfig::default()
     };
     let db = Arc::new(open_database(&roomy).expect("open the database"));
-    let cache = Cache::open(Arc::clone(&db), &roomy).expect("open the responses table");
+    let cache = Cache::open(
+        Arc::clone(&db),
+        &roomy,
+        llmrouter::metrics::Metrics::new().expect("the recorder builds"),
+    )
+    .expect("open the responses table");
 
     // Twenty answers, oldest first.
     let keys: Vec<CacheKey> = (0..20u8)
@@ -340,6 +350,7 @@ fn a_write_over_max_bytes_evicts_the_oldest_tenth_first() {
             max_bytes: 1,
             ..roomy.clone()
         },
+        llmrouter::metrics::Metrics::new().expect("the recorder builds"),
     )
     .expect("open the responses table again");
     let fresh = key_for(Format::OpenAiChat, &openai_request("question 20", "auto"));

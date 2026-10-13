@@ -1700,22 +1700,90 @@ names the crate.
 
 ## What it records
 
-Omniroute died quietly. These four metrics are the reason `/metrics` exists.
+Omniroute died quietly and nobody was watching. `/metrics` exists so this one
+does not.
+
+The first live run against real providers settled what the page has to carry.
+Ten identical requests at N=2 and M=2 took a median of 730 seconds each, and
+the page could not say why. It reported 150 failed attempts against 92 channel
+trials with no way to tell which number counted what, no reason behind a single
+failure, nothing at all about hedging, nothing about backoff, and not one token
+counted. Everything below exists because that run needed it and it was not
+there.
+
+### The request
 
 | Metric | Why |
 |---|---|
 | `router_requests_total{outcome}` | One per code: `hit_cache`, `success`, `too_large` (413), `no_network` (502), `not_admitted` (503), `no_channel` (504). |
-| `router_rss_bytes` against `memory_high_water` | How close the gate is to firing. The one graph to watch. |
-| `router_attempts_total{provider,model,outcome}` | `success`, `http_error`, `timeout`, `cancelled`. A provider and model that flips to all `http_error` overnight is dead. Labelled by provider and model, not by channel id: a channel id is per key, which would put tens of thousands of series on the page. |
-| `router_latency_seconds` | Histogram, split into time to the winning response and time added by the router. The second one proves the latency target. |
+| `router_latency_seconds{stage}` | Histogram, split into `upstream` (time to the winning response) and `router` (time the router added). The second one proves the latency target. |
+| `router_ttft_seconds` | Histogram, accepting the client request to its first content token. Separate from latency because the two diverge: on the live run a request took 755 seconds to start and 1.3 seconds to finish, and only this says which half the client waited on. |
+| `router_trials_per_request`, `router_copies_per_request` | Histograms. How deep the walk went, and what M cost on top. The live run sat at 9.2 trials and 18.4 copies. |
+
+### Racing across channels, N
+
+| Metric | Why |
+|---|---|
+| `router_trials_total{provider,outcome}` | One per channel the walk reached, whatever M is: `won`, `failed`, `cancelled`. `won` means the trial produced a usable answer, which under the `tps` strategy more than one channel can do for a single client request: the window exists so several can be judged against each other, and recording the losers as `cancelled` would deny that they answered. The count of answers that reached a client is `router_requests_total`. |
+| `router_attempts_total{provider,model,outcome}` | `success`, `http_error`, `timeout`, `cancelled`. Per trial, kept for model-level diagnosis: a provider and model that flips to all `http_error` overnight is dead. Labelled by provider and model, not by channel id: a channel id is per key, which would put tens of thousands of series on the page. |
+| `router_trials_inflight` | Gauge, against `race_width`. Says whether N is the binding constraint. |
+
+### Hedging within one channel, M
+
+| Metric | Why |
+|---|---|
+| `router_copies_total{provider,outcome}` | One per copy, M per trial: `success`, `http_error`, `timeout`, `superseded`, `cancelled`, `self_inflicted_429`, `body_error`. `superseded` is a copy whose sibling on the same channel won. Nothing recorded it before, which is why no number could reconcile. |
+| `router_hedge_wins_total{provider,copy}` | Which copy index won. All the wins on `0` means M is buying a second call per channel and nothing else. This is the number that decides whether M should be 1. |
+| `router_copy_latency_seconds{outcome}` | Histogram, how long one copy ran before it won or failed. The live run's failures were taking 40 to 120 seconds each, which is the whole explanation for a 12 minute walk, and the page did not show it. |
+
+### Errors
+
+| Metric | Why |
+|---|---|
+| `router_errors_total{provider,class}` | Why a channel call failed: `unauthorized`, `forbidden`, `not_found`, `rate_limited`, `self_inflicted_429`, `other_client_error`, `server_error`, `timeout`, `connect`, `stream_stalled`, `stream_error`, `stream_truncated`, `stream_transport`, `body_unparseable`, `body_undecodable`, `other`. The four stream classes are separate on purpose: a stall, a provider reporting a failure mid-answer, a body cut short, and a socket that simply broke are four different faults, and only health saw any of them before. Three different jobs hid behind one `http_error` count: a provider on `unauthorized` needs a new key, on `rate_limited` needs fewer calls, on `self_inflicted_429` needs a smaller M. Not labelled by model, so this is 14 providers times 13 classes rather than 222 models times 13. |
+
+### Backoff
+
+| Metric | Why |
+|---|---|
+| `router_backoff_entries_total{kind}`, `router_backoff_resets_total{kind}` | `channel`, `provider_key`, `provider`. Entries climbing with resets flat is a list going dead. Both climbing together is a provider flapping. The live run could not tell the two apart. |
+| `router_backoff_seconds` | Histogram of the wait applied. Shows the doubling actually doubling. |
+| `router_in_backoff{kind}` | Gauge, how many are cooling off right now. |
+| `router_channels_total{state}` | Gauge, `eligible` against `in_backoff`. Eligible falling while the total holds is the list going dead under backoff, which is the shape that precedes a `504`. |
+
+### Cache
+
+| Metric | Why |
+|---|---|
+| `router_cache_lookups_total{result}` | `hit`, `miss_absent`, `miss_expired`, `miss_model_mismatch`, `miss_schema`, `disabled`, `error`. The miss reason matters more than the hit rate: a cache missing all day on `miss_model_mismatch` is a client naming models, not a cache that is cold. Every read lands on exactly one of these, `error` included, so the sum is the number of reads and a redb outage cannot hide behind a flat hit rate. |
+| `router_cache_writes_total{result}` | `stored`, `skipped_lower_intelligence`, `skipped_partial_stream`, `error`. |
+| `router_cache_age_seconds` | Histogram, how old the entry a hit served was. |
+| `router_cache_entries`, `router_cache_bytes` | Against `cache.max_bytes`. Entries alone cannot say how close the cap is. |
+
+### Throughput and memory
+
+| Metric | Why |
+|---|---|
+| `router_tokens_total{provider,kind}` | `prompt`, `completion`, `reasoning`. Reasoning is counted apart because it is billed and usually not shown: the live run returned 42 content tokens against 529 total, and one mixed figure describes neither. |
+| `router_output_tokens_per_second` | Histogram, per finished request. |
+| `router_rss_bytes` against `memory_high_water` | How close the admission gate is to firing. The one graph to watch. |
 | `router_rss_bytes`, `router_cache_entries` | Memory growth killed omniroute and nobody watched. A flat line here is the proof it is not repeating. |
+
+### Cardinality
+
+Every label set above is bounded by something small: an outcome, a class, a
+state, a kind, or a provider. Only `router_attempts_total` carries a model, and
+it carried one before. Nothing is labelled by channel id, which is per key and
+would put tens of thousands of series on the page.
 
 One log line per request at info: outcome, winning channel, attempts, total
 milliseconds. No prompts, no responses, no keys. At 1 RPS that is 86,000 lines a
 day, which Docker can hold.
 
 Failed attempts log at debug, off by default. Turn it on to find out why a
-provider stopped answering.
+provider stopped answering. The `router_errors_total` classes answer most of
+that without it, which is the point: the live run had debug off and lost the
+reason behind all 150 failures.
 
 ## Deployment
 
