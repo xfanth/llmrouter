@@ -1,13 +1,14 @@
 services:
   llmrouter:
-    # No `image:` tag on purpose. A fixed tag such as llmrouter:latest is
-    # global to the docker daemon, so two checkouts running the smoke tier at
-    # once retag it between one another's build and container create, and a
-    # run ends up testing the other checkout's binary. Without the key Compose
-    # names the image after the project. Compose's own default project name is
-    # only the directory basename, which two clones share, so ci.sh and the
-    # smoke test both set COMPOSE_PROJECT_NAME from the full checkout path.
-    build: .
+    # The image GitHub publishes after a green CI run on master (see
+    # .github/workflows/publish.yml). TrueNAS runs this file as-is: no
+    # `build:` key, because the NAS does not build images.
+    #
+    # The smoke tier does not use this tag. Its overlay,
+    # docker-compose.ci.yml, replaces the image with a per-checkout name and
+    # builds it from source, so two checkouts running the smoke tier at once
+    # never retag one another's binary.
+    image: ghcr.io/xfanth/llmrouter:latest
     # The health table flushes every 5 minutes, so a restart costs at most 5
     # minutes of learned health. The cache is on the pool and survives.
     restart: unless-stopped
