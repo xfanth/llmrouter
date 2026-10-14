@@ -294,23 +294,49 @@ fn the_ci_overlay_replaces_the_published_ports_rather_than_adding_to_them() {
     );
 }
 
-/// Two checkouts running the smoke tier at once must not share a stack. That
-/// takes both halves: no fixed `image:` tag in the base compose file (a tag
-/// such as llmrouter:latest is global to the daemon, so one run retags it
-/// between the other's build and container create), and a project name keyed
-/// on the checkout's full path, because Compose's own default is only the
-/// directory basename and two clones of this repo almost always share one.
-/// Read from the file so it holds on a machine with no daemon.
+/// Two checkouts running the smoke tier at once must not share a stack. The
+/// base compose file is what the NAS runs, and the NAS only pulls: it must
+/// name the published image and carry no `build:` key. The smoke tier's image
+/// therefore comes from the overlay, which builds from the checkout and tags
+/// it with the per-checkout project name — a fixed tag such as
+/// llmrouter-smoke-acme would be global to the daemon, so two runs could
+/// retag one another's binary between build and container create. The project
+/// name is keyed on the checkout's full path, because Compose's own default
+/// is only the directory basename and two clones of this repo almost always
+/// share one. Read from the files so it holds on a machine with no daemon.
 #[test]
 fn each_checkout_gets_its_own_image_container_and_volume() {
     let base: serde_yaml::Value = serde_yaml::from_str(
         &std::fs::read_to_string(format!("{ROOT}/docker-compose.yml")).unwrap(),
     )
     .expect("the base compose file is YAML");
-    let image = &base["services"]["llmrouter"]["image"];
+    let service = &base["services"]["llmrouter"];
     assert!(
-        image.is_null(),
-        "docker-compose.yml must not set `image:`, found {image:?}: a fixed tag is shared by every checkout on the daemon"
+        service["build"].is_null(),
+        "docker-compose.yml must not set `build:`, found {:?}: the NAS cannot build images, it pulls",
+        service["build"]
+    );
+    assert!(
+        service["image"]
+            .as_str()
+            .is_some_and(|image| image.starts_with("ghcr.io/")),
+        "docker-compose.yml must pull the published image from ghcr, found {:?}",
+        service["image"]
+    );
+
+    let overlay: serde_yaml::Value = serde_yaml::from_str(
+        &std::fs::read_to_string(format!("{ROOT}/docker-compose.ci.yml")).unwrap(),
+    )
+    .expect("the CI overlay is YAML");
+    let smoke = &overlay["services"]["llmrouter"];
+    let image = smoke["image"].as_str().unwrap_or_default();
+    assert!(
+        image.contains("${COMPOSE_PROJECT_NAME}"),
+        "the overlay must key the smoke image on COMPOSE_PROJECT_NAME, found {image:?}, or two checkouts share one daemon-global tag"
+    );
+    assert!(
+        !smoke["build"].is_null(),
+        "the overlay must carry the `build:` key, or the smoke tier pulls the published image instead of testing this checkout"
     );
 
     // Same basename, different path: the names must still differ, or the two

@@ -164,7 +164,7 @@ jobs:
 
       # Warms the buildx builder from the gha cache. It only fills the cache;
       # the image the smoke tier tests is built by 'compose up --build' below,
-      # through the compose file's build section, exactly as ci.sh does.
+      # through the overlay's build section, exactly as ci.sh does.
       # mode=max keeps the build stage's layers too, so an unchanged
       # dependency set is not recompiled on the next run.
       - name: Warm the image build cache

@@ -2,9 +2,21 @@
 # that only exist on the NAS, so CI swaps them for a fixture config directory
 # and a throwaway named volume.
 #
-#   docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --build
+#   COMPOSE_PROJECT_NAME=smoke docker compose -f docker-compose.yml \
+#     -f docker-compose.ci.yml up -d --build
+#
+# COMPOSE_PROJECT_NAME must be set: it names the smoke image (below) and the
+# project, and ci.sh plus the smoke test both set it from the checkout path.
 services:
   llmrouter:
+    # The smoke tier builds from this checkout, never pulls from ghcr, and
+    # never tags the shared ghcr name: a fixed image name is global to the
+    # daemon, so two checkouts running the tier at once would retag one
+    # another's binary between build and a later container create. The
+    # project name, which ci.sh and the smoke test both set from the full
+    # checkout path, keeps the image name per checkout too.
+    build: .
+    image: llmrouter-smoke-${COMPOSE_PROJECT_NAME}
     volumes:
       - ./tests/smoke/fixture-config:/config:ro
       - smoke-data:/data
