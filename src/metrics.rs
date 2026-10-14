@@ -260,7 +260,14 @@ pub enum ErrorClass {
     BodyUnparseable,
     /// A 2xx whose JSON did not decode to a response.
     BodyUndecodable,
-    /// A 2xx with an empty content block, or anything else.
+    /// A 2xx that never produced an answer: no content, or an error event
+    /// where the opening of the answer should be. It has its own class for
+    /// the same reason `prefill_transport` does: on the same live run that
+    /// earned `prefill_transport` its class, this was the real content of the
+    /// `other` bin, hidden behind a name that was meant for the rare
+    /// leftover.
+    NotAnAnswer,
+    /// Anything else a class list does not name.
     Other,
 }
 
@@ -284,6 +291,7 @@ impl ErrorClass {
             ErrorClass::PrefillTransport => "prefill_transport",
             ErrorClass::BodyUnparseable => "body_unparseable",
             ErrorClass::BodyUndecodable => "body_undecodable",
+            ErrorClass::NotAnAnswer => "not_an_answer",
             ErrorClass::Other => "other",
         }
     }

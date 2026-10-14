@@ -1397,9 +1397,9 @@ fn prefill_failure_class(failure: &StreamStartError) -> (AttemptOutcome, ErrorCl
         // disk faults. Three different problems under one name that was meant
         // for the rare leftover.
         StreamStartError::Transport(_) => (AttemptOutcome::HttpError, ErrorClass::PrefillTransport),
-        // A 2xx carrying no answer, which is the `Other` case the class list
-        // was written for.
-        StreamStartError::NotAnAnswer(_) => (AttemptOutcome::HttpError, ErrorClass::Other),
+        // A 2xx carrying no answer. A channel failure like any other: the
+        // sibling or the next channel takes over, and health counts it.
+        StreamStartError::NotAnAnswer(_) => (AttemptOutcome::HttpError, ErrorClass::NotAnAnswer),
     }
 }
 
@@ -3229,7 +3229,7 @@ mod tests {
         );
         assert_eq!(
             prefill_failure_class(&StreamStartError::NotAnAnswer("empty".into())),
-            (AttemptOutcome::HttpError, ErrorClass::Other)
+            (AttemptOutcome::HttpError, ErrorClass::NotAnAnswer)
         );
     }
 
