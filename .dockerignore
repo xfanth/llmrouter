@@ -6,5 +6,6 @@
 # will show them. Anything not named below never enters the build context.
 *
 !src
+!static
 !Cargo.toml
 !Cargo.lock

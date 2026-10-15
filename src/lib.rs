@@ -9,6 +9,7 @@ pub mod admission;
 pub mod cache;
 pub mod catalogue;
 pub mod config;
+pub mod dashboard;
 pub mod health;
 pub mod logging;
 pub mod metrics;

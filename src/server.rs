@@ -170,7 +170,7 @@ pub struct AppState {
     pub started_at: Instant,
 }
 
-/// The four routes plus the two probes.
+/// The four routes, the two probes, and the two browser pages.
 ///
 /// The body limit is off. axum's default is 2 MiB, and the `Bytes` extractor
 /// would refuse a 3.8MB prompt with a bare plain-text 413 before a handler
@@ -180,6 +180,10 @@ pub struct AppState {
 /// `admission.rs` the only admission control.
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
+        .route("/", get(crate::dashboard::index))
+        .route("/dashboard", get(crate::dashboard::dashboard_page))
+        .route("/docs", get(crate::dashboard::docs_page))
+        .route("/openapi.json", get(crate::dashboard::openapi_json))
         .route("/v1/messages", post(post_messages))
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/models", get(crate::models_api::get_models))

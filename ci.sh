@@ -67,7 +67,7 @@ step "every source file is tracked"
 # editor directories and agent worktrees such as .claude/, which .gitignore
 # does not cover and which CI never reads.
 untracked=$(git ls-files --others --exclude-standard -- \
-    src tests Cargo.toml Cargo.lock rust-toolchain.toml Dockerfile \
+    src tests static Cargo.toml Cargo.lock rust-toolchain.toml Dockerfile \
     docker-compose.yml docker-compose.ci.yml)
 if [ -n "$untracked" ]; then
     echo "FAIL: these files are not in git, so CI will never see them:"

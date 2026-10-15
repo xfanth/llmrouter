@@ -75,6 +75,7 @@ One agent owns one file. Never edit another module's file.
 | `src/race.rs` | N channels, M hedged copies, first copy home wins, cancellation, fallback, the client-disconnect path. | Core loop, Streaming, Concurrency against one provider |
 | `src/server.rs` | axum routes, request and response translation at the edges, status codes, and the keepalive (SSE `: ping` for a streaming client, a leading space for a non-streaming one). Nothing goes out for the first `keepalive_interval`, so any outcome decided inside that window still gets its own 400/404/413/502/503/504. Past it the response is committed to `200` and a later failure is delivered inside the body, as an SSE `error` event or the error JSON. | Endpoints, Status codes, Streaming, Keepalive |
 | `src/models_api.rs` | `GET /v1/models`, one row per distinct model with live channel health. | `GET /v1/models` |
+| `src/dashboard.rs` | The browser pages: `GET /docs` (Swagger UI over `static/openapi.json`), `GET /dashboard` (telemetry rendered in the browser from `GET /metrics`), `GET /openapi.json`, and the `/` redirect. The pages are static files under `static/`, embedded at compile time. | Endpoints |
 | `src/admission.rs` | The RSS gate: read `/proc/self/statm`, compare to `memory_high_water`, `503` above it. | Admission: the gate is memory |
 | `src/net.rs` | The two network test calls that run beside every client request. | When the network itself is down |
 | `src/metrics.rs` | Prometheus text, every counter and histogram named in the design. | What it records |
