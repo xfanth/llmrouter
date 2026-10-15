@@ -187,6 +187,9 @@ impl Edge {
             cache,
             racer,
             metrics,
+            history: Arc::new(llmrouter::history::History::open(
+                &router.cache.path.with_file_name("history.redb"),
+            )),
             started_at: Instant::now(),
         });
         Self {

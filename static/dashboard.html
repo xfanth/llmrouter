@@ -758,6 +758,38 @@ setInterval(() => {
   el.textContent = "last scrape " + Math.round((Date.now() - lastOk) / 1000) + "s ago";
 }, 1000);
 
+// seed the rolling history charts from the backend so a refresh keeps the lines
+async function seedHistory() {
+  let points;
+  try {
+    const res = await fetch("/metrics/history", { cache: "no-store" });
+    if (!res.ok) return;
+    points = await res.json();
+  } catch {
+    return;
+  }
+  if (!Array.isArray(points) || points.length === 0) return;
+  // A live scrape that landed while the seed fetched has already pushed a
+  // newer point, so the older backend points would append after it and draw
+  // the lines backwards. Skip the seed and let the live history stand.
+  if (history.length > 0) return;
+  for (const p of points.slice(-HIST_MAX)) {
+    history.push({
+      t: new Date(p.t).toTimeString().slice(0, 8),
+      rate: p.rate ?? null,
+      up50: p.up50, up90: p.up90,
+      rt90: p.rt90, ttft90: p.ttft90,
+      tps: p.tps,
+      rss: p.rss / 1048576,
+      cache: p.cache / 1048576,
+    });
+  }
+  prevReq = points[points.length - 1].requests;
+  prevT = points[points.length - 1].t;
+  renderHistoryCharts();
+}
+
+seedHistory();
 setPill("connecting", "connecting");
 tick();
 </script>

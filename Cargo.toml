@@ -55,6 +55,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+# Reads a Prometheus scrape into samples, so the history sampler compares
+# exact values rather than matching text prefixes.
+prometheus-parse = "0.2.5"
 
 # Typed `Authorization: Bearer` parsing, case-insensitive scheme name.
 headers = "0.4"
@@ -108,8 +111,6 @@ wiremock = "0.6.5"
 # Log capture in tests. One global subscriber, because a scoped `with_default`
 # one races parallel tests for the callsite interest cache and misses events.
 tracing-test = "0.2.6"
-# Reads a Prometheus scrape into samples, so a test compares exact values.
-prometheus-parse = "0.2.5"
 
 [profile.release]
 opt-level = 3

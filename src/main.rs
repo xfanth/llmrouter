@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(
         Arc::clone(&state.health).flush_loop(config.router.cache.flush_interval, shutdown.clone()),
     );
+    tokio::spawn(Arc::clone(&state.history).sampler((*state.metrics).clone(), shutdown.clone()));
 
     let listener = tokio::net::TcpListener::bind(config.router.listen)
         .await
@@ -81,6 +82,9 @@ async fn main() -> anyhow::Result<()> {
     shutdown.cancel();
     if let Err(e) = state.health.flush() {
         tracing::warn!(error = %e, "health flush on shutdown failed");
+    }
+    if let Err(e) = state.history.flush() {
+        tracing::warn!(error = %e, "history flush on shutdown failed");
     }
     result.context("server")?;
     tracing::info!("stopped");
@@ -171,6 +175,12 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
         Arc::clone(&metrics),
     ));
 
+    // The history file sits beside cache.redb, so it lands on the same
+    // mounted volume and the dashboard's charts survive a restart.
+    let mut history_path = router.cache.path.clone();
+    history_path.set_file_name("history.redb");
+    let history = Arc::new(llmrouter::history::History::open(&history_path));
+
     Ok(Arc::new(llmrouter::AppState {
         admission: Admission::new(router.memory_high_water, RSS_RETRY_AFTER),
         config: Arc::clone(&config),
@@ -179,6 +189,7 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
         cache,
         racer,
         metrics,
+        history,
         started_at: Instant::now(),
     }))
 }
