@@ -947,7 +947,8 @@ fn describe_everything() {
     );
     describe_histogram!(
         "router_output_tokens_per_second",
-        "Output tokens per second for one finished request."
+        "Output tokens per second of the winning stream over its own generation \
+         window, not the whole request."
     );
     describe_histogram!(
         "router_ttft_seconds",
