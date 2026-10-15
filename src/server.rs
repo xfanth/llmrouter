@@ -166,6 +166,8 @@ pub struct AppState {
     pub admission: Admission,
     /// Prometheus.
     pub metrics: Arc<Metrics>,
+    /// The backend recorded metric history for the dashboard.
+    pub history: Arc<crate::history::History>,
     /// For the uptime on `/healthz`.
     pub started_at: Instant,
 }
@@ -189,6 +191,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/models", get(crate::models_api::get_models))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
+        .route("/metrics/history", get(crate::history::endpoint))
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state)
 }
@@ -2579,6 +2582,9 @@ mod tests {
             cache: None,
             racer,
             metrics,
+            history: Arc::new(crate::history::History::open(
+                &dir.path().join("history.redb"),
+            )),
             started_at: Instant::now(),
         })
     }

@@ -139,6 +139,26 @@
         }
       }
     },
+    "/metrics/history": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "Recorded metric history",
+        "description": "The router's own metric samples, one every five seconds, oldest first, up to 720 of them. The ring is written through to disk, so the samples survive a restart and a browser refresh does not reset the charts.",
+        "responses": {
+          "200": {
+            "description": "The samples, oldest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "type": "object", "additionalProperties": true }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/docs": {
       "get": {
         "tags": ["Router"],
