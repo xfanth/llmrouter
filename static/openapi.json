@@ -1,0 +1,605 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "llmrouter",
+    "version": "0.1.0",
+    "description": "A router that races many provider, model and key channels per request; the first good answer wins. A response cache and per-request hedging sit in front of the channels. The API reference is at /docs and the live telemetry at /dashboard."
+  },
+  "servers": [{ "url": "/" }],
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Redirect to the dashboard",
+        "description": "303 redirect to /dashboard, the front page.",
+        "responses": { "303": { "description": "The dashboard." } }
+      }
+    },
+    "/v1/messages": {
+      "post": {
+        "tags": ["Anthropic"],
+        "summary": "Anthropic Messages API compatible completion",
+        "description": "Accepts an Anthropic Messages request, races the channels that serve its model, and returns the first good answer; with stream true, a text/event-stream. Status codes: 200 answered or cached. 400 malformed body, the caller's mistake. 404 the model is unknown to the catalogue, the caller's mistake. 413 shorten the prompt. 502 the local link is down. 503 the router is full, back off (Retry-After). 504 the upstreams cannot serve it, wait or investigate.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AnthropicMessagesRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A channel answered, or the cache did. JSON, or a text/event-stream when stream was true.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AnthropicMessagesResponse" }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "object",
+                  "description": "Anthropic-style server-sent events: message_start, content_block_delta entries carrying the text, then message_stop."
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/UnknownModel" },
+          "413": { "$ref": "#/components/responses/TooLarge" },
+          "502": { "$ref": "#/components/responses/NoNetwork" },
+          "503": { "$ref": "#/components/responses/NotAdmitted" },
+          "504": { "$ref": "#/components/responses/NoChannel" }
+        }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "OpenAI Chat Completions compatible completion",
+        "description": "Same routing and status codes as /v1/messages, OpenAI shape. Status codes: 200 answered or cached. 400 malformed body, the caller's mistake. 404 the model is unknown to the catalogue, the caller's mistake. 413 shorten the prompt. 502 the local link is down. 503 the router is full, back off (Retry-After). 504 the upstreams cannot serve it, wait or investigate.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/OpenAiChatRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "A channel answered, or the cache did. JSON, or a text/event-stream when stream was true.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/OpenAiChatResponse" }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "object",
+                  "description": "OpenAI-style server-sent events: chat.completion.chunk entries, then data: [DONE]."
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/UnknownModel" },
+          "413": { "$ref": "#/components/responses/TooLarge" },
+          "502": { "$ref": "#/components/responses/NoNetwork" },
+          "503": { "$ref": "#/components/responses/NotAdmitted" },
+          "504": { "$ref": "#/components/responses/NoChannel" }
+        }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["OpenAI"],
+        "summary": "List the models",
+        "description": "One row per distinct model, not per channel: nine keys serving one Gemini is one row with channels.total 9. Ranked by intelligence, auto first, and every model with a channel appears, healthy or not. Channel health comes from the same data GET /healthz serves.",
+        "responses": {
+          "200": {
+            "description": "The merged catalogue.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ModelsResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "Channel health",
+        "description": "Live channel health: the total and eligible channel counts, and each provider or key in backoff with when it is next due. Returns 200 from the first second.",
+        "responses": {
+          "200": {
+            "description": "The health snapshot.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "Prometheus metrics",
+        "description": "Prometheus text exposition of every router_ metric, consumed by the /dashboard page.",
+        "responses": {
+          "200": {
+            "description": "Prometheus text/plain exposition.",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "The API reference",
+        "description": "This page: a Swagger UI shell that renders /openapi.json.",
+        "responses": {
+          "200": {
+            "description": "The reference page, text/html.",
+            "content": {
+              "text/html": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dashboard": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "The telemetry dashboard",
+        "description": "The telemetry dashboard; it reads GET /metrics.",
+        "responses": {
+          "200": {
+            "description": "The telemetry dashboard, text/html.",
+            "content": {
+              "text/html": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "This document",
+        "description": "This OpenAPI document itself.",
+        "responses": {
+          "200": {
+            "description": "The document, application/json.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed body: not a valid request in this endpoint's format. Error tag bad_request, detail names the reason. The caller's mistake; fix the body.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RouterError" }
+          }
+        }
+      },
+      "UnknownModel": {
+        "description": "The model is unknown to the catalogue: no channel serves it. Error tag unknown_model, detail names the model. The caller's mistake; pick from GET /v1/models. The router never substitutes a different one.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RouterError" }
+          }
+        }
+      },
+      "TooLarge": {
+        "description": "No channel has a context window big enough for this prompt. Error tag too_large, detail carries prompt_tokens and largest_context. The caller's; shorten the prompt.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RouterError" }
+          }
+        }
+      },
+      "NoNetwork": {
+        "description": "The router cannot reach the internet: both network test calls failed. Error tag no_network, detail lists the failed URLs. The local link's; retry once the link is back.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RouterError" }
+          }
+        }
+      },
+      "NotAdmitted": {
+        "description": "RSS is above memory_high_water, so the request was not admitted. Error tag not_admitted, detail carries rss, memory_high_water and retry_after_secs, and the response carries Retry-After. The router's; it is transient, back off.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RouterError" }
+          }
+        }
+      },
+      "NoChannel": {
+        "description": "No channel could serve it: none eligible, or every channel call failed. Error tag no_channel, detail carries attempts and last_error. The upstreams'; probably not worth a retry.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RouterError" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AnthropicMessagesRequest": {
+        "type": "object",
+        "required": ["model", "max_tokens", "messages"],
+        "additionalProperties": true,
+        "description": "Anthropic Messages request. model is the client-facing model name from GET /v1/models, or auto to let the router choose. With stream true the router replies with server-sent events.",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Client-facing model name from GET /v1/models, or auto."
+          },
+          "max_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Cap on output tokens."
+          },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AnthropicMessage" }
+          },
+          "system": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+            ],
+            "description": "System prompt, a string or an array of blocks."
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "true returns server-sent events."
+          },
+          "temperature": { "type": "number" },
+          "top_p": { "type": "number" },
+          "top_k": { "type": "integer" },
+          "stop_sequences": { "type": "array", "items": { "type": "string" } },
+          "tools": { "type": "array", "items": { "$ref": "#/components/schemas/Tool" } },
+          "tool_choice": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "auto, any, tool, or none."
+          },
+          "metadata": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "AnthropicMessage": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["user", "assistant"] },
+          "content": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "$ref": "#/components/schemas/ContentBlock" } }
+            ]
+          }
+        }
+      },
+      "ContentBlock": {
+        "description": "One entry of a content array.",
+        "oneOf": [
+          { "$ref": "#/components/schemas/TextBlock" },
+          { "$ref": "#/components/schemas/ToolUseBlock" },
+          { "$ref": "#/components/schemas/ToolResultBlock" }
+        ]
+      },
+      "TextBlock": {
+        "type": "object",
+        "required": ["type", "text"],
+        "properties": {
+          "type": { "type": "string", "enum": ["text"] },
+          "text": { "type": "string" }
+        }
+      },
+      "ToolUseBlock": {
+        "type": "object",
+        "required": ["type", "id", "name", "input"],
+        "properties": {
+          "type": { "type": "string", "enum": ["tool_use"] },
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "input": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "ToolResultBlock": {
+        "type": "object",
+        "required": ["type", "tool_use_id", "content"],
+        "properties": {
+          "type": { "type": "string", "enum": ["tool_result"] },
+          "tool_use_id": { "type": "string" },
+          "content": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+            ]
+          }
+        }
+      },
+      "Tool": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "input_schema": { "type": "object", "additionalProperties": true }
+        }
+      },
+      "AnthropicMessagesResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string", "enum": ["message"], "description": "Always message." },
+          "role": { "type": "string", "enum": ["assistant"] },
+          "model": { "type": "string" },
+          "content": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ContentBlock" }
+          },
+          "stop_reason": {
+            "type": "string",
+            "enum": ["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+          },
+          "stop_sequence": { "type": "string", "nullable": true },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "input_tokens": { "type": "integer" },
+              "output_tokens": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "OpenAiChatRequest": {
+        "type": "object",
+        "required": ["model", "messages"],
+        "additionalProperties": true,
+        "description": "OpenAI Chat Completions request. max_tokens is the legacy alias for max_completion_tokens; the router accepts both.",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "Client-facing model name from GET /v1/models, or auto."
+          },
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OpenAiMessage" }
+          },
+          "stream": {
+            "type": "boolean",
+            "description": "true returns server-sent events."
+          },
+          "temperature": { "type": "number" },
+          "top_p": { "type": "number" },
+          "max_tokens": {
+            "type": "integer",
+            "description": "Legacy alias for max_completion_tokens."
+          },
+          "max_completion_tokens": { "type": "integer" },
+          "tools": { "type": "array", "items": { "$ref": "#/components/schemas/OpenAiTool" } },
+          "tool_choice": {
+            "description": "none, auto, or required, or a named function."
+          },
+          "stop": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          },
+          "presence_penalty": { "type": "number" },
+          "frequency_penalty": { "type": "number" }
+        }
+      },
+      "OpenAiMessage": {
+        "type": "object",
+        "required": ["role"],
+        "properties": {
+          "role": { "type": "string", "enum": ["system", "user", "assistant", "tool"] },
+          "content": {
+            "type": "string",
+            "nullable": true,
+            "description": "Null on assistant messages that carry tool_calls."
+          },
+          "tool_calls": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OpenAiToolCall" }
+          },
+          "tool_call_id": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      },
+      "OpenAiToolCall": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string", "enum": ["function"] },
+          "function": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "arguments": {
+                "type": "string",
+                "description": "The arguments as a JSON encoded string."
+              }
+            }
+          }
+        }
+      },
+      "OpenAiTool": {
+        "type": "object",
+        "properties": {
+          "type": { "type": "string", "enum": ["function"] },
+          "function": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "description": { "type": "string" },
+              "parameters": { "type": "object", "additionalProperties": true }
+            }
+          }
+        }
+      },
+      "OpenAiChatResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "object": { "type": "string", "enum": ["chat.completion"] },
+          "created": { "type": "integer", "description": "Unix seconds." },
+          "model": { "type": "string" },
+          "choices": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OpenAiChoice" }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "prompt_tokens": { "type": "integer" },
+              "completion_tokens": { "type": "integer" },
+              "total_tokens": { "type": "integer" }
+            }
+          }
+        }
+      },
+      "OpenAiChoice": {
+        "type": "object",
+        "properties": {
+          "index": { "type": "integer" },
+          "message": {
+            "type": "object",
+            "properties": {
+              "role": { "type": "string", "enum": ["assistant"] },
+              "content": { "type": "string", "nullable": true },
+              "reasoning_content": {
+                "type": "string",
+                "nullable": true,
+                "description": "Reasoning text where the channel returns it."
+              },
+              "tool_calls": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/OpenAiToolCall" }
+              }
+            }
+          },
+          "finish_reason": {
+            "type": "string",
+            "description": "stop, length, tool_calls, content_filter."
+          }
+        }
+      },
+      "RouterError": {
+        "type": "object",
+        "required": ["error", "message", "detail"],
+        "description": "Every failure returns this envelope. error is the short tag, message is one sentence for a human, detail carries the numbers for the code: bad_request a reason; unknown_model the model; too_large prompt_tokens and largest_context; no_network the failed test URLs; not_admitted rss, memory_high_water and retry_after_secs, with a Retry-After header; no_channel attempts and last_error.",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Short tag: bad_request, unknown_model, too_large, no_network, not_admitted, no_channel.",
+            "example": "no_channel"
+          },
+          "message": {
+            "type": "string",
+            "description": "One sentence for a human.",
+            "example": "no channel could serve the request"
+          },
+          "detail": {
+            "type": "object",
+            "description": "Numbers specific to the code.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "ModelsResponse": {
+        "type": "object",
+        "required": ["object", "data"],
+        "properties": {
+          "object": { "type": "string", "enum": ["list"] },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/ModelRow" } }
+        }
+      },
+      "ModelRow": {
+        "type": "object",
+        "required": ["id", "object", "owned_by", "created"],
+        "properties": {
+          "id": { "type": "string", "description": "The model id a caller passes back in a request." },
+          "object": { "type": "string", "enum": ["model"] },
+          "owned_by": { "type": "string", "description": "Which provider serves it, or router for the auto row." },
+          "created": { "type": "integer", "description": "Unix seconds." },
+          "intelligence": { "type": "integer", "description": "General intelligence score, higher is better, 0 when unranked." },
+          "intelligence_rank": { "type": "integer", "description": "Best rank across the channels, lower is better." },
+          "context_length": { "type": "integer", "description": "Largest context window across the channels." },
+          "max_output": { "type": "integer", "description": "Largest completion length across the channels." },
+          "supports_tools": { "type": "boolean" },
+          "supports_vision": { "type": "boolean" },
+          "supports_reasoning": { "type": "boolean" },
+          "channels": { "$ref": "#/components/schemas/ChannelSummary" }
+        }
+      },
+      "ChannelSummary": {
+        "type": "object",
+        "properties": {
+          "total": { "type": "integer" },
+          "healthy": { "type": "integer" },
+          "in_backoff": { "type": "integer" },
+          "providers": { "type": "array", "items": { "type": "string" } },
+          "next_eligible": {
+            "type": "string",
+            "nullable": true,
+            "description": "RFC 3339, or null when nothing is in backoff."
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["ok"] },
+          "uptime_seconds": { "type": "integer" },
+          "channels": {
+            "type": "object",
+            "properties": {
+              "total": { "type": "integer" },
+              "eligible": { "type": "integer" }
+            }
+          },
+          "unhealthy": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": { "type": "string", "description": "provider or key." },
+                "name": { "type": "string" },
+                "retry_counter": { "type": "integer" },
+                "retry_base_secs": { "type": "integer" },
+                "eligible_at": { "type": "integer", "description": "Unix seconds." },
+                "eligible_in_secs": { "type": "integer" }
+              }
+            }
+          },
+          "cache_entries": { "type": "integer", "nullable": true, "description": "Null when the cache is off." }
+        }
+      }
+    }
+  }
+}

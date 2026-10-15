@@ -405,5 +405,5 @@ fn the_build_context_carries_the_crate_sources_and_nothing_else() {
                 .unwrap_or_else(|| panic!("only re-inclusions may follow `*`, found {line:?}"))
         })
         .collect();
-    assert_eq!(allowed, ["src", "Cargo.toml", "Cargo.lock"]);
+    assert_eq!(allowed, ["src", "static", "Cargo.toml", "Cargo.lock"]);
 }

@@ -1,0 +1,765 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmrouter telemetry</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #2a313c;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #4fc3f7;
+  --good: #56d364;
+  --warn: #d29922;
+  --bad: #f85149;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  padding: 0 20px 32px;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 0 14px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 18px;
+}
+header h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: 0.2px; }
+header .links { margin-left: auto; display: flex; gap: 14px; font-size: 13px; }
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+}
+.pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill.live { color: var(--good); border-color: rgba(86, 211, 100, 0.4); }
+.pill.live .dot { background: var(--good); }
+.pill.stalled { color: var(--warn); border-color: rgba(210, 153, 34, 0.4); }
+.pill.stalled .dot { background: var(--warn); }
+.pill.failed { color: var(--bad); border-color: rgba(248, 81, 73, 0.4); }
+.pill.failed .dot { background: var(--bad); }
+.age { color: var(--muted); font-size: 12px; }
+#retry {
+  display: none;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+#retry:hover { border-color: var(--accent); color: var(--accent); }
+#tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.tile {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+.tile .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+.tile .value { font-size: 26px; font-weight: 650; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
+.tile .sub { color: var(--muted); font-size: 12px; min-height: 15px; }
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px 10px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  min-width: 0;
+}
+.card h3 { margin: 0 0 2px; font-size: 13px; font-weight: 600; color: var(--text); }
+.card .sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; min-height: 15px; }
+.card.wide { grid-column: 1 / -1; }
+.card canvas { max-height: 260px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+td { font-variant-numeric: tabular-nums; }
+tr:last-child td { border-bottom: none; }
+footer {
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+footer .links { margin-left: auto; display: flex; gap: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>llmrouter telemetry</h1>
+  <span class="pill" id="pill"><span class="dot"></span><span id="pilltext">connecting</span></span>
+  <span class="age" id="age"></span>
+  <button id="retry" type="button">Retry</button>
+  <nav class="links">
+    <a href="/docs">API docs</a>
+    <a href="/metrics">raw metrics</a>
+  </nav>
+</header>
+<div id="tiles"></div>
+<div class="charts">
+  <div class="card"><h3>Request rate</h3><div class="sub">requests per minute</div><canvas id="hist_rate"></canvas></div>
+  <div class="card"><h3>Latency percentiles</h3><div class="sub">seconds</div><canvas id="hist_latency"></canvas></div>
+  <div class="card"><h3>Mean tokens per second</h3><div class="sub">output, across requests</div><canvas id="hist_tps"></canvas></div>
+  <div class="card"><h3>Memory</h3><div class="sub">resident set and cache, MB</div><canvas id="hist_mem"></canvas></div>
+</div>
+<div class="charts">
+  <div class="card"><h3>Request outcomes</h3><div class="sub">cumulative</div><canvas id="snap_outcomes"></canvas></div>
+  <div class="card"><h3>Cache lookups</h3><div class="sub">cumulative</div><canvas id="snap_lookups"></canvas></div>
+  <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider</div><canvas id="snap_hedgewins"></canvas></div>
+  <div class="card"><h3>Hedge outcomes</h3><div class="sub">cumulative</div><canvas id="snap_hedgeout"></canvas></div>
+  <div class="card"><h3>Latency histogram by stage</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_lathist"></canvas></div>
+  <div class="card"><h3>Time to first token</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_ttft"></canvas></div>
+  <div class="card"><h3>Tokens per second histogram</h3><div class="sub">count per bucket</div><canvas id="snap_tpshist"></canvas></div>
+  <div class="card"><h3>Cache age histogram</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_agehist"></canvas></div>
+  <div class="card wide"><h3>Errors by class</h3><div class="sub">top 10 classes across providers</div><canvas id="snap_errors"></canvas></div>
+  <div class="card"><h3>Tokens by kind</h3><div class="sub">cumulative</div><canvas id="snap_tokkind"></canvas></div>
+  <div class="card"><h3>Backoff</h3><div class="sub" id="backoff_now"></div><canvas id="snap_backoff"></canvas></div>
+  <div class="card wide"><h3>Per provider</h3><div class="sub">trials, attempts, copies, hedging, copy latency, errors</div>
+    <table id="channels">
+      <thead><tr>
+        <th>Provider</th><th>Trials won</th><th>Trials failed</th><th>Trials cancelled</th>
+        <th>Attempts ok</th><th>Attempts error</th><th>Attempts timeout</th><th>Attempts cancelled</th>
+        <th>Copies</th><th>Hedge wins</th><th>Rescue rate</th><th>Copy p50</th><th>Copy p90</th><th>Errors</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+<footer>
+  <span>Parses GET /metrics every 5 seconds and everything is computed in the browser, nothing leaves this page.</span>
+  <nav class="links">
+    <a href="/docs">API docs</a>
+    <a href="/metrics">raw metrics</a>
+  </nav>
+</footer>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.js" integrity="sha384-hfkuqrKeWFmnTMWN31VWyoe8xgdTADD11kgxmdpx2uyE6j5Az5uZq6u6AKYYmAOw" crossorigin="anonymous"></script>
+<script>
+"use strict";
+// == formatters ==
+function fmtInt(n) {
+  if (!isFinite(n)) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(abs >= 1e10 ? 0 : 1) + "G";
+  if (abs >= 1e6) return (n / 1e6).toFixed(abs >= 1e7 ? 0 : 1) + "M";
+  if (abs >= 1e4) return (n / 1e3).toFixed(0) + "k";
+  return String(Math.round(n));
+}
+function fmtBytes(n) {
+  if (!isFinite(n) || n < 0) return "0 B";
+  if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + " GB";
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + " MB";
+  if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + " kB";
+  return Math.round(n) + " B";
+}
+function fmtPct(x) { return isFinite(x) ? (x * 100).toFixed(1) + "%" : "-"; }
+function fmtSecs(s) {
+  if (!isFinite(s)) return "-";
+  if (s < 1) return Math.round(s * 1000) + " ms";
+  if (s < 90) return s.toFixed(s < 10 ? 2 : 1) + " s";
+  if (s < 5400) return Math.round(s / 60) + " m";
+  return (s / 3600).toFixed(1) + " h";
+}
+function fmtNum1(n) { return isFinite(n) ? n.toFixed(1) : "0.0"; }
+const $ = (id) => document.getElementById(id);
+
+// == prometheus text parser ==
+// The exporter emits plain samples only: name, optional labels, numeric value.
+// No label value in this exporter contains commas or braces, so a naive
+// comma split of the label text is safe.
+const SAMPLE_RE = /^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)$/;
+function parseLabels(text) {
+  const out = {};
+  if (!text) return out;
+  for (const part of text.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq < 0) continue;
+    let v = trimmed.slice(eq + 1).trim();
+    if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    out[trimmed.slice(0, eq).trim()] = v;
+  }
+  return out;
+}
+function parseMetrics(text) {
+  const m = new Map();
+  for (const line of text.split("\n")) {
+    if (!line || line.charCodeAt(0) === 35) continue; // 35 == "#"
+    const match = SAMPLE_RE.exec(line);
+    if (!match) continue;
+    const name = match[1];
+    let v = Number(match[3]);
+    if (!isFinite(v)) continue;
+    if (!m.has(name)) m.set(name, []);
+    m.get(name).push({ labels: parseLabels(match[2]), value: v });
+  }
+  return m;
+}
+let latest = new Map(); // metric name -> [{labels, value}]
+
+function collect(name) { return latest.get(name) || []; }
+function totalOf(name) {
+  let s = 0;
+  for (const smp of collect(name)) s += smp.value;
+  return s;
+}
+function sumWhere(name, pred) {
+  let s = 0;
+  for (const smp of collect(name)) if (pred(smp.labels)) s += smp.value;
+  return s;
+}
+function byLabel(name, key) { // value -> summed count
+  const out = new Map();
+  for (const smp of collect(name)) {
+    const k = smp.labels[key] !== undefined ? smp.labels[key] : "(none)";
+    out.set(k, (out.get(k) || 0) + smp.value);
+  }
+  return out;
+}
+function byLabelMulti(name, outer, inner) { // outer value -> Map(inner value -> sum)
+  const out = new Map();
+  for (const smp of collect(name)) {
+    const o = smp.labels[outer] !== undefined ? smp.labels[outer] : "(none)";
+    const i = smp.labels[inner] !== undefined ? smp.labels[inner] : "(none)";
+    if (!out.has(o)) out.set(o, new Map());
+    const m = out.get(o);
+    m.set(i, (m.get(i) || 0) + smp.value);
+  }
+  return out;
+}
+function providersOf(name) {
+  return [...byLabel(name, "provider").keys()].filter((k) => k !== "(none)");
+}
+function allProviders() {
+  const s = new Set();
+  for (const n of ["router_attempts_total", "router_trials_total", "router_copies_total", "router_hedge_wins_total", "router_hedge_outcome_total", "router_copy_latency_seconds", "router_errors_total", "router_tokens_total"]) {
+    for (const p of providersOf(n)) s.add(p);
+  }
+  return [...s].sort();
+}
+
+// == histograms ==
+// Assemble _bucket/_sum/_count samples of one base name into per label set
+// objects. le="+Inf" is dropped: _count already carries that cumulative total.
+function buildHistograms() {
+  const h = new Map(); // base -> key -> hist
+  const ensure = (base, key) => {
+    if (!h.has(base)) h.set(base, new Map());
+    if (!h.get(base).has(key)) h.get(base).set(key, { labels: null, buckets: [], sum: 0, count: 0 });
+    return h.get(base).get(key);
+  };
+  for (const [name, smps] of latest) {
+    let base = null, kind = null;
+    if (name.endsWith("_bucket")) { base = name.slice(0, -7); kind = "b"; }
+    else if (name.endsWith("_sum")) { base = name.slice(0, -4); kind = "s"; }
+    else if (name.endsWith("_count")) { base = name.slice(0, -6); kind = "c"; }
+    if (!base) continue;
+    for (const smp of smps) {
+      const labels = Object.assign({}, smp.labels);
+      const le = labels.le;
+      delete labels.le;
+      const key = JSON.stringify(labels, Object.keys(labels).sort());
+      const rec = ensure(base, key);
+      rec.labels = labels;
+      if (kind === "b") {
+        if (le === undefined || !isFinite(Number(le))) continue; // skip +Inf
+        rec.buckets.push({ le: Number(le), cum: smp.value });
+      } else if (kind === "s") rec.sum = smp.value;
+      else rec.count = smp.value;
+    }
+  }
+  for (const perBase of h.values()) {
+    for (const rec of perBase.values()) rec.buckets.sort((a, b) => a.le - b.le);
+  }
+  return h;
+}
+let hists = new Map();
+
+function histMerge(base, pred) { // merge matching label sets into one hist
+  const out = { buckets: [], sum: 0, count: 0 };
+  const perBase = hists.get(base);
+  if (!perBase) return out;
+  for (const rec of perBase.values()) {
+    let ok = true;
+    for (const [lk, lv] of Object.entries(pred || {})) {
+      if ((rec.labels[lk] || "") !== lv) { ok = false; break; }
+    }
+    if (!ok) continue;
+    out.sum += rec.sum;
+    out.count += rec.count;
+    if (out.buckets.length === 0) {
+      out.buckets = rec.buckets.map((b) => ({ le: b.le, cum: b.cum }));
+    } else {
+      rec.buckets.forEach((b, i) => { if (out.buckets[i]) out.buckets[i].cum += b.cum; });
+    }
+  }
+  return out;
+}
+function histQuantile(h, q) {
+  if (!h.count) return NaN;
+  const rank = q * h.count;
+  for (const b of h.buckets) {
+    if (b.cum >= rank) return b.le;
+  }
+  return h.buckets.length ? h.buckets[h.buckets.length - 1].le : NaN;
+}
+function histCounts(h) { // counts per bucket from cumulative series
+  const out = [];
+  let prev = 0;
+  for (const b of h.buckets) {
+    const d = Math.max(0, b.cum - prev);
+    out.push(d);
+    prev = b.cum;
+  }
+  return out;
+}
+// == chart plumbing ==
+const PAL = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373", "#ba68c8", "#4db6ac", "#fff176", "#f06292", "#90a4ae", "#aed581", "#64b5f6", "#ffd54f"];
+const OUTCOME_COLORS = { hit_cache: "#56d364", success: "#4fc3f7", too_large: "#ffb74d", no_network: "#f85149", not_admitted: "#ba68c8", no_channel: "#e57373" };
+const LOOKUP_COLORS = { hit: "#56d364", miss_absent: "#ffb74d", miss_expired: "#d29922", miss_model_mismatch: "#ba68c8", miss_schema: "#f78166", disabled: "#8b949e", error: "#f85149" };
+const HEDGE_COLORS = { rescued: "#56d364", faster: "#4fc3f7", redundant: "#8b949e", no_hedge: "#d29922" };
+const charts = {};
+Chart.defaults.color = "#8b949e";
+Chart.defaults.borderColor = "rgba(42, 49, 60, 0.9)";
+Chart.defaults.font.size = 11;
+Chart.defaults.animation = false;
+Chart.defaults.plugins.legend.labels.boxWidth = 10;
+Chart.defaults.plugins.legend.labels.boxHeight = 10;
+
+function baseOpts(extra) {
+  return Object.assign({
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { position: "bottom", labels: { padding: 8 } } },
+    scales: {
+      x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+      y: { beginAtZero: true, grid: { color: "rgba(42, 49, 60, 0.9)" } },
+    },
+  }, extra || {});
+}
+function canvasOf(id) { return $(id).getContext("2d"); }
+
+function makeLine(id, ds, yTitle, opts) {
+  const cfg = {
+    type: "line",
+    data: { labels: [], datasets: ds },
+    options: baseOpts({
+      elements: { point: { radius: 0 }, line: { borderWidth: 1.6, tension: 0.25 } },
+      scales: {
+        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 6 }, grid: { display: false } },
+        y: { beginAtZero: true, grid: { color: "rgba(42, 49, 60, 0.9)" }, title: { display: !!yTitle, text: yTitle || "" } },
+      },
+      interaction: { mode: "index", intersect: false },
+      plugins: { legend: { position: "bottom" } },
+    }, opts),
+  };
+  charts[id] = new Chart(canvasOf(id), cfg);
+  return charts[id];
+}
+function makeDoughnut(id, labels, colors) {
+  charts[id] = new Chart(canvasOf(id), {
+    type: "doughnut",
+    data: {
+      labels,
+      datasets: [{ data: labels.map(() => 0), backgroundColor: labels.map((l) => colors[l] || PAL[labels.indexOf(l) % PAL.length]), borderColor: "#161b22", borderWidth: 2 }],
+    },
+    options: { responsive: true, maintainAspectRatio: false, animation: false, cutout: "62%", plugins: { legend: { position: "bottom", labels: { padding: 6, font: { size: 10 } } } } },
+  });
+  return charts[id];
+}
+function makeBar(id, labels, ds, extra) {
+  charts[id] = new Chart(canvasOf(id), {
+    type: "bar",
+    data: { labels, datasets: ds },
+    options: baseOpts(Object.assign({ plugins: { legend: { position: "bottom" } } }, extra || {})),
+  });
+  return charts[id];
+}
+
+function lineDs(label, color, opts) {
+  return Object.assign({ label, data: [], borderColor: color, backgroundColor: color + "22", fill: false, pointRadius: 0, borderWidth: 1.6, tension: 0.25 }, opts || {});
+}
+
+// == charts ==
+makeLine("hist_rate", [lineDs("req/min", "#4fc3f7")]);
+makeLine("hist_latency", [
+  lineDs("upstream p50", "#4fc3f7"),
+  lineDs("upstream p90", "#81c784"),
+  lineDs("router p90", "#ffb74d"),
+  lineDs("TTFT p90", "#e57373"),
+]);
+makeLine("hist_tps", [lineDs("mean tokens/s", "#ba68c8")]);
+makeLine("hist_mem", [lineDs("RSS MB", "#4fc3f7"), lineDs("cache MB", "#81c784")]);
+
+makeDoughnut("snap_outcomes", ["hit_cache", "success", "too_large", "no_network", "not_admitted", "no_channel"], OUTCOME_COLORS);
+makeDoughnut("snap_lookups", ["hit", "miss_absent", "miss_expired", "miss_model_mismatch", "miss_schema", "disabled", "error"], LOOKUP_COLORS);
+makeDoughnut("snap_hedgeout", ["rescued", "faster", "redundant", "no_hedge"], HEDGE_COLORS);
+makeDoughnut("snap_tokkind", ["prompt", "completion", "reasoning"], { prompt: "#4fc3f7", completion: "#81c784", reasoning: "#ba68c8" });
+
+makeBar("snap_hedgewins",
+  ["0", "1", "2", "3+"],
+  [],
+  { scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, grid: { color: "rgba(42, 49, 60, 0.9)" } } } });
+
+makeBar("snap_lathist", [], [
+  { label: "upstream", data: [], backgroundColor: "#4fc3f7aa" },
+  { label: "router", data: [], backgroundColor: "#ffb74daa" },
+]);
+makeBar("snap_ttft", [], [{ label: "count", data: [], backgroundColor: "#e57373aa" }]);
+makeBar("snap_tpshist", [], [{ label: "count", data: [], backgroundColor: "#ba68c8aa" }]);
+makeBar("snap_agehist", [], [{ label: "count", data: [], backgroundColor: "#4db6acaa" }]);
+makeBar("snap_backoff", ["channel", "provider_key", "provider"], [
+  { label: "entries", data: [0, 0, 0], backgroundColor: "#f85149aa" },
+  { label: "resets", data: [0, 0, 0], backgroundColor: "#56d364aa" },
+]);
+
+const errSplits = new Map(); // error class -> Map(provider -> count), feeds the tooltip
+const errDs = [{ label: "count", data: [], backgroundColor: "#f85149aa" }];
+charts.snap_errors = new Chart(canvasOf("snap_errors"), {
+  type: "bar",
+  data: { labels: [], datasets: errDs },
+  options: {
+    indexAxis: "y",
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          afterBody(items) {
+            const cls = items[0].label;
+            const split = errSplits.get(cls);
+            if (!split) return [];
+            return [...split.entries()].map(([p, c]) => "  " + p + ": " + fmtInt(c));
+          },
+        },
+      },
+    },
+    scales: {
+      x: { beginAtZero: true, grid: { color: "rgba(42, 49, 60, 0.9)" } },
+      y: { grid: { display: false } },
+    },
+  },
+});
+
+// == stat tiles ==
+const tileEls = {};
+const TILE_DEFS = [
+  ["requests", "Requests total"],
+  ["rate", "Request rate"],
+  ["channels", "Channels"],
+  ["cache", "Cache hit rate"],
+  ["hedge", "Hedge rescue rate"],
+  ["inflight", "Trials in flight"],
+  ["rss", "Resident set"],
+  ["tokens", "Tokens total"],
+];
+for (const [key, label] of TILE_DEFS) {
+  const el = document.createElement("div");
+  el.className = "tile";
+  el.innerHTML = '<div class="label">' + label + '</div><div class="value">-</div><div class="sub"></div>';
+  tileEls[key] = { value: el.children[1], sub: el.children[2] };
+  $("tiles").appendChild(el);
+}
+
+// == history ==
+const HIST_MAX = 360; // 30 minutes at one scrape every 5 seconds
+const history = []; // {t, rate, up50, up90, rt90, ttft90, tps, rss, cache}
+let prevReq = null, prevT = 0;
+
+function pushHistory() {
+  const now = Date.now();
+  const reqTotal = totalOf("router_requests_total");
+  let rate = null;
+  const dt = prevReq === null ? 0 : (now - prevT) / 1000;
+  if (prevReq !== null && dt > 0) rate = ((reqTotal - prevReq) / dt) * 60;
+  prevReq = reqTotal;
+  prevT = now;
+  const up = histMerge("router_latency_seconds", { stage: "upstream" });
+  const rt = histMerge("router_latency_seconds", { stage: "router" });
+  const ttft = histMerge("router_ttft_seconds");
+  const tpsH = histMerge("router_output_tokens_per_second");
+  history.push({
+    t: new Date(now).toTimeString().slice(0, 8),
+    rate, up50: histQuantile(up, 0.5), up90: histQuantile(up, 0.9),
+    rt90: histQuantile(rt, 0.9), ttft90: histQuantile(ttft, 0.9),
+    tps: tpsH.count ? tpsH.sum / tpsH.count : null,
+    rss: totalOf("router_rss_bytes") / 1048576,
+    cache: totalOf("router_cache_bytes") / 1048576,
+  });
+  if (history.length > HIST_MAX) history.splice(0, 1);
+}
+
+// == rendering helpers ==
+function setDs(chart, values) {
+  const d = chart.data.datasets[0].data;
+  d.length = 0;
+  for (const v of values) d.push(v);
+}
+function setLabels(chart, labels) {
+  const l = chart.data.labels;
+  l.length = 0;
+  for (const v of labels) l.push(v);
+}
+function renderTiles() {
+  const req = totalOf("router_requests_total");
+  const chanElig = sumWhere("router_channels_total", (l) => l.state === "eligible");
+  const chanAll = totalOf("router_channels_total");
+  const lookHit = sumWhere("router_cache_lookups_total", (l) => l.result === "hit");
+  const lookMiss = sumWhere("router_cache_lookups_total", (l) => (l.result || "").startsWith("miss_"));
+  const lookDen = lookHit + lookMiss;
+  const rescued = sumWhere("router_hedge_outcome_total", (l) => l.result === "rescued");
+  const faster = sumWhere("router_hedge_outcome_total", (l) => l.result === "faster");
+  const redundant = sumWhere("router_hedge_outcome_total", (l) => l.result === "redundant");
+  tileEls.requests.value.textContent = fmtInt(req);
+  tileEls.requests.sub.textContent = "by outcome: " + Array.from(byLabel("router_requests_total", "outcome"), ([k, v]) => k + " " + fmtInt(v)).join(", ");
+  tileEls.rate.value.textContent = history.length > 1 && history[history.length - 1].rate !== null ? fmtNum1(history[history.length - 1].rate) : "-";
+  tileEls.rate.sub.textContent = "requests per minute over the last scrape interval";
+  tileEls.channels.value.textContent = fmtInt(chanElig) + " / " + fmtInt(chanAll);
+  tileEls.channels.sub.textContent = "eligible / total";
+  tileEls.cache.value.textContent = lookDen ? fmtPct(lookHit / lookDen) : "-";
+  tileEls.cache.sub.textContent = fmtInt(totalOf("router_cache_entries")) + " entries, " + fmtBytes(totalOf("router_cache_bytes"));
+  tileEls.hedge.value.textContent = rescued + faster + redundant ? fmtPct(rescued / (rescued + faster + redundant)) : "-";
+  tileEls.hedge.sub.textContent = "rescued " + fmtInt(rescued) + ", faster " + fmtInt(faster) + ", redundant " + fmtInt(redundant);
+  tileEls.inflight.value.textContent = fmtInt(totalOf("router_trials_inflight"));
+  tileEls.inflight.sub.textContent = "router_trials_inflight";
+  tileEls.rss.value.textContent = fmtBytes(totalOf("router_rss_bytes"));
+  tileEls.rss.sub.textContent = "router_rss_bytes";
+  const tok = byLabel("router_tokens_total", "kind");
+  let tokSum = 0;
+  for (const v of tok.values()) tokSum += v;
+  tileEls.tokens.value.textContent = fmtInt(tokSum);
+  tileEls.tokens.sub.textContent = Array.from(tok, ([k, v]) => k + " " + fmtInt(v)).join(", ") || "no token samples yet";
+}
+function renderHistoryCharts() {
+  const labels = history.map((p) => p.t);
+  setLabels(charts.hist_rate, labels);
+  setDs(charts.hist_rate, history.map((p) => p.rate));
+  setLabels(charts.hist_latency, labels);
+  const lat = charts.hist_latency.data.datasets;
+  lat[0].data = history.map((p) => p.up50);
+  lat[1].data = history.map((p) => p.up90);
+  lat[2].data = history.map((p) => p.rt90);
+  lat[3].data = history.map((p) => p.ttft90);
+  setLabels(charts.hist_tps, labels);
+  setDs(charts.hist_tps, history.map((p) => p.tps));
+  setLabels(charts.hist_mem, labels);
+  charts.hist_mem.data.datasets[0].data = history.map((p) => p.rss);
+  charts.hist_mem.data.datasets[1].data = history.map((p) => p.cache);
+}
+function renderSnapshots() {
+  // doughnuts: fixed label order, values summed by label
+  const fillDoughnut = (chart, map) => {
+    const d = chart.data.datasets[0].data;
+    d.length = 0;
+    for (const lbl of chart.data.labels) d.push(map.get(lbl) || 0);
+  };
+  fillDoughnut(charts.snap_outcomes, byLabel("router_requests_total", "outcome"));
+  fillDoughnut(charts.snap_lookups, byLabel("router_cache_lookups_total", "result"));
+  fillDoughnut(charts.snap_hedgeout, byLabel("router_hedge_outcome_total", "result"));
+  fillDoughnut(charts.snap_tokkind, byLabel("router_tokens_total", "kind"));
+
+  // hedge wins stacked bar: one dataset per provider over x = 0, 1, 2, 3+
+  const providers = allProviders();
+  const hw = byLabelMulti("router_hedge_wins_total", "provider", "hedge_index");
+  const hwDatasets = providers.map((p, i) => ({
+    label: p,
+    data: ["0", "1", "2", "3+"].map((ix) => (hw.get(p) || new Map()).get(ix) || 0),
+    backgroundColor: PAL[i % PAL.length] + "cc",
+  }));
+  charts.snap_hedgewins.data.datasets = hwDatasets;
+
+  // latency histogram by stage: labels from the upstream hist, counts per bucket
+  const lh = histMerge("router_latency_seconds", { stage: "upstream" });
+  const lr = histMerge("router_latency_seconds", { stage: "router" });
+  const les = lh.buckets.map((b) => fmtSecs(b.le));
+  setLabels(charts.snap_lathist, les);
+  setDs(charts.snap_lathist, histCounts(lh));
+  charts.snap_lathist.data.datasets[1].data = histCounts(lr);
+  const tt = histMerge("router_ttft_seconds");
+  setLabels(charts.snap_ttft, tt.buckets.map((b) => fmtSecs(b.le)));
+  setDs(charts.snap_ttft, histCounts(tt));
+  const tp = histMerge("router_output_tokens_per_second");
+  setLabels(charts.snap_tpshist, tp.buckets.map((b) => fmtNum1(b.le)));
+  setDs(charts.snap_tpshist, histCounts(tp));
+  const ca = histMerge("router_cache_age_seconds");
+  setLabels(charts.snap_agehist, ca.buckets.map((b) => fmtSecs(b.le)));
+  setDs(charts.snap_agehist, histCounts(ca));
+}
+
+function renderErrors() {
+  // aggregate errors by class across providers, keep the provider split for the tooltip
+  const perClass = new Map();
+  errSplits.clear();
+  for (const smp of collect("router_errors_total")) {
+    const cls = smp.labels.class !== undefined ? smp.labels.class : "(none)";
+    const prov = smp.labels.provider !== undefined ? smp.labels.provider : "(none)";
+    if (!perClass.has(cls)) perClass.set(cls, 0);
+    perClass.set(cls, perClass.get(cls) + smp.value);
+    if (!errSplits.has(cls)) errSplits.set(cls, new Map());
+    const sm = errSplits.get(cls);
+    sm.set(prov, (sm.get(prov) || 0) + smp.value);
+  }
+  const top = Array.from(perClass, ([k, v]) => [k, v])
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+  setLabels(charts.snap_errors, top.map((e) => e[0]));
+  setDs(charts.snap_errors, top.map((e) => e[1]));
+}
+
+function renderBackoff() {
+  const kinds = ["channel", "provider_key", "provider"];
+  const entries = byLabel("router_backoff_entries_total", "kind");
+  const resets = byLabel("router_backoff_resets_total", "kind");
+  const inB = byLabel("router_in_backoff", "kind");
+  charts.snap_backoff.data.datasets[0].data = kinds.map((k) => entries.get(k) || 0);
+  charts.snap_backoff.data.datasets[1].data = kinds.map((k) => resets.get(k) || 0);
+  $("backoff_now").textContent = "now: " + kinds.map((k) => {
+    const short = k === "provider_key" ? "key" : k;
+    return short + " " + fmtInt(inB.get(k) || 0);
+  }).join(", ");
+}
+
+function renderTable() {
+  const tbody = $("channels").tBodies[0];
+  const rows = [];
+  for (const p of allProviders()) {
+    const t = (o) => sumWhere("router_trials_total", (l) => l.provider === p && l.outcome === o);
+    const a = (o) => sumWhere("router_attempts_total", (l) => l.provider === p && l.outcome === o);
+    const won = t("won"), failed = t("failed"), cancelled = t("cancelled");
+    const cp = sumWhere("router_copies_total", (l) => l.provider === p);
+    const hw = sumWhere("router_hedge_wins_total", (l) => l.provider === p);
+    const resc = sumWhere("router_hedge_outcome_total", (l) => l.provider === p && l.result === "rescued");
+    const fast = sumWhere("router_hedge_outcome_total", (l) => l.provider === p && l.result === "faster");
+    const redn = sumWhere("router_hedge_outcome_total", (l) => l.provider === p && l.result === "redundant");
+    const denom = resc + fast + redn;
+    const rr = denom ? resc / denom : null;
+    const ch = histMerge("router_copy_latency_seconds", { provider: p });
+    rows.push({
+      p, won, failed, cancelled,
+      aok: a("success"), aerr: a("http_error"),
+      atimeout: a("timeout"), acancel: a("cancelled"),
+      cp, hw, rr,
+      p50: histQuantile(ch, 0.5), p90: histQuantile(ch, 0.9),
+      errs: sumWhere("router_errors_total", (l) => l.provider === p),
+    });
+  }
+  rows.sort((x, y) => (y.won + y.failed + y.cancelled) - (x.won + x.failed + x.cancelled));
+  const trs = rows.map((r) => {
+    const cells = [r.p, fmtInt(r.won), fmtInt(r.failed), fmtInt(r.cancelled), fmtInt(r.aok), fmtInt(r.aerr), fmtInt(r.atimeout), fmtInt(r.acancel), fmtInt(r.cp), fmtInt(r.hw),
+      r.rr === null ? "-" : fmtPct(r.rr), fmtSecs(r.p50), fmtSecs(r.p90), fmtInt(r.errs)];
+    return "<tr><td>" + cells.join("</td><td>") + "</td></tr>";
+  });
+  tbody.innerHTML = trs.join("");
+}
+
+// == scrape loop ==
+function ingest(text) {
+  latest = parseMetrics(text);
+  hists = buildHistograms();
+  pushHistory();
+  renderTiles();
+  renderHistoryCharts();
+  renderSnapshots();
+  renderErrors();
+  renderBackoff();
+  renderTable();
+  for (const c of Object.values(charts)) c.update("none");
+}
+
+function setPill(state, text) {
+  const pill = $("pill");
+  pill.className = "pill " + state;
+  $("pilltext").textContent = text;
+}
+
+let failStreak = 0, inFlight = false, timer = null, retryTimer = null, stopped = false, lastOk = 0;
+
+async function tick() {
+  if (inFlight || stopped) return;
+  inFlight = true;
+  try {
+    const res = await fetch("/metrics", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    ingest(await res.text());
+    failStreak = 0;
+    lastOk = Date.now();
+    setPill("live", "live");
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (!timer) timer = setInterval(tick, 5000);
+  } catch (err) {
+    failStreak += 1;
+    if (timer) { clearInterval(timer); timer = null; }
+    if (failStreak >= 3) {
+      stopped = true;
+      setPolling();
+    } else {
+      setPill("stalled", "scrape failed, retrying in 30s");
+      retryTimer = setTimeout(tick, 30000);
+    }
+  }
+  inFlight = false;
+}
+
+function setPolling() {
+  stopped = true;
+  setPill("failed", "scrape failed");
+  $("retry").style.display = "";
+}
+
+$("retry").addEventListener("click", () => {
+  stopped = false;
+  failStreak = 0;
+  $("retry").style.display = "none";
+  setPill("connecting", "connecting");
+  tick();
+});
+
+setInterval(() => {
+  const el = $("age");
+  if (!lastOk) { el.textContent = "no scrape yet"; return; }
+  el.textContent = "last scrape " + Math.round((Date.now() - lastOk) / 1000) + "s ago";
+}, 1000);
+
+setPill("connecting", "connecting");
+tick();
+</script>
+</body>
+</html>
