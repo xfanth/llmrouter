@@ -260,13 +260,19 @@ pub async fn healthz(state: axum::extract::State<Arc<AppState>>) -> Response {
 /// reasoning tokens with it, so a single "completion" figure would have
 /// described neither the bill nor what the client actually read.
 ///
-/// The rate uses completion tokens alone against the whole request, reasoning
-/// excluded, because that is the number a caller feels.
+/// `rate` is the winning stream's tokens per second over its own generation
+/// window: first content token to end of stream for a streamed winner, the
+/// winning channel call's own wall clock for a buffered one. Dividing by the
+/// whole request instead charged the hedge window and every failed channel
+/// the walk got through first to a speed the provider never delivered at: a
+/// 33 token answer that streamed in a quarter of a second recorded 6.7
+/// tokens a second against the whole request and some 140 over its own
+/// window.
 fn record_usage(
     metrics: &Metrics,
     provider: &str,
     usage: &crate::wire::NeutralUsage,
-    elapsed: Duration,
+    rate: Option<f64>,
 ) {
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
@@ -276,12 +282,12 @@ fn record_usage(
     metrics.record_tokens(provider, TokenKind::Completion, output);
     metrics.record_tokens(provider, TokenKind::Reasoning, reasoning);
 
-    // A provider that reports no usage at all leaves the rate out rather than
-    // recording a zero: a zero would pull the histogram down and read as a
-    // slow answer, when in fact nothing was measured.
-    let seconds = elapsed.as_secs_f64();
-    if output > 0 && seconds > 0.0 {
-        metrics.record_output_rate(output as f64 / seconds);
+    // A measured rate is recorded as measured. An absent, zero, negative or
+    // non-finite rate is left out rather than recorded: a zero would pull the
+    // histogram down and read as a slow answer, when in fact nothing was
+    // measured.
+    if let Some(rate) = rate.filter(|r| r.is_finite() && *r > 0.0) {
+        metrics.record_output_rate(rate);
     }
 }
 
@@ -847,7 +853,14 @@ async fn handle_completion(
             // Nothing streamed, so the client's first token is its whole
             // answer and the two timings are the same reading.
             state.metrics.record_ttft(total);
-            record_usage(&state.metrics, &winner.provider, &usage, total);
+            // A buffered answer has no stream to time, so the winning
+            // channel call's own wall clock is the generation window: it is
+            // the whole call, connect to last byte, with none of the walk.
+            let rate = usage
+                .output_tokens
+                .filter(|&o| o > 0)
+                .map(|o| o as f64 / winner.latency.as_secs_f64());
+            record_usage(&state.metrics, &winner.provider, &usage, rate);
             state.metrics.record_request(Outcome::Success);
             tracing::info!(
                 outcome = "success",
@@ -946,7 +959,16 @@ async fn handle_completion(
                 let usage_provider = provider.clone();
                 tokio::spawn(async move {
                     if let Ok(usage) = reported_usage.await {
-                        record_usage(&usage_metrics, &usage_provider, &usage, started.elapsed());
+                        // The usage frame arrives with the end of the stream,
+                        // so the distance from the first token to here is the
+                        // provider's own generation window, with none of the
+                        // walk or the hedge decision window in it.
+                        let generated = first_token_at.elapsed();
+                        let rate = usage
+                            .output_tokens
+                            .filter(|&o| o > 0)
+                            .map(|o| o as f64 / generated.as_secs_f64());
+                        record_usage(&usage_metrics, &usage_provider, &usage, rate);
                     }
                 });
 
@@ -981,12 +1003,22 @@ async fn handle_completion(
                         };
                         // The fold on this path happens on the request's own
                         // task, so the usage block is in hand here rather
-                        // than on the cache's spawned copy.
+                        // than on the cache's spawned copy. The stream has
+                        // run to its end by now, so the distance from the
+                        // first token to here is the provider's generation
+                        // window.
+                        let generated = first_token_at.elapsed();
+                        let rate = winner
+                            .response
+                            .usage
+                            .output_tokens
+                            .filter(|&o| o > 0)
+                            .map(|o| o as f64 / generated.as_secs_f64());
                         record_usage(
                             &state.metrics,
                             &winner.provider,
                             &winner.response.usage,
-                            started.elapsed(),
+                            rate,
                         );
                         if let (Some(cache), Some(key)) = (state.cache.as_ref(), key) {
                             write_cache(
@@ -1513,6 +1545,78 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scrape read into samples, so a test compares exact values rather
+    /// than matching a prefix of the text. Mirrors the helpers in metrics.rs.
+    fn scrape(metrics: &Metrics) -> Vec<prometheus_parse::Sample> {
+        prometheus_parse::Scrape::parse(metrics.render().lines().map(|l| Ok(l.to_owned())))
+            .expect("the scrape parses")
+            .samples
+    }
+
+    /// The one unlabelled value behind `name`.
+    fn plain(samples: &[prometheus_parse::Sample], name: &str) -> f64 {
+        let found: Vec<_> = samples
+            .iter()
+            .filter(|s| s.metric == name && s.labels.is_empty())
+            .collect();
+        assert_eq!(found.len(), 1, "{name} in the scrape");
+        match &found[0].value {
+            prometheus_parse::Value::Counter(v)
+            | prometheus_parse::Value::Gauge(v)
+            | prometheus_parse::Value::Untyped(v) => *v,
+            other => panic!("{name} is not a plain value: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_output_rate_is_recorded_over_its_generation_window() {
+        let metrics = Metrics::new().expect("the recorder builds");
+        let usage = crate::wire::NeutralUsage {
+            input_tokens: Some(17),
+            output_tokens: Some(33),
+            ..Default::default()
+        };
+
+        record_usage(&metrics, "zai", &usage, Some(140.0));
+
+        let s = scrape(&metrics);
+        assert_eq!(plain(&s, "router_output_tokens_per_second_sum"), 140.0);
+        assert_eq!(plain(&s, "router_output_tokens_per_second_count"), 1.0);
+        let tokens = s
+            .iter()
+            .find(|s| {
+                s.metric == "router_tokens_total"
+                    && s.labels.get("provider") == Some("zai")
+                    && s.labels.get("kind") == Some("completion")
+            })
+            .expect("the completion token counter is in the scrape");
+        match &tokens.value {
+            prometheus_parse::Value::Counter(v) => assert_eq!(*v, 33.0),
+            other => panic!("the tokens counter: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_zero_or_nonfinite_rate_is_left_out() {
+        let metrics = Metrics::new().expect("the recorder builds");
+        let usage = crate::wire::NeutralUsage {
+            output_tokens: Some(33),
+            ..Default::default()
+        };
+
+        record_usage(&metrics, "zai", &usage, None);
+        record_usage(&metrics, "zai", &usage, Some(0.0));
+        record_usage(&metrics, "zai", &usage, Some(f64::NAN));
+        record_usage(&metrics, "zai", &usage, Some(f64::INFINITY));
+
+        let s = scrape(&metrics);
+        assert!(
+            s.iter()
+                .all(|s| s.metric != "router_output_tokens_per_second_count"),
+            "no rate sample should exist"
+        );
+    }
 
     /// A stored entry must hold the answer once. `wire` decodes with
     /// preservation off so the provider's exact reply is never kept beside the
