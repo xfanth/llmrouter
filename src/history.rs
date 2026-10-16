@@ -35,6 +35,41 @@ const HISTORY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("history");
 /// The ring's single row key.
 const POINTS_KEY: &[u8] = b"points";
 
+/// The redb table holding the saved counters. One row, the whole map as one
+/// JSON blob: series key to value.
+const COUNTERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("counters");
+
+/// The counters table's single row key.
+const COUNTERS_KEY: &[u8] = b"counters";
+
+/// The counter series a save keeps: every counter metric except the `_count`,
+/// `_sum` and `_bucket` companions histograms carry. Histograms are not
+/// restored (they cannot be replayed faithfully into the recorder; the
+/// history ring already keeps their percentiles over time) and gauges are
+/// current readings, not history.
+fn counters_from_samples(samples: &[Sample]) -> Vec<(String, u64)> {
+    samples
+        .iter()
+        .filter(|s| {
+            matches!(s.value, Value::Counter(_))
+                && !s.metric.ends_with("_count")
+                && !s.metric.ends_with("_sum")
+                && !s.metric.ends_with("_bucket")
+        })
+        .filter_map(|s| {
+            let pairs: Vec<(String, String)> = s
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let value = match &s.value {
+                Value::Counter(v) => *v as u64,
+                _ => return None,
+            };
+            Some((crate::metrics::build_series_key(&s.metric, &pairs), value))
+        })
+        .collect()
+}
 fn store_err(e: impl std::fmt::Display) -> crate::RouterError {
     crate::RouterError::Store(e.to_string())
 }
@@ -171,6 +206,71 @@ impl History {
         Ok(())
     }
 
+    /// Writes the counter map through to redb, replacing whatever a previous
+    /// flush wrote. Called on the same cadence as the ring's flush.
+    pub fn save_counters(&self, saved: &[(String, u64)]) -> crate::Result<()> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(());
+        };
+        let blob = serde_json::to_vec(saved).map_err(store_err)?;
+        let write = db.begin_write().map_err(store_err)?;
+        {
+            let mut table = write.open_table(COUNTERS).map_err(store_err)?;
+            table
+                .insert(COUNTERS_KEY, blob.as_slice())
+                .map_err(store_err)?;
+        }
+        write.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// The counters the previous run saved. Empty on a fresh file.
+    pub fn load_counters(&self) -> Vec<(String, u64)> {
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
+        let read = match db.begin_read() {
+            Ok(read) => read,
+            Err(e) => {
+                tracing::warn!(error = %e, "counters load failed, starting empty");
+                return Vec::new();
+            }
+        };
+        let table = match read.open_table(COUNTERS) {
+            Ok(table) => table,
+            Err(_) => return Vec::new(),
+        };
+        let Some(blob) = (match table.get(COUNTERS_KEY) {
+            Ok(Some(blob)) => Some(blob),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        match serde_json::from_slice(blob.value()) {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(error = %e, "counters load failed, starting empty");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Renders the metrics, picks the counter series out and saves them. The
+    /// sampler calls this beside the ring's flush.
+    pub fn save_counters_from(&self, metrics: &crate::metrics::Metrics) {
+        let text = metrics.render();
+        let scrape = match Scrape::parse(text.lines().map(|l| Ok(l.to_owned()))) {
+            Ok(scrape) => scrape,
+            Err(e) => {
+                tracing::warn!(error = %e, "counter save skipped: the scrape did not parse");
+                return;
+            }
+        };
+        let saved = counters_from_samples(&scrape.samples);
+        if let Err(e) = self.save_counters(&saved) {
+            tracing::warn!(error = %e, "counter save failed");
+        }
+    }
     /// A copy of the ring, oldest first.
     pub fn points(&self) -> Vec<Point> {
         self.points.lock().expect("history ring").clone()
@@ -201,6 +301,7 @@ impl History {
                         if let Err(e) = self.flush() {
                             tracing::warn!(error = %e, "history flush failed");
                         }
+                        self.save_counters_from(&metrics);
                     }
                 }
                 _ = shutdown.cancelled() => break,
@@ -425,6 +526,49 @@ mod tests {
         // the second sample and ends on the last one.
         assert_eq!(points.first().map(|p| p.t), Some(5_000));
         assert_eq!(points.last().map(|p| p.t), Some(MAX_SAMPLES as u64 * 5_000));
+    }
+
+    #[test]
+    fn counters_round_trip_through_redb() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("history.redb");
+        let m = metrics();
+        {
+            let h = History::open(&path);
+            m.record_request(Outcome::Success);
+            m.record_request(Outcome::Success);
+            m.record_output_rate(140.0);
+            h.save_counters_from(&m);
+        }
+        let h = History::open(&path);
+        let saved = h.load_counters();
+        let requests = saved
+            .iter()
+            .find(|(key, _)| key.contains("router_requests_total{outcome=\"success\"}"))
+            .map(|(_, v)| *v);
+        // Only counters are saved: histogram and gauge series stay out.
+        assert_eq!(requests, Some(2));
+        assert!(saved.iter().all(|(key, _)| {
+            !key.contains("_count") && !key.contains("_sum") && !key.contains("router_rss_bytes")
+        }));
+    }
+
+    #[test]
+    fn saved_counters_restore_onto_a_fresh_recorder() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join("history.redb");
+        let m = metrics();
+        {
+            let h = History::open(&path);
+            m.record_request(Outcome::Success);
+            h.save_counters_from(&m);
+        }
+        let h = History::open(&path);
+        let saved = h.load_counters();
+        let fresh = metrics();
+        fresh.set_counter_offsets(&saved);
+        let text = fresh.render();
+        assert!(text.contains("router_requests_total{outcome=\"success\"} 1"));
     }
 
     #[test]

@@ -892,6 +892,7 @@ async fn handle_completion(
                 chunks,
                 latency,
                 first_token_at,
+                slot: stream_slot,
             } = *winner;
             let served = named_model.clone().unwrap_or_else(|| model_id.clone());
 
@@ -922,6 +923,7 @@ async fn handle_completion(
                             intelligence,
                             response: crate::wire::NeutralResponse::default(),
                             latency,
+                            slot: stream_slot,
                         };
                         (forwarded, Some((cache, key, winner, complete)))
                     }
@@ -1003,6 +1005,7 @@ async fn handle_completion(
                             intelligence,
                             response,
                             latency,
+                            slot: stream_slot,
                         };
                         // The fold on this path happens on the request's own
                         // task, so the usage block is in hand here rather
@@ -1799,14 +1802,20 @@ mod tests {
             ..RouterConfig::default()
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
         runtime.block_on(async {
             let prompt = Bytes::from(vec![b'x'; 4 * 1024 * 1024]);
-            let mut spill = Box::pin(PromptBody::new(prompt, 101, &config));
-            // One poll starts the write on the blocking pool, then the handler
-            // future is dropped, as axum does when the client disconnects.
-            assert!(futures::poll!(spill.as_mut()).is_pending());
+            let spill = Box::pin(PromptBody::new(prompt, 101, &config));
+            // Give the blocking write a beat to start, then abandon the
+            // handler future, as axum does when the client disconnects.
+            // Whether the write finished before or after the drop is a
+            // property of the disk, not of the router; the cleanup must
+            // hold either way. Asserting the first poll stayed pending was
+            // a timing bet that failed on a fast CI disk.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            drop(spill);
         });
         // Dropping the runtime waits for the blocking pool to finish, so any
         // write still in flight has landed by now.

@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = state.history.flush() {
         tracing::warn!(error = %e, "history flush on shutdown failed");
     }
+    state.history.save_counters_from(&state.metrics);
     result.context("server")?;
     tracing::info!("stopped");
     Ok(())
@@ -180,6 +181,14 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
     let mut history_path = router.cache.path.clone();
     history_path.set_file_name("history.redb");
     let history = Arc::new(llmrouter::history::History::open(&history_path));
+
+    // The counters the previous run saved come back on top of the fresh
+    // recorder, so the dashboard's cumulative charts survive a restart.
+    let saved = history.load_counters();
+    if !saved.is_empty() {
+        tracing::info!(series = saved.len(), "restoring saved counters");
+        metrics.set_counter_offsets(&saved);
+    }
 
     Ok(Arc::new(llmrouter::AppState {
         admission: Admission::new(router.memory_high_water, RSS_RETRY_AFTER),

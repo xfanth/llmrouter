@@ -3,7 +3,8 @@
 //! Omniroute died quietly and nobody was watching. These are the counters that
 //! would have shown it.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metrics::Unit;
@@ -402,6 +403,39 @@ impl HedgeOutcome {
     }
 }
 
+/// What the N-race bought for one walk that ends with an answer.
+///
+/// The M-hedge asks whether M copies of one channel call helped that call;
+/// `router_hedge_outcome_total` answers that question. This asks the other:
+/// did firing `race_width` channels at once pay, compared with trying them
+/// one at a time? Two hedges, two knobs, two sets of stats.
+///
+/// Classified by completion order: a late-fired trial that failed before an
+/// early slot won also counts as `rescued`. The per-copy lines in the log
+/// carry the exact timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaceStat {
+    /// The first channel fired won the walk. The race bought nothing a
+    /// sequential walk would not have.
+    FirstWon,
+    /// A later channel won with no other trial failing first, so the race
+    /// bought speed: the first channel had not answered yet.
+    LaterWon,
+    /// A later channel won after another trial had already failed, so a
+    /// sequential walk would have burned its wait on the failure first.
+    Rescued,
+}
+
+impl RaceStat {
+    /// The label value written to `/metrics` under `result`.
+    pub fn label(self) -> &'static str {
+        match self {
+            RaceStat::FirstWon => "first_won",
+            RaceStat::LaterWon => "later_won",
+            RaceStat::Rescued => "rescued",
+        }
+    }
+}
 /// Histogram buckets for `router_latency_seconds`, in seconds.
 ///
 /// One metric name carries both stages, so Prometheus forces one bucket set
@@ -495,6 +529,9 @@ const ALL_BACKOFF_KINDS: &[BackoffKind] = &[
     BackoffKind::Provider,
 ];
 
+/// Every race stat, so the counter is seeded at zero.
+const ALL_RACE_STATS: &[RaceStat] = &[RaceStat::FirstWon, RaceStat::LaterWon, RaceStat::Rescued];
+
 /// The two values of the `state` label on `router_channels_total`.
 const CHANNEL_STATES: &[&str] = &["eligible", "in_backoff"];
 
@@ -521,6 +558,8 @@ const STAGE_ROUTER: &str = "router";
 pub struct Metrics {
     recorder: Arc<PrometheusRecorder>,
     handle: PrometheusHandle,
+    /// Counter values a previous run saved, applied when `render` runs.
+    counter_offsets: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Metrics {
@@ -545,6 +584,7 @@ impl Metrics {
         let recorder = builder.build_recorder();
         let metrics = Self {
             handle: recorder.handle(),
+            counter_offsets: Arc::new(Mutex::new(HashMap::new())),
             recorder: Arc::new(recorder),
         };
 
@@ -659,6 +699,35 @@ impl Metrics {
             )
             .increment(1);
         });
+    }
+
+    /// What the N-race bought for one walk that ends with an answer.
+    /// `router_race_outcome_total{result}`.
+    ///
+    /// Read beside the M-hedge numbers: `first_won` climbing means the race
+    /// mostly fires N calls for one answer, which is what the race costs.
+    /// `later_won` and `rescued` climbing means the race pays for itself.
+    pub fn record_race_outcome(&self, result: RaceStat) {
+        self.on_recorder(|| {
+            counter!("router_race_outcome_total", "result" => result.label()).increment(1);
+        });
+    }
+
+    /// Loads the counters a previous run saved, as Prometheus-form series
+    /// keys (`name{k="v"}`) and their values. The values ride on top of
+    /// whatever the fresh recorder has once `/metrics` renders.
+    ///
+    /// Only counters are restored: a histogram cannot be replayed faithfully
+    /// into the recorder, and the history backend already keeps percentiles
+    /// over time. Gauges are current readings, not history.
+    pub fn set_counter_offsets(&self, saved: &[(String, u64)]) {
+        let mut map = self.counter_offsets.lock().expect("counter offsets");
+        map.clear();
+        for (key, value) in saved {
+            if *value > 0 {
+                map.insert(key.clone(), *value);
+            }
+        }
     }
 
     /// One channel trial finished. `router_trials_total{provider,outcome}`.
@@ -851,9 +920,14 @@ impl Metrics {
         self.on_recorder(|| gauge!("router_cache_entries").set(entries as f64));
     }
 
-    /// The Prometheus text body for `GET /metrics`.
+    /// The Prometheus text body for `GET /metrics`, with the counters a
+    /// previous run saved added back on.
     pub fn render(&self) -> String {
-        self.handle.render()
+        let offsets = self.counter_offsets.lock().expect("counter offsets");
+        if offsets.is_empty() {
+            return self.handle.render();
+        }
+        apply_counter_offsets(&self.handle.render(), &offsets)
     }
 }
 
@@ -904,6 +978,13 @@ fn describe_everything() {
         "Won trials by what the hedge bought: rescued when a hedge copy won \
          after the first copy failed, faster when a hedge copy beat a first \
          copy still running, redundant when the first copy won anyway."
+    );
+    describe_counter!(
+        "router_race_outcome_total",
+        "Walks that ended with an answer, by what the N-way race bought: \
+         first_won when the first channel fired won, later_won when a later \
+         channel beat the first, rescued when a later channel won after \
+         another trial had failed."
     );
     describe_counter!(
         "router_trials_total",
@@ -996,6 +1077,9 @@ fn seed_zero() {
     for result in ALL_CACHE_WRITES {
         counter!("router_cache_writes_total", "result" => result.label()).increment(0);
     }
+    for result in ALL_RACE_STATS {
+        counter!("router_race_outcome_total", "result" => result.label()).increment(0);
+    }
     for kind in ALL_BACKOFF_KINDS {
         counter!("router_backoff_entries_total", "kind" => kind.label()).increment(0);
         counter!("router_backoff_resets_total", "kind" => kind.label()).increment(0);
@@ -1010,6 +1094,84 @@ fn seed_zero() {
     gauge!("router_trials_inflight").set(0.0);
 }
 
+/// Splits a Prometheus-form series key `name{k="v",k2="v2"}` into the metric
+/// name and its label pairs. A key without a brace part is name-only.
+fn parse_series_key(key: &str) -> Option<(String, Vec<(String, String)>)> {
+    let (name, labels_part) = match key.split_once('{') {
+        Some((name, rest)) => (name, rest.strip_suffix('}')?),
+        None => (key, ""),
+    };
+    let mut labels = Vec::new();
+    if !labels_part.is_empty() {
+        for pair in labels_part.split(',') {
+            let (k, v) = pair.split_once('=')?;
+            let v = v.strip_prefix('"')?.strip_suffix('"')?;
+            labels.push((k.to_owned(), v.to_owned()));
+        }
+    }
+    Some((name.to_owned(), labels))
+}
+
+/// The stable key of one series: `name{k="v",...}` with the label pairs
+/// sorted by key, so the same series makes the same key on both sides of a
+/// save and restore.
+pub(crate) fn build_series_key(name: &str, labels: &[(String, String)]) -> String {
+    let mut sorted = labels.to_vec();
+    sorted.sort();
+    if sorted.is_empty() {
+        return name.to_owned();
+    }
+    let pairs: Vec<String> = sorted.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+    format!("{}{{{}}}", name, pairs.join(","))
+}
+
+/// Adds the counters a previous run saved onto a fresh scrape. A line whose
+/// series the save carries gains the saved value; a series the save carries
+/// but the scrape does not is appended at the end.
+fn apply_counter_offsets(scrape: &str, offsets: &HashMap<String, u64>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for line in scrape.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            out.push(line.to_owned());
+            continue;
+        }
+        let Some((key_part, value_part)) = line.rsplit_once(' ') else {
+            out.push(line.to_owned());
+            continue;
+        };
+        let norm = match parse_series_key(key_part) {
+            Some((name, pairs)) => build_series_key(&name, &pairs),
+            None => key_part.to_owned(),
+        };
+        match offsets.get(&norm) {
+            Some(offset) => {
+                seen.insert(norm);
+                let value = value_part.parse::<f64>().unwrap_or(0.0) + *offset as f64;
+                out.push(format!("{key_part} {}", format_value(value)));
+            }
+            None => out.push(line.to_owned()),
+        }
+    }
+    for (key, value) in offsets {
+        if !seen.contains(key) {
+            out.push(format!("{key} {value}"));
+        }
+    }
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    joined
+}
+
+/// Renders a counter value the way the exporter would: a whole number with no
+/// decimal part.
+fn format_value(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{}", value as u64)
+    } else {
+        format!("{value}")
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,6 +1181,49 @@ mod tests {
     /// one process do not share numbers.
     fn local() -> Metrics {
         Metrics::new().expect("the recorder builds")
+    }
+
+    #[test]
+    fn series_keys_survive_a_save_and_restore() {
+        let saved: Vec<(String, u64)> = vec![
+            (
+                build_series_key(
+                    "router_attempts_total",
+                    &[
+                        ("provider".to_owned(), "nvidia".to_owned()),
+                        ("model".to_owned(), "m".to_owned()),
+                    ],
+                ),
+                7,
+            ),
+            ("router_requests_total".to_owned(), 3),
+        ];
+        let metrics = local();
+        metrics.set_counter_offsets(&saved);
+
+        let text = metrics.render();
+        // The restored series the recorder has not touched yet land at the
+        // end of the body with their saved values.
+        assert!(text.contains("router_attempts_total{model=\"m\",provider=\"nvidia\"} 7"));
+        assert!(text.contains("router_requests_total 3"));
+    }
+
+    #[test]
+    fn offsets_add_onto_a_recorder_that_restarted_at_zero() {
+        let metrics = local();
+        let saved: Vec<(String, u64)> = vec![(
+            build_series_key(
+                "router_requests_total",
+                &[("outcome".to_owned(), "success".to_owned())],
+            ),
+            9,
+        )];
+        metrics.set_counter_offsets(&saved);
+        metrics.record_request(Outcome::Success);
+
+        let text = metrics.render();
+        // The seed zero plus the saved 9 plus the one new request.
+        assert!(text.contains("router_requests_total{outcome=\"success\"} 10"));
     }
 
     #[test]

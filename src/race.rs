@@ -89,6 +89,10 @@ pub struct Winner {
     pub response: NeutralResponse,
     /// Wall clock of the winning channel call.
     pub latency: Duration,
+
+    /// This trial's slot in the walk's fire order, which the N-race
+    /// outcome reads: slot 0 winning means the race bought nothing.
+    pub slot: u32,
 }
 
 /// A streamed winner. The chunks are neutral; the server encodes them into the
@@ -106,6 +110,10 @@ pub struct StreamWinner {
     pub chunks: ChunkStream,
     /// Wall clock of the winning channel call up to its first bytes.
     pub latency: Duration,
+
+    /// This trial's slot in the walk's fire order, which the N-race
+    /// outcome reads: slot 0 winning means the race bought nothing.
+    pub slot: u32,
     /// When the first token arrived. Everything from here until the answer is
     /// whole is the provider generating, not the router working.
     pub first_token_at: tokio::time::Instant,
@@ -275,6 +283,9 @@ impl Racer {
 
         let mut excluded: Excluded = HashSet::new();
         let mut last_error: Option<String> = None;
+        // Failed trials so far, which is what the N-race outcome reads at the
+        // moment a winner emerges.
+        let mut failed_before_win: u32 = 0;
         // Health moves owed by trials that failed before the network test
         // answered. They land only once the link is proven up, and are dropped
         // when it is down, because a local fault is not the channel's.
@@ -345,6 +356,12 @@ impl Racer {
             match finished {
                 TrialOutcome::Won(winner) => {
                     race_cancel.cancel();
+                    // What the N-race bought: slot 0 winning means a
+                    // sequential walk would have landed here anyway; a later
+                    // slot winning after a failure means the race carried the
+                    // walk past a dead channel.
+                    let stat = race_stat(winner.slot, failed_before_win);
+                    self.metrics.record_race_outcome(stat);
                     // Anything that had already returned 2xx with content is
                     // paid for either way, and one of them may come from a
                     // smarter model than the winner.
@@ -433,6 +450,12 @@ impl Racer {
                         }
                         continue;
                     };
+                    // What the N-race bought, judged on the winner's own slot
+                    // rather than the trial that opened the window: a later
+                    // channel that out-streamed the first is exactly what the
+                    // race is for.
+                    let stat = race_stat(picked.slot, failed_before_win);
+                    self.metrics.record_race_outcome(stat);
                     // The success is written only now the stream has been
                     // judged. Writing it at the first token would clear the
                     // backoff of a channel that then broke inside the window.
@@ -470,6 +493,7 @@ impl Racer {
                 TrialOutcome::Cancelled => {}
                 TrialOutcome::Failed { error, pending } => {
                     last_error = Some(error);
+                    failed_before_win += 1;
                     if let Some(pending) = pending {
                         if link_up {
                             self.apply_failure(pending.channel, pending.retry_after_secs);
@@ -537,11 +561,13 @@ impl Racer {
             crate::catalogue::query(snapshot, &input.filter, excluded, wanted, now_unix())
         {
             excluded.insert(channel.id);
+            let slot = fired.queued();
             fired.queued.fetch_add(copies, Ordering::Relaxed);
             inflight.push(Box::pin(self.run_trial(
                 channel,
                 Arc::clone(&input.outbound),
                 input.streaming,
+                slot,
                 cancel.child_token(),
                 fired,
                 walk_started,
@@ -554,11 +580,13 @@ impl Racer {
     /// The first copy to produce an answer wins and the rest are cancelled.
     ///
     /// The whole trial counts once against health, whatever M is.
+    #[allow(clippy::too_many_arguments)] // slot rides the same list
     async fn run_trial<'a>(
         &self,
         channel: &'a Channel,
         body: Arc<PromptBody>,
         streaming: bool,
+        slot: u32,
         cancel: CancellationToken,
         fired: &'a WalkCount,
         walk_started: tokio::time::Instant,
@@ -617,9 +645,9 @@ impl Racer {
                     }
                 };
                 let called = if streaming {
-                    self.copy_streamed(channel, body, &own).await
+                    self.copy_streamed(channel, body, &own, slot).await
                 } else {
-                    self.copy_buffered(channel, body, &own).await
+                    self.copy_buffered(channel, body, &own, slot).await
                 };
                 match called {
                     Ok(win) => {
@@ -768,6 +796,7 @@ impl Racer {
         channel: &Channel,
         body: SharedBody,
         own: &Arc<AtomicU32>,
+        slot: u32,
     ) -> Result<CopyWin, CopyFailure> {
         let _open = InFlight::open(channel, own);
         channel.telemetry.calls.fetch_add(1, Ordering::Relaxed);
@@ -867,6 +896,7 @@ impl Racer {
             intelligence: channel.intelligence,
             response,
             latency: call.latency,
+            slot,
         })))
     }
 
@@ -879,6 +909,7 @@ impl Racer {
         channel: &Channel,
         body: SharedBody,
         own: &Arc<AtomicU32>,
+        slot: u32,
     ) -> Result<CopyWin, CopyFailure> {
         // The guard travels with the stream: a streamed call ends when the
         // stream ends, not when its first frame arrives.
@@ -981,6 +1012,7 @@ impl Racer {
             broken: false,
             finished_at: None,
             elapsed: started.elapsed(),
+            slot,
             rest,
             open,
         })))
@@ -2169,6 +2201,10 @@ pub struct ReadyStream {
     /// the window: measuring it to the close would charge it for time it was
     /// never given, and hand the window to a slower stream still running.
     finished_at: Option<tokio::time::Instant>,
+
+    /// This trial's slot in the walk's fire order, which the N-race
+    /// outcome reads: slot 0 winning means the race bought nothing.
+    slot: u32,
     elapsed: Duration,
     rest: Pin<Box<dyn Stream<Item = Result<Vec<u8>, CallError>> + Send + 'static>>,
     /// Holds the channel's in-flight count up until this stream is finished or
@@ -2245,6 +2281,7 @@ impl ReadyStream {
             intelligence: self.intelligence,
             chunks,
             latency: self.elapsed,
+            slot: self.slot,
             first_token_at: self.content_at,
         })
     }
@@ -2429,6 +2466,20 @@ pub fn best_for_cache<'a>(winner: &'a Winner, also_finished: &'a [Winner]) -> &'
     })
 }
 
+/// What the N-race bought for the walk that just ended with a winner: slot 0
+/// is the first channel fired, so a slot-0 win means a sequential walk would
+/// have landed on the same answer, and a later slot winning means the race
+/// carried the walk past whatever the earlier channels were doing.
+fn race_stat(slot: u32, failed_before_win: u32) -> crate::metrics::RaceStat {
+    if slot == 0 {
+        crate::metrics::RaceStat::FirstWon
+    } else if failed_before_win > 0 {
+        crate::metrics::RaceStat::Rescued
+    } else {
+        crate::metrics::RaceStat::LaterWon
+    }
+}
+
 /// The trials in flight. The futures are boxed so the top-up is one helper
 /// rather than a copy of the same push on every path that loses a trial.
 type Trials<'a> =
@@ -2554,6 +2605,27 @@ mod tests {
     /// Several providers answer a dead key or an empty quota with a `200`
     /// whose body holds the error. Reporting that as "status 200" hands the
     /// operator a success code and no reason, so the message has to survive.
+    #[test]
+    fn race_stat_reads_the_winner_slot_and_failures() {
+        // Slot 0 winning: a sequential walk lands on the same channel anyway.
+        assert!(matches!(
+            race_stat(0, 0),
+            crate::metrics::RaceStat::FirstWon
+        ));
+        assert!(matches!(
+            race_stat(0, 3),
+            crate::metrics::RaceStat::FirstWon
+        ));
+        // A later slot winning with nothing failed: the race bought speed.
+        assert!(matches!(
+            race_stat(4, 0),
+            crate::metrics::RaceStat::LaterWon
+        ));
+        // A later slot winning after a failure: the race carried the walk
+        // past a dead channel.
+        assert!(matches!(race_stat(4, 1), crate::metrics::RaceStat::Rescued));
+    }
+
     #[test]
     fn a_two_hundred_carrying_an_error_reports_the_upstream_message() {
         let body = br#"{"error":{"message":"insufficient quota","type":"insufficient_quota"}}"#;
@@ -3088,6 +3160,7 @@ mod tests {
             intelligence,
             response: NeutralResponse::default(),
             latency: Duration::from_millis(1),
+            slot: 0,
         }
     }
 
@@ -3358,6 +3431,7 @@ mod tests {
             broken: false,
             finished_at: None,
             elapsed: Duration::from_millis(elapsed_ms),
+            slot: 0,
             rest,
             open: InFlight::open(&test_channel(), &Arc::new(AtomicU32::new(0))),
         }
@@ -4098,6 +4172,7 @@ mod tests {
             broken: false,
             finished_at: None,
             elapsed: Duration::from_millis(1),
+            slot: 0,
             rest: Box::pin(futures::stream::empty()),
             open: InFlight::open(&channel, &own),
         };
@@ -4207,6 +4282,7 @@ mod tests {
                     &self.channel,
                     body,
                     false,
+                    0,
                     cancel,
                     &self.fired,
                     tokio::time::Instant::now(),

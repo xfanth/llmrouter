@@ -142,7 +142,8 @@ footer .links { margin-left: auto; display: flex; gap: 14px; }
   <div class="card"><h3>Request outcomes</h3><div class="sub">cumulative</div><canvas id="snap_outcomes"></canvas></div>
   <div class="card"><h3>Cache lookups</h3><div class="sub">cumulative</div><canvas id="snap_lookups"></canvas></div>
   <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider</div><canvas id="snap_hedgewins"></canvas></div>
-  <div class="card"><h3>Hedge outcomes</h3><div class="sub">cumulative</div><canvas id="snap_hedgeout"></canvas></div>
+  <div class="card"><h3>Hedge outcomes (M)</h3><div class="sub">cumulative</div><canvas id="snap_hedgeout"></canvas></div>
+  <div class="card"><h3>Race outcomes (N)</h3><div class="sub">cumulative</div><canvas id="snap_raceout"></canvas></div>
   <div class="card"><h3>Latency histogram by stage</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_lathist"></canvas></div>
   <div class="card"><h3>Time to first token</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_ttft"></canvas></div>
   <div class="card"><h3>Tokens per second histogram</h3><div class="sub">count per bucket</div><canvas id="snap_tpshist"></canvas></div>
@@ -268,7 +269,7 @@ function providersOf(name) {
 }
 function allProviders() {
   const s = new Set();
-  for (const n of ["router_attempts_total", "router_trials_total", "router_copies_total", "router_hedge_wins_total", "router_hedge_outcome_total", "router_copy_latency_seconds", "router_errors_total", "router_tokens_total"]) {
+  for (const n of ["router_attempts_total", "router_trials_total", "router_copies_total", "router_hedge_wins_total", "router_hedge_outcome_total", "router_race_outcome_total", "router_copy_latency_seconds", "router_errors_total", "router_tokens_total"]) {
     for (const p of providersOf(n)) s.add(p);
   }
   return [...s].sort();
@@ -354,6 +355,7 @@ const PAL = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373", "#ba68c8", "#4db6ac", "
 const OUTCOME_COLORS = { hit_cache: "#56d364", success: "#4fc3f7", too_large: "#ffb74d", no_network: "#f85149", not_admitted: "#ba68c8", no_channel: "#e57373" };
 const LOOKUP_COLORS = { hit: "#56d364", miss_absent: "#ffb74d", miss_expired: "#d29922", miss_model_mismatch: "#ba68c8", miss_schema: "#f78166", disabled: "#8b949e", error: "#f85149" };
 const HEDGE_COLORS = { rescued: "#56d364", faster: "#4fc3f7", redundant: "#8b949e", no_hedge: "#d29922" };
+const RACE_COLORS = { first_won: "#8b949e", later_won: "#4fc3f7", rescued: "#56d364" };
 const charts = {};
 Chart.defaults.color = "#8b949e";
 Chart.defaults.borderColor = "rgba(42, 49, 60, 0.9)";
@@ -430,6 +432,7 @@ makeLine("hist_mem", [lineDs("RSS MB", "#4fc3f7"), lineDs("cache MB", "#81c784")
 makeDoughnut("snap_outcomes", ["hit_cache", "success", "too_large", "no_network", "not_admitted", "no_channel"], OUTCOME_COLORS);
 makeDoughnut("snap_lookups", ["hit", "miss_absent", "miss_expired", "miss_model_mismatch", "miss_schema", "disabled", "error"], LOOKUP_COLORS);
 makeDoughnut("snap_hedgeout", ["rescued", "faster", "redundant", "no_hedge"], HEDGE_COLORS);
+makeDoughnut("snap_raceout", ["first_won", "later_won", "rescued"], RACE_COLORS);
 makeDoughnut("snap_tokkind", ["prompt", "completion", "reasoning"], { prompt: "#4fc3f7", completion: "#81c784", reasoning: "#ba68c8" });
 
 makeBar("snap_hedgewins",
@@ -557,7 +560,10 @@ function renderTiles() {
   tileEls.cache.value.textContent = lookDen ? fmtPct(lookHit / lookDen) : "-";
   tileEls.cache.sub.textContent = fmtInt(totalOf("router_cache_entries")) + " entries, " + fmtBytes(totalOf("router_cache_bytes"));
   tileEls.hedge.value.textContent = rescued + faster + redundant ? fmtPct(rescued / (rescued + faster + redundant)) : "-";
-  tileEls.hedge.sub.textContent = "rescued " + fmtInt(rescued) + ", faster " + fmtInt(faster) + ", redundant " + fmtInt(redundant);
+  const firstWon = sumWhere("router_race_outcome_total", (l) => l.result === "first_won");
+  const laterWon = sumWhere("router_race_outcome_total", (l) => l.result === "later_won");
+  const raceRescued = sumWhere("router_race_outcome_total", (l) => l.result === "rescued");
+  tileEls.hedge.sub.textContent = "M: rescued " + fmtInt(rescued) + ", faster " + fmtInt(faster) + ", redundant " + fmtInt(redundant) + " / N: first " + fmtInt(firstWon) + ", later " + fmtInt(laterWon) + ", rescued " + fmtInt(raceRescued);
   tileEls.inflight.value.textContent = fmtInt(totalOf("router_trials_inflight"));
   tileEls.inflight.sub.textContent = "router_trials_inflight";
   tileEls.rss.value.textContent = fmtBytes(totalOf("router_rss_bytes"));
@@ -594,6 +600,7 @@ function renderSnapshots() {
   fillDoughnut(charts.snap_outcomes, byLabel("router_requests_total", "outcome"));
   fillDoughnut(charts.snap_lookups, byLabel("router_cache_lookups_total", "result"));
   fillDoughnut(charts.snap_hedgeout, byLabel("router_hedge_outcome_total", "result"));
+  fillDoughnut(charts.snap_raceout, byLabel("router_race_outcome_total", "result"));
   fillDoughnut(charts.snap_tokkind, byLabel("router_tokens_total", "kind"));
 
   // hedge wins stacked bar: one dataset per provider over x = 0, 1, 2, 3+
