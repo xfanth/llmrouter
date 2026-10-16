@@ -892,6 +892,7 @@ async fn handle_completion(
                 chunks,
                 latency,
                 first_token_at,
+                slot: stream_slot,
             } = *winner;
             let served = named_model.clone().unwrap_or_else(|| model_id.clone());
 
@@ -922,6 +923,7 @@ async fn handle_completion(
                             intelligence,
                             response: crate::wire::NeutralResponse::default(),
                             latency,
+                            slot: stream_slot,
                         };
                         (forwarded, Some((cache, key, winner, complete)))
                     }
@@ -1003,6 +1005,7 @@ async fn handle_completion(
                             intelligence,
                             response,
                             latency,
+                            slot: stream_slot,
                         };
                         // The fold on this path happens on the request's own
                         // task, so the usage block is in hand here rather
