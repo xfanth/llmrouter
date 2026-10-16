@@ -1629,7 +1629,7 @@ mod tests {
         let quota_gone = ProbeOutcome {
             alive: true,
             models: Vec::new(),
-            retry_after_secs: Some(3 * 86_400),
+            retry_after_secs: Some(3 * 3_600),
             error: Some("429".to_string()),
         };
         assert!(prober.apply_keyed_outcome(&provider, 0, quota_gone));
@@ -1643,7 +1643,7 @@ mod tests {
             "a pair in backoff must not be raced"
         );
         assert!(
-            rows[0].health.not_before() > now + 86_400,
+            rows[0].health.not_before() > now + 3_600,
             "the row carries the pair's Retry-After as its next_eligible time"
         );
 
