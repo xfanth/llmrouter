@@ -353,7 +353,7 @@ Default 0 means never wait.
 The M copies are one trial, not M trials. Identical request, identical provider,
 model and key, same moment. The second copy tells you nothing the first did not.
 Counting them would also make the backoff depend on a latency dial: at M=3 a
-channel reaches the 30 day cap after 8 walks instead of 23.
+channel reaches the 24 hour cap after 6 walks instead of 18.
 
 - Any copy returns 2xx with content: the channel is healthy, `retry_counter`
   resets to 0. Ignore the sibling failures.
@@ -515,8 +515,7 @@ itself.
 | 1 | 1s |
 | 12 | 34 minutes |
 | 17 | 18 hours |
-| 20 | 6 days |
-| 23 | the 30 day cap |
+| 18 | the 24 hour cap |
 
 By failure 12 the wait is 34 minutes, which is longer than the client requests
 arriving, so the list is already empty and the router answers `504` without
@@ -1192,10 +1191,10 @@ channel, a provider/key pair and a provider alike.
 | `retry_counter` | Consecutive failures. 1, 2, 3, and so on. |
 | `retry_base` | Seconds. 1 by default. |
 
-The cap is **30 days**, not an hour.
+The cap is **24 hours**.
 
 ```
-wait_seconds = min(2_592_000, retry_base * 2.pow(retry_counter - 1))
+wait_seconds = min(86_400, retry_base * 2.pow(retry_counter - 1))
 ```
 
 On a failure, add 1 to `retry_counter` and wait that long before the thing is
@@ -1207,14 +1206,12 @@ date rather than a number, use the seconds between now and that date. Everything
 else is unchanged: the same doubling applies on top.
 
 So a provider saying 60 seconds gives 60s, then 120s, then 240s on the third
-consecutive failure, capped at 30 days.
+consecutive failure, capped at 24 hours.
 
-**Why the cap is 30 days and not an hour.** A monthly quota is the normal way a
-free tier runs out, and the provider says so: `Retry-After` carries a figure in
-days. An hourly cap would ignore that and retry a channel 24 times a day for the
-rest of the month, failing every time, burning rate limit and keeping a dead
-channel at the top of the ranking. 30 days matches how the quotas actually
-reset.
+**Why the cap is 24 hours.** A channel that exhausts its quota today gets
+another chance tomorrow without an operator touching anything, and the router
+walks down the ranking to channels with quota left in the meantime. The cap
+still stops a dead channel from being retried every hour for weeks.
 
 **On a success, reset both.** `retry_counter` back to 0 and `retry_base` back to
 1, so the next failure is failure number one again and waits 1 second. A success
@@ -1925,7 +1922,7 @@ say what it costs, so the first change is informed rather than a guess.
 |---|---|---|
 | `race_width` (N) | 32 | Provider quotas run dry, or the answer is good enough from fewer channels. |
 | `max_per_channel` (M) | 2 | Latency is fine without the hedge, or a key keeps hitting its rate limit. |
-| `backoff_max` | 30d | Channels come back sooner than a monthly reset. |
+| `backoff_max` | 24h | Channels come back sooner than a monthly reset. |
 | `http2_stream_window` | 131072 | `router_rss_bytes` approaches `memory_high_water`. |
 | `memory_high_water` | 3GB | The container memory limit changes. |
 | `cache.max_bytes` | 100GB | The pool fills, or 7 days of entries never gets close. |
@@ -1946,7 +1943,7 @@ At 3,000 client requests a day with 1M token prompts:
 189 billion tokens a day buy answers that get cancelled and thrown away.
 
 **Starting at N=32, M=2.** The trade is the best model slowly against the
-twentieth best model fast, and 32 picks the second. The 30 day backoff cap makes
+twentieth best model fast, and 32 picks the second. The 24 hour backoff cap makes
 the failure mode clean: a channel that exhausts its monthly quota says so
 through `Retry-After`, goes quiet for the right length of time, and the router
 walks down the ranking to channels with quota left.
@@ -2019,7 +2016,7 @@ http2_connection_window: 1048576
 health_poll:
   probe_timeout: 5s      # per probe, every wave
   retry_base: 1s         # default base; Retry-After overrides it per failure
-  backoff_max: 30d       # wait = min(backoff_max, retry_base * 2^(counter-1))
+  backoff_max: 24h       # wait = min(backoff_max, retry_base * 2^(counter-1))
   network_test_timeout: 2s  # runs beside every request's upstream calls
 cache:
   enabled: true
@@ -2520,8 +2517,8 @@ spreadsheet of which endpoint works. See **Startup and health**.
 
 **Do not add a cap on channel calls per client request.** Spec item 8 says walk
 until success or the list runs out. The exponential backoff is the cap: a
-channel that keeps failing reaches 34 minutes after 12 failures and the 30 day
-cap after 23, so it leaves the list on its own. A fixed `max_attempts` was proposed and removed.
+channel that keeps failing reaches 34 minutes after 12 failures and the 24 hour
+cap after 18, so it leaves the list on its own. A fixed `max_attempts` was proposed and removed.
 
 **Do not add a wall-clock deadline for the client request.** Same reason.
 `request_timeout` limits one channel call and nothing limits the client request.

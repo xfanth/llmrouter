@@ -288,7 +288,7 @@ impl Default for HealthPollConfig {
         Self {
             probe_timeout: Duration::from_secs(5),
             retry_base: Duration::from_secs(1),
-            backoff_max: Duration::from_secs(30 * 24 * 3600),
+            backoff_max: Duration::from_secs(24 * 3600),
             network_test_timeout: Duration::from_secs(2),
         }
     }
@@ -1008,13 +1008,10 @@ mod tests {
         assert_eq!(d.memory_high_water, 3 * 1_024 * 1_024 * 1_024);
         assert_eq!(d.cache.max_bytes, 100_000_000_000);
         assert_eq!(d.cache.ttl, Duration::from_secs(168 * 3600));
-        // 30 days, not an hour: a monthly quota is the normal way a free tier
-        // runs out, and from a 1 second base the cap is first reached at
-        // failure 23, not 12.
-        assert_eq!(
-            d.health_poll.backoff_max,
-            Duration::from_secs(30 * 24 * 3600)
-        );
+        // 24 hours: a channel that exhausts its quota today gets another
+        // chance tomorrow, and from a 1 second base the cap is first
+        // reached at failure 18, not 12.
+        assert_eq!(d.health_poll.backoff_max, Duration::from_secs(24 * 3600));
         assert!(d.streaming);
         assert_eq!(d.hedge_strategy, HedgeStrategy::Tps);
         assert_eq!(d.hedge_window_ms, 1000);
@@ -1043,7 +1040,7 @@ http2_connection_window: 1048576
 health_poll:
   probe_timeout: 5s
   retry_base: 1s
-  backoff_max: 30d
+  backoff_max: 24h
   network_test_timeout: 2s
 cache:
   enabled: true
@@ -1057,10 +1054,7 @@ cache:
         assert_eq!(cfg.http2_stream_window, 131_072);
         assert_eq!(cfg.cache.max_bytes, 100_000_000_000);
         assert_eq!(cfg.cache.ttl, Duration::from_secs(168 * 3600));
-        assert_eq!(
-            cfg.health_poll.backoff_max,
-            Duration::from_secs(30 * 24 * 3600)
-        );
+        assert_eq!(cfg.health_poll.backoff_max, Duration::from_secs(24 * 3600));
         assert!(cfg.streaming);
         assert_eq!(cfg.hedge_strategy, HedgeStrategy::Tps);
         assert_eq!(cfg.hedge_window_ms, 1000);
@@ -1099,15 +1093,15 @@ cache:
     }
 
     /// From the 1 second default base the wait doubles every failure, so the
-    /// 30 day cap first binds at failure 23. An hourly cap would bind at 12
-    /// and retry a dead channel 24 times a day for the rest of the month.
+    /// 24 hour cap first binds at failure 18. An hourly cap would bind at 12
+    /// and retry a dead channel 24 times a day.
     #[test]
-    fn the_backoff_cap_is_reached_at_failure_23() {
+    fn the_backoff_cap_is_reached_at_failure_18() {
         let cap = RouterConfig::default().health_poll.backoff_max.as_secs();
         let base = RouterConfig::default().health_poll.retry_base.as_secs();
         let wait = |counter: u32| crate::health::wait_seconds(counter, base, cap);
-        assert!(wait(22) < cap);
-        assert_eq!(wait(23), cap);
+        assert!(wait(17) < cap);
+        assert_eq!(wait(18), cap);
         assert_eq!(wait(12), 2048);
     }
 
