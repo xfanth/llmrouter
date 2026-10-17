@@ -1,7 +1,7 @@
 //! The race.
 //!
-//! N channels in flight, M hedged copies each. `hedge_delay_ms` is 0 by
-//! default, so the copies fire with the first one.
+//! N channels in flight, M hedged copies each. `hedge_delay_ms` is 1 by
+//! default, 1ms behind the first one.
 //!
 //! The M copies are one trial, not M. Any copy returning 2xx with content makes
 //! the channel healthy. Every copy failing bumps `retry_counter` by 1, and the

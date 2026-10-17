@@ -233,7 +233,7 @@ impl Default for RouterConfig {
             listen: default_listen(),
             race_width: 32,
             max_per_channel: 2,
-            hedge_delay_ms: 0,
+            hedge_delay_ms: 1,
             streaming: true,
             hedge_strategy: HedgeStrategy::default(),
             hedge_window_ms: 1000,
