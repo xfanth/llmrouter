@@ -342,11 +342,11 @@ and 75 models is 675 channels, not one.
 **M** (`max_per_channel`) = concurrent calls to the *same* channel. A hedged
 duplicate of the identical request to the identical provider, model and key.
 
-The M copies fire **with** the first one. `hedge_delay_ms` is 0 by default.
+The M copies start 1ms after the first one. `hedge_delay_ms` is 1 by default.
 
-Set it above 0 to delay the copies instead. That saves the duplicate calls when
+Raise it to delay the copies further. That saves the duplicate calls when
 the first copy answers quickly, at the cost of being slower when it does not.
-Default 0 means never wait.
+0 means all copies fire together.
 
 ### M and health
 
@@ -497,7 +497,7 @@ after another. Each one returns `401`. As each fails, its `retry_counter` goes
 to 1 and its wait goes to 1 second. The router fires the next N. It walks all
 4,000 this way, N at a time.
 
-**M fires too.** `hedge_delay_ms` is 0 by default, so the M copies of a channel
+**M fires too.** `hedge_delay_ms` is 1 by default, so the M copies of a channel
 call start with the first one. Each wave is N times M calls in flight, not N.
 All of them return `401`.
 
@@ -2000,7 +2000,7 @@ provider whose every chat call fails. `llmrouter-make-config` therefore copies
 ```yaml
 race_width: 32           # N: concurrent channel calls, different channels
 max_per_channel: 2       # M: hedged copies of one channel call
-hedge_delay_ms: 0        # 0 = the M copies fire with the first one
+hedge_delay_ms: 1        # 1 = the M copies start 1ms after the first one
 streaming: true
 hedge_strategy: tps           # tps | ttft
 hedge_window_ms: 1000         # tps only: how long to watch before choosing

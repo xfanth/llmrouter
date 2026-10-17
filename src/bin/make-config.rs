@@ -1227,7 +1227,7 @@ cloudflare-workers-ai,@cf/meta/llama,1,0,,128000,4096,\"[\"\"text\"\"]\",llama,1
         let defaults = RouterConfig::default();
         assert_eq!(parsed.race_width, 32);
         assert_eq!(parsed.max_per_channel, 2);
-        assert_eq!(parsed.hedge_delay_ms, 0);
+        assert_eq!(parsed.hedge_delay_ms, 1);
         assert!(parsed.streaming);
         assert_eq!(parsed.hedge_window_ms, 1000);
         assert_eq!(parsed.request_timeout, defaults.request_timeout);
