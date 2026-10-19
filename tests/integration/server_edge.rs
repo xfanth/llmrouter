@@ -991,6 +991,21 @@ async fn one_router_serves_a_streaming_client_and_a_plain_client_from_the_same_a
         "same answer either way"
     );
 
+    // The request log's row for that plain client carries the request body
+    // it was sent, not an empty string. The first version left the two
+    // success rows without it.
+    let rows: Vec<Value> =
+        serde_json::from_str(&text_body(edge.get("/metrics/requests").await).await)
+            .expect("the request log is JSON");
+    let row = rows
+        .iter()
+        .find(|r| r["outcome"] == "success" && r["status"] == 200)
+        .expect("the success is logged");
+    assert!(
+        row["request"].as_str().unwrap_or_default().contains("ping"),
+        "the success row carries the request payload: {row}"
+    );
+
     let streamed = edge.post_chat(&chat_request("ping", true)).await;
     assert_eq!(streamed.status(), StatusCode::OK);
     let content_type = streamed
@@ -1908,6 +1923,29 @@ async fn a_stream_that_dies_before_anything_reaches_a_plain_client_retries_invis
     assert!(
         text.contains("router_cache_writes_total{result=\"stored\"} 1"),
         "the fresh channel's complete answer is cached: {text}"
+    );
+    // The retried request's row carries the request payload and the answer
+    // text from the fresh channel.
+    let rows: Vec<Value> =
+        serde_json::from_str(&text_body(edge.get("/metrics/requests").await).await)
+            .expect("the request log is JSON");
+    let row = rows
+        .iter()
+        .find(|r| r["outcome"] == "success" && r["status"] == 200)
+        .expect("the success is logged");
+    assert!(
+        row["request"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("retry me"),
+        "the retried request's row carries the request payload: {row}"
+    );
+    assert!(
+        row["response"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the complete answer from the fresh channel"),
+        "the retried request's row carries the fresh answer: {row}"
     );
     dying_task.abort();
 }

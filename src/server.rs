@@ -922,6 +922,10 @@ async fn handle_completion(
             // Taken before the branch below, which hands the response on to
             // be encoded and in the streaming case moves it outright.
             let usage = winner.response.usage.clone();
+            // The encoded reply feeds the request log's row below; a
+            // streaming delivery of a whole answer has no single body to
+            // show, so its row's payload stays empty.
+            let mut reply_snippet: Option<String> = None;
             let reply = if wants_stream {
                 // The client asked for a stream and the answer arrived whole,
                 // which is what `streaming: false` in `router.yml` gives. The
@@ -929,7 +933,10 @@ async fn handle_completion(
                 stream_reply(winner.response, client_format, served.clone())
             } else {
                 match crate::wire::encode_response(&winner.response, client_format, Some(&served)) {
-                    Ok(value) => Some(Served::Whole(axum::Json(value).into_response())),
+                    Ok(value) => {
+                        reply_snippet = Some(crate::reqlog::Entry::snippet(value.to_string()));
+                        Some(Served::Whole(axum::Json(value).into_response()))
+                    }
                     Err(err) => {
                         tracing::warn!(error = %err, "the reply could not be translated");
                         None
@@ -986,6 +993,8 @@ async fn handle_completion(
             row.client = client;
             row.served = Some(winner.model_id.clone());
             row.provider = Some(winner.provider.clone());
+            row.request = request_snippet;
+            row.response = reply_snippet.unwrap_or_default();
             row.attempts = attempts;
             row.ttft_ms = Some(total.as_millis() as u64);
             row.total_ms = total.as_millis() as u64;
@@ -1297,6 +1306,7 @@ async fn handle_completion(
                                 row.client = client;
                                 row.served = Some(model_id.clone());
                                 row.provider = Some(provider.clone());
+                                row.request = request_snippet;
                                 row.attempts = attempts;
                                 row.response = crate::reqlog::Entry::snippet(value.to_string());
                                 row.tps = rate;
