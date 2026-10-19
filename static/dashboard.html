@@ -628,7 +628,7 @@ function renderRequests(entries) {
     snippet(e.request),
     snippet(e.response),
   ]);
-  $("#reqtable").tBodies[0].innerHTML = rows
+  $("reqtable").tBodies[0].innerHTML = rows
     .map((r) => "<tr><td>" + r.join("</td><td>") + "</td></tr>")
     .join("");
 }
