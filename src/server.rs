@@ -17,6 +17,7 @@
 //! leading space before the JSON body for a non-streaming one, every
 //! `keepalive_interval` until the first real byte.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::path::Path;
@@ -168,6 +169,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// The backend recorded metric history for the dashboard.
     pub history: Arc<crate::history::History>,
+    /// The request log the dashboard's bottom table reads.
+    pub reqlog: Arc<crate::reqlog::RequestLog>,
     /// For the uptime on `/healthz`.
     pub started_at: Instant,
 }
@@ -192,6 +195,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .route("/metrics/history", get(crate::history::endpoint))
+        .route("/metrics/requests", get(crate::reqlog::endpoint))
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state)
 }
@@ -358,18 +362,35 @@ async fn completion_response(
     // span is what keeps ten concurrent identical requests from blurring
     // into one in the saved log.
     static NEXT_REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
+    let client = client_key_prefix(headers);
     let span = tracing::info_span!(
         "request",
-        client_key = %client_key_prefix(headers),
+        client_key = %client,
         format = ?client_format,
         bytes = body.len(),
         request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
     );
-    respond(state, client_format, body).instrument(span).await
+    respond(state, client_format, body, client)
+        .instrument(span)
+        .await
+}
+
+/// The endpoint a completion request came in on, for the request log.
+fn endpoint_name(format: Format) -> &'static str {
+    match format {
+        Format::AnthropicMessages => "/v1/messages",
+        Format::OpenAiChat => "/v1/chat/completions",
+        Format::OpenAiResponses => "/v1/responses",
+    }
 }
 
 /// The body of [`completion_response`], run inside its request span.
-async fn respond(state: Arc<AppState>, client_format: Format, body: axum::body::Bytes) -> Response {
+async fn respond(
+    state: Arc<AppState>,
+    client_format: Format,
+    body: axum::body::Bytes,
+    client: String,
+) -> Response {
     // The clock starts here rather than inside the handler. Everything from
     // this line on is latency the router adds, the admission gate included:
     // on a host without `/proc` the gate forks `ps` to read RSS, which is
@@ -387,6 +408,16 @@ async fn respond(state: Arc<AppState>, client_format: Format, body: axum::body::
     } = state.admission.check()
     {
         state.metrics.record_request(Outcome::NotAdmitted);
+        let mut entry = crate::reqlog::Entry::finished(
+            endpoint_name(client_format),
+            None,
+            false,
+            503,
+            "not_admitted",
+        );
+        entry.client = client.clone();
+        entry.total_ms = started.elapsed().as_millis() as u64;
+        state.reqlog.record(entry);
         return ApiError::NotAdmitted {
             rss,
             high_water,
@@ -396,13 +427,29 @@ async fn respond(state: Arc<AppState>, client_format: Format, body: axum::body::
     }
 
     let raw_len = body.len();
+    // The request-log row wants the first part of the body as the client
+    // sent it. Read off the raw bytes rather than re-serialising the parsed
+    // value, so a 3.8MB prompt costs one lossy read, not a second copy.
+    let request_snippet =
+        crate::reqlog::Entry::snippet(String::from_utf8_lossy(&body[..body.len().min(8_000)]));
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => {
+            let mut entry = crate::reqlog::Entry::finished(
+                endpoint_name(client_format),
+                None,
+                wants_stream_of(&body),
+                400,
+                "bad_request",
+            );
+            entry.client = client.clone();
+            entry.request = request_snippet;
+            entry.total_ms = started.elapsed().as_millis() as u64;
+            state.reqlog.record(entry);
             return ApiError::BadRequest {
                 reason: format!("body is not valid JSON: {err}"),
             }
-            .served(started)
+            .served(started);
         }
     };
     drop(body);
@@ -418,13 +465,32 @@ async fn respond(state: Arc<AppState>, client_format: Format, body: axum::body::
 
     with_keepalive(
         Box::pin(
-            handle_completion(state, client_format, parsed, raw_len, wants_stream, started)
-                .in_current_span(),
+            handle_completion(
+                state,
+                client_format,
+                parsed,
+                raw_len,
+                wants_stream,
+                started,
+                client,
+                request_snippet,
+            )
+            .in_current_span(),
         ),
         wants_stream,
         interval,
     )
     .await
+}
+
+/// Whether a not-yet-parsed body asked for a stream, for the request log's
+/// row of a request the parser rejects. Only the parse failure needs this
+/// before `respond` has read the flag properly.
+fn wants_stream_of(body: &axum::body::Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// What the completion path decided: a whole response, or the winner's events.
@@ -581,21 +647,21 @@ async fn read_body(response: Response) -> Bytes {
 /// not here but in `race.rs`, on the byte stream, which is the one place every
 /// winning stream passes through and the only place that can back the channel
 /// off for it.
+///
+/// The death is also deliberately not sent as an SSE `error` event. An error
+/// event is a *server* verdict, and agent clients such as Claude Code stop on
+/// it; an abruptly closing stream is a *transport* failure, and the same
+/// clients retry the whole request with backoff on one of those. The retry
+/// lands on fresh channels, because the dead channel is already in backoff, so
+/// the client sees its answer rather than an API error. The channel's health
+/// move, the error class and the request-log entry still name the failure.
 fn sse_frames(mut events: EventStream, format: Format) -> SseFrames {
     Box::pin(async_stream::stream! {
         while let Some(item) = events.next().await {
             match item {
                 Ok(value) => yield Ok(sse_event(format, &value)),
                 Err(err) => {
-                    tracing::error!(error = %err, "the winning stream died mid-answer");
-                    // No end-of-stream marker after a death. `[DONE]` (or a
-                    // forged `message_stop`) would tell the client the half
-                    // answer it already has is the whole answer, and it would
-                    // never retry. An `error` event names the failure and the
-                    // abrupt close is what ends the request.
-                    yield Ok(Event::default().event("error").data(
-                        r#"{"error":{"type":"upstream_error","message":"the winning stream died mid-answer"}}"#,
-                    ));
+                    tracing::error!(error = %err, "the winning stream died mid-answer;                         the abrupt close is a transport failure the client will retry");
                     return;
                 }
             }
@@ -640,6 +706,9 @@ fn sse_event(format: Format, value: &Value) -> Event {
 /// The shared path behind both completion endpoints: admit, hash, read the
 /// cache, build the filter, race, write the cache, translate out.
 ///
+/// `client` and `request_snippet` ride along for the request log's row, which
+/// every exit of this function records.
+///
 /// `wants_stream` is the client's own `stream` flag and decides only the shape
 /// of the reply. The providers are asked for a stream whenever `streaming` is
 /// on in `router.yml`, whatever the client asked for, because the hedge
@@ -647,6 +716,7 @@ fn sse_event(format: Format, value: &Value) -> Event {
 ///
 /// `started` is when the request reached the router. The caller takes it
 /// before the admission gate so that the gate counts as router overhead too.
+#[allow(clippy::too_many_arguments)] // the request-log row rides the same list
 async fn handle_completion(
     state: Arc<AppState>,
     client_format: Format,
@@ -654,18 +724,31 @@ async fn handle_completion(
     raw_len: usize,
     wants_stream: bool,
     started: Instant,
+    client: String,
+    request_snippet: String,
 ) -> Served {
     let (_concurrency, concurrent) = Concurrency::open();
 
     let request = match crate::wire::decode_request(client_format, &body) {
         Ok(request) => request,
         Err(err) => {
+            let mut entry = crate::reqlog::Entry::finished(
+                endpoint_name(client_format),
+                None,
+                wants_stream,
+                400,
+                "bad_request",
+            );
+            entry.client = client;
+            entry.request = request_snippet;
+            entry.total_ms = started.elapsed().as_millis() as u64;
+            state.reqlog.record(entry);
             return Served::Whole(
                 ApiError::BadRequest {
                     reason: err.to_string(),
                 }
                 .served(started),
-            )
+            );
         }
     };
     drop(body);
@@ -700,6 +783,22 @@ async fn handle_completion(
                     // the same: leaving hits out would make the time to first
                     // token histogram describe only the slow half of traffic.
                     state.metrics.record_ttft(started.elapsed());
+                    let mut row = crate::reqlog::Entry::finished(
+                        endpoint_name(client_format),
+                        named_model.clone(),
+                        wants_stream,
+                        200,
+                        "hit_cache",
+                    );
+                    row.client = client;
+                    row.served = Some(entry.model_id.clone());
+                    row.provider = Some(entry.provider.clone());
+                    row.request = request_snippet;
+                    row.response =
+                        crate::reqlog::Entry::snippet(String::from_utf8_lossy(&entry.body));
+                    row.ttft_ms = Some(started.elapsed().as_millis() as u64);
+                    row.total_ms = started.elapsed().as_millis() as u64;
+                    state.reqlog.record(row);
                     tracing::info!(
                         outcome = "hit_cache",
                         model = %entry.model_id,
@@ -731,6 +830,17 @@ async fn handle_completion(
         if let Some(outcome) = error.outcome() {
             state.metrics.record_request(outcome);
         }
+        let mut entry = crate::reqlog::Entry::finished(
+            endpoint_name(client_format),
+            named_model.clone(),
+            wants_stream,
+            error.status().as_u16(),
+            error.tag(),
+        );
+        entry.client = client;
+        entry.request = request_snippet;
+        entry.total_ms = started.elapsed().as_millis() as u64;
+        state.reqlog.record(entry);
         return Served::Whole(error.served(started));
     }
 
@@ -761,10 +871,11 @@ async fn handle_completion(
     let guard = cancel.clone().drop_guard();
     let racer = Arc::clone(&state.racer);
     let input = RaceInput {
-        outbound,
-        filter,
+        outbound: Arc::clone(&outbound),
+        filter: filter.clone(),
         streaming,
         named_model: named_model.clone(),
+        exclude: std::collections::HashSet::new(),
     };
     let race = tokio::spawn(
         async move {
@@ -865,6 +976,23 @@ async fn handle_completion(
                 .map(|o| o as f64 / winner.latency.as_secs_f64());
             record_usage(&state.metrics, &winner.provider, &usage, rate);
             state.metrics.record_request(Outcome::Success);
+            let mut row = crate::reqlog::Entry::finished(
+                endpoint_name(client_format),
+                named_model.clone(),
+                wants_stream,
+                200,
+                "success",
+            );
+            row.client = client;
+            row.served = Some(winner.model_id.clone());
+            row.provider = Some(winner.provider.clone());
+            row.attempts = attempts;
+            row.ttft_ms = Some(total.as_millis() as u64);
+            row.total_ms = total.as_millis() as u64;
+            row.tps = rate;
+            row.tokens_in = usage.input_tokens;
+            row.tokens_out = usage.output_tokens;
+            state.reqlog.record(row);
             tracing::info!(
                 outcome = "success",
                 channel = %winner.channel_id,
@@ -884,16 +1012,20 @@ async fn handle_completion(
             attempts,
             race_elapsed,
         } => {
+            // Every binding is mutable so the failover walk below can move
+            // the request's identity onto whichever walk the answer finally
+            // came from.
             let crate::race::StreamWinner {
-                channel_id,
-                provider,
-                model_id,
-                intelligence,
+                mut channel_id,
+                mut provider,
+                mut model_id,
+                mut intelligence,
                 chunks,
-                latency,
+                mut latency,
                 first_token_at,
-                slot: stream_slot,
+                slot: mut stream_slot,
             } = *winner;
+            let mut attempts = attempts;
             let served = named_model.clone().unwrap_or_else(|| model_id.clone());
 
             // A streaming client has the winning response at its first token.
@@ -959,22 +1091,64 @@ async fn handle_completion(
                 // the clock when the stream ends also makes the rate the one
                 // the client felt, rather than one that includes a fold the
                 // client never waited for.
-                let (chunks, reported_usage) = crate::wire::tap_usage(chunks);
+                let (chunks, facts) = crate::wire::tap_stream(chunks);
                 let usage_metrics = state.metrics.clone();
                 let usage_provider = provider.clone();
+                let reqlog = Arc::clone(&state.reqlog);
+                // Everything the row needs except what the stream itself
+                // produces; the task below finalises it when the stream ends,
+                // the only moment the answer text and the total time are
+                // known.
+                let entry_model = named_model.clone();
+                let entry_served = served.clone();
+                let entry_provider = provider.clone();
+                let entry_request = request_snippet;
+                let entry_ttft = first_token_elapsed.as_millis() as u64;
+                let entry_attempts = attempts;
                 tokio::spawn(async move {
-                    if let Ok(usage) = reported_usage.await {
+                    let facts = facts.await.ok();
+                    if let Some(facts) = facts.as_ref() {
                         // The usage frame arrives with the end of the stream,
                         // so the distance from the first token to here is the
                         // provider's own generation window, with none of the
                         // walk or the hedge decision window in it.
                         let generated = first_token_at.elapsed();
-                        let rate = usage
-                            .output_tokens
+                        let rate = facts
+                            .usage
+                            .as_ref()
+                            .and_then(|usage| usage.output_tokens)
                             .filter(|&o| o > 0)
                             .map(|o| o as f64 / generated.as_secs_f64());
-                        record_usage(&usage_metrics, &usage_provider, &usage, rate);
+                        if let Some(usage) = facts.usage.as_ref() {
+                            record_usage(&usage_metrics, &usage_provider, usage, rate);
+                        }
                     }
+                    let mut entry = crate::reqlog::Entry::finished(
+                        endpoint_name(client_format),
+                        entry_model,
+                        true,
+                        200,
+                        "success",
+                    );
+                    if let Some(facts) = facts {
+                        entry.response = crate::reqlog::Entry::snippet(facts.text);
+                        entry.tokens_in = facts.usage.as_ref().and_then(|u| u.input_tokens);
+                        entry.tokens_out = facts.usage.as_ref().and_then(|u| u.output_tokens);
+                        if let Some(usage) = facts.usage.as_ref() {
+                            let generated = first_token_at.elapsed();
+                            entry.tps = usage
+                                .output_tokens
+                                .filter(|&o| o > 0)
+                                .map(|o| o as f64 / generated.as_secs_f64());
+                        }
+                    }
+                    entry.served = Some(entry_served);
+                    entry.provider = Some(entry_provider);
+                    entry.attempts = entry_attempts;
+                    entry.ttft_ms = Some(entry_ttft);
+                    entry.request = entry_request;
+                    entry.total_ms = started.elapsed().as_millis() as u64;
+                    reqlog.record(entry);
                 });
 
                 crate::wire::encode_stream(chunks, client_format, Some(served.clone()))
@@ -994,8 +1168,79 @@ async fn handle_completion(
                 // high and saturated the router half to zero, which is the
                 // one number the split exists to prove.
                 let fold_started = Instant::now();
-                let folded = crate::wire::aggregate_stream(chunks).await;
+
+                // A stream that dies during the fold has reached nothing: the
+                // client still has nothing, so the walk is re-run on fresh
+                // channels and the client never knows. The channel that died
+                // is excluded from every later attempt, and so is every
+                // channel a retry's own winning stream then died on.
+                let mut exclude: HashSet<crate::catalogue::ChannelId> = HashSet::new();
+                exclude.insert(channel_id);
+                let mut folded = crate::wire::aggregate_stream(chunks).await;
+                let mut retries = 0;
+                while let Err(err) = folded {
+                    if retries >= 2 {
+                        folded = Err(err);
+                        break;
+                    }
+                    retries += 1;
+                    tracing::warn!(
+                        channel = %channel_id,
+                        error = %err,
+                        "the winning stream died before anything reached the client;                          re-running the walk on fresh channels"
+                    );
+                    let input = RaceInput {
+                        outbound: Arc::clone(&outbound),
+                        filter: filter.clone(),
+                        streaming,
+                        named_model: named_model.clone(),
+                        exclude: exclude.clone(),
+                    };
+                    let retry_cancel = CancellationToken::new();
+                    let _guard = retry_cancel.clone().drop_guard();
+                    match state.racer.run(input, retry_cancel).await {
+                        RaceOutcome::Streamed {
+                            winner,
+                            attempts: more,
+                            race_elapsed: more_elapsed,
+                        } => {
+                            attempts += more;
+                            upstream += more_elapsed;
+                            let w = *winner;
+                            exclude.insert(w.channel_id);
+                            channel_id = w.channel_id;
+                            provider = w.provider;
+                            model_id = w.model_id;
+                            intelligence = w.intelligence;
+                            latency = w.latency;
+                            stream_slot = w.slot;
+                            folded = crate::wire::aggregate_stream(w.chunks).await;
+                        }
+                        RaceOutcome::Buffered {
+                            winner,
+                            attempts: more,
+                            race_elapsed: more_elapsed,
+                            ..
+                        } => {
+                            attempts += more;
+                            upstream += more_elapsed;
+                            let w = *winner;
+                            channel_id = w.channel_id;
+                            provider = w.provider;
+                            model_id = w.model_id;
+                            intelligence = w.intelligence;
+                            latency = w.latency;
+                            stream_slot = w.slot;
+                            folded = Ok(w.response);
+                        }
+                        // Nothing else came back, so the first death stands.
+                        _ => {
+                            folded = Err(err);
+                        }
+                    }
+                }
                 upstream += fold_started.elapsed();
+
                 match folded {
                     Ok(response) => {
                         let winner = crate::race::Winner {
@@ -1036,11 +1281,41 @@ async fn handle_completion(
                             )
                             .await;
                         }
-                        crate::wire::encode_response(&winner.response, client_format, Some(&served))
-                            .map(|value| Served::Whole(axum::Json(value).into_response()))
-                            .map_err(|err| err.to_string())
+                        match crate::wire::encode_response(
+                            &winner.response,
+                            client_format,
+                            Some(&served),
+                        ) {
+                            Ok(value) => {
+                                let mut row = crate::reqlog::Entry::finished(
+                                    endpoint_name(client_format),
+                                    named_model.clone(),
+                                    false,
+                                    200,
+                                    "success",
+                                );
+                                row.client = client;
+                                row.served = Some(model_id.clone());
+                                row.provider = Some(provider.clone());
+                                row.attempts = attempts;
+                                row.response = crate::reqlog::Entry::snippet(value.to_string());
+                                row.tps = rate;
+                                row.tokens_in = winner.response.usage.input_tokens;
+                                row.tokens_out = winner.response.usage.output_tokens;
+                                row.total_ms = started.elapsed().as_millis() as u64;
+                                // The plain client's first token is its whole
+                                // answer, so the two timings are the same.
+                                row.ttft_ms = Some(row.total_ms);
+                                state.reqlog.record(row);
+                                Ok(Served::Whole(axum::Json(value).into_response()))
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "the reply could not be translated");
+                                Err(err.to_string())
+                            }
+                        }
                     }
-                    Err(err) => Err(err.to_string()),
+                    Err(error) => Err(error.to_string()),
                 }
             };
             // Sampled after the branch above, not before it. On the plain path
@@ -1095,6 +1370,19 @@ async fn handle_completion(
 
         RaceOutcome::NoNetwork { failed } => {
             state.metrics.record_request(Outcome::NoNetwork);
+            {
+                let mut row = crate::reqlog::Entry::finished(
+                    endpoint_name(client_format),
+                    named_model.clone(),
+                    wants_stream,
+                    502,
+                    "no_network",
+                );
+                row.client = client;
+                row.request = request_snippet;
+                row.total_ms = started.elapsed().as_millis() as u64;
+                state.reqlog.record(row);
+            }
             tracing::info!(
                 outcome = "no_network",
                 ms = started.elapsed().as_millis() as u64,
@@ -1108,6 +1396,19 @@ async fn handle_completion(
             last_error,
         } => {
             state.metrics.record_request(Outcome::NoChannel);
+            {
+                let mut row = crate::reqlog::Entry::finished(
+                    endpoint_name(client_format),
+                    named_model.clone(),
+                    wants_stream,
+                    504,
+                    "no_channel",
+                );
+                row.client = client;
+                row.request = request_snippet;
+                row.total_ms = started.elapsed().as_millis() as u64;
+                state.reqlog.record(row);
+            }
             tracing::info!(
                 outcome = "no_channel",
                 attempts,
@@ -2071,7 +2372,10 @@ mod tests {
     /// A stream that dies mid-answer must not be framed as a clean ending.
     /// `data: [DONE]` tells an OpenAI client the half answer it already has is
     /// the whole answer, so nothing retries and the user never learns the
-    /// reply was cut off.
+    /// reply was cut off. It must also not carry a server `error` event: that
+    /// makes agent clients such as Claude Code stop instead of retrying, and
+    /// the abrupt close is the one ending the client will treat as a
+    /// transport failure and re-send the whole request for.
     #[tokio::test]
     async fn a_stream_that_dies_mid_answer_gets_no_done_marker() {
         let bytes = futures::stream::iter(vec![
@@ -2095,8 +2399,8 @@ mod tests {
             "a death is not a clean ending: {body}"
         );
         assert!(
-            body.contains("event: error"),
-            "the client is told why: {body}"
+            !body.contains("event: error"),
+            "a death is a transport failure to the client, not a server error: {body}"
         );
     }
 
@@ -2594,6 +2898,7 @@ mod tests {
             history: Arc::new(crate::history::History::open(
                 &dir.path().join("history.redb"),
             )),
+            reqlog: Arc::new(crate::reqlog::RequestLog::new()),
             started_at: Instant::now(),
         })
     }

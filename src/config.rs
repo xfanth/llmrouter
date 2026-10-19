@@ -179,8 +179,15 @@ pub enum RankMatch {
 pub struct RouterConfig {
     /// Address to bind. `0.0.0.0:8080`; network security sits elsewhere.
     pub listen: SocketAddr,
-    /// N: concurrent channel calls to different channels.
+    /// N at the start of a walk.
     pub race_width: usize,
+    /// The most N may ever reach. The walk escalates one channel at a time,
+    /// one `race_escalation_ms` apart, until it stops climbing.
+    pub race_width_max: usize,
+    /// How often an in-progress walk adds one more channel, up to
+    /// `race_width_max`. 0 disables the escalation: N stays at `race_width`
+    /// for the whole walk.
+    pub race_escalation_ms: u64,
     /// M: hedged copies of one channel call.
     pub max_per_channel: usize,
     /// 0 means the M copies fire with the first one.
@@ -231,7 +238,9 @@ impl Default for RouterConfig {
     fn default() -> Self {
         Self {
             listen: default_listen(),
-            race_width: 32,
+            race_width: 2,
+            race_width_max: 32,
+            race_escalation_ms: 1,
             max_per_channel: 2,
             hedge_delay_ms: 1,
             streaming: true,
@@ -1002,7 +1011,9 @@ mod tests {
     #[test]
     fn router_defaults_match_the_design() {
         let d = RouterConfig::default();
-        assert_eq!(d.race_width, 32);
+        assert_eq!(d.race_width, 2);
+        assert_eq!(d.race_width_max, 32);
+        assert_eq!(d.race_escalation_ms, 1);
         assert_eq!(d.max_per_channel, 2);
         assert_eq!(d.request_timeout, Duration::from_secs(3600));
         assert_eq!(d.memory_high_water, 3 * 1_024 * 1_024 * 1_024);
@@ -1022,9 +1033,11 @@ mod tests {
     #[test]
     fn router_yml_from_the_design_parses() {
         let yaml = "\
-race_width: 32
+race_width: 2
+race_width_max: 32
+race_escalation_ms: 1
 max_per_channel: 2
-hedge_delay_ms: 0
+hedge_delay_ms: 1
 streaming: true
 hedge_strategy: tps
 hedge_window_ms: 1000
@@ -1055,6 +1068,7 @@ cache:
         assert_eq!(cfg.cache.max_bytes, 100_000_000_000);
         assert_eq!(cfg.cache.ttl, Duration::from_secs(168 * 3600));
         assert_eq!(cfg.health_poll.backoff_max, Duration::from_secs(24 * 3600));
+        assert_eq!(cfg.health_poll.probe_timeout, Duration::from_secs(5));
         assert!(cfg.streaming);
         assert_eq!(cfg.hedge_strategy, HedgeStrategy::Tps);
         assert_eq!(cfg.hedge_window_ms, 1000);
@@ -1062,7 +1076,8 @@ cache:
         assert_eq!(cfg.keepalive_interval, Duration::from_secs(15));
         // An empty file still boots on the defaults.
         let empty: RouterConfig = serde_yaml::from_str("{}").expect("empty router.yml");
-        assert_eq!(empty.race_width, 32);
+        assert_eq!(empty.race_width, 2);
+        assert_eq!(empty.race_width_max, 32);
     }
 
     /// A key the router does not read is a setting an operator believes is
@@ -1160,7 +1175,8 @@ cache:
 
         // Nothing on disk: defaults, and no panic.
         let bare = Config::load(dir).expect("empty dir loads");
-        assert_eq!(bare.router.race_width, 32);
+        assert_eq!(bare.router.race_width, 2);
+        assert_eq!(bare.router.race_width_max, 32);
         assert!(bare.providers.is_empty());
         assert_eq!(
             bare.rank_of("gemini", "anything"),

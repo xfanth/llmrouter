@@ -133,25 +133,40 @@ footer .links { margin-left: auto; display: flex; gap: 14px; }
 </header>
 <div id="tiles"></div>
 <div class="charts">
-  <div class="card"><h3>Request rate</h3><div class="sub">requests per minute</div><canvas id="hist_rate"></canvas></div>
-  <div class="card"><h3>Latency percentiles</h3><div class="sub">seconds</div><canvas id="hist_latency"></canvas></div>
-  <div class="card"><h3>Mean tokens per second</h3><div class="sub">output, across requests</div><canvas id="hist_tps"></canvas></div>
+  <div class="card"><h3>Request rate</h3><div class="sub">requests per minute, with the five-minute rolling average</div><canvas id="hist_rate"></canvas></div>
+  <div class="card"><h3>Latency percentiles</h3><div class="sub">seconds, one point per five-second window</div><canvas id="hist_latency"></canvas></div>
+  <div class="card"><h3>Mean tokens per second</h3><div page:
+sec="output, one point per five-second window"></div><canvas id="hist_tps"></canvas></div>
   <div class="card"><h3>Memory</h3><div class="sub">resident set and cache, MB</div><canvas id="hist_mem"></canvas></div>
 </div>
 <div class="charts">
   <div class="card"><h3>Request outcomes</h3><div class="sub">cumulative</div><canvas id="snap_outcomes"></canvas></div>
   <div class="card"><h3>Cache lookups</h3><div class="sub">cumulative</div><canvas id="snap_lookups"></canvas></div>
-  <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider</div><canvas id="snap_hedgewins"></canvas></div>
-  <div class="card"><h3>Hedge outcomes (M)</h3><div class="sub">cumulative</div><canvas id="snap_hedgeout"></canvas></div>
-  <div class="card"><h3>Race outcomes (N)</h3><div class="sub">cumulative</div><canvas id="snap_raceout"></canvas></div>
+  <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider; copy 0 is the first call a channel makes</div><canvas id="snap_hedgewins"></canvas></div>
   <div class="card"><h3>Latency histogram by stage</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_lathist"></canvas></div>
   <div class="card"><h3>Time to first token</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_ttft"></canvas></div>
-  <div class="card"><h3>Tokens per second histogram</h3><div class="sub">count per bucket</div><canvas id="snap_tpshist"></canvas></div>
+  <div class="card"><h3>Tokens per second histogram</h3><div class="sub">count per bucket</div><canvas id="snap_tpshist"></canvas>
+  </div>
   <div class="card"><h3>Cache age histogram</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_agehist"></canvas></div>
   <div class="card wide"><h3>Errors by class</h3><div class="sub">top 10 classes across providers</div><canvas id="snap_errors"></canvas></div>
   <div class="card"><h3>Tokens by kind</h3><div class="sub">cumulative</div><canvas id="snap_tokkind"></canvas></div>
   <div class="card"><h3>Backoff</h3><div class="sub" id="backoff_now"></div><canvas id="snap_backoff"></canvas></div>
+</div>
+<div class="charts">
+  <div class="card wide">
+    <h3>Per-channel hedging (M)</h3>
+    <div class="sub">A hedge copy is a second call to the same channel, fired <span id="hedge_delay_note">1ms</span> after the first.</div>
+    <table id="hedge_m"><tbody></tbody></table>
+  </div>
+  <div class="card wide">
+    <h3>Router-wide race (N)</h3>
+    <div class="sub">The router fires several channels at once and replaces failures as they land; these say what that bought.</div>
+    <table id="hedge_n"><tbody></tbody></table>
+  </div>
+</div>
+<div class="charts">
   <div class="card wide"><h3>Per provider</h3><div class="sub">trials, attempts, copies, hedging, copy latency, errors</div>
+    <div style="overflow-x:auto">
     <table id="channels">
       <thead><tr>
         <th>Provider</th><th>Trials won</th><th>Trials failed</th><th>Trials cancelled</th>
@@ -160,10 +175,24 @@ footer .links { margin-left: auto; display: flex; gap: 14px; }
       </tr></thead>
       <tbody></tbody>
     </table>
+    </div>
+  </div>
+</div>
+<div class="card wide">
+  <h3>Requests</h3>
+  <div class="sub" id="reqlog_sub">the last 256 requests</div>
+  <div style="overflow-x:auto">
+  <table id="reqtable">
+    <thead><tr>
+      <th>Time</th><th>Client</th><th>Endpoint</th><th>Model</th><th>Provider</th><th>Status</th><th>Outcome</th>
+      <th>TTFT</th><th>Total</th><th>tok/s</th><th>Tokens in/out</th><th>Attempts</th><th>Request</th><th>Answer</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
   </div>
 </div>
 <footer>
-  <span>Parses GET /metrics every 5 seconds and everything is computed in the browser, nothing leaves this page.</span>
+  <span>Parses GET /metrics and GET /metrics/history every 5 seconds and everything is computed in the browser, nothing leaves this page.</span>
   <nav class="links">
     <a href="/docs">API docs</a>
     <a href="/metrics">raw metrics</a>
@@ -354,8 +383,6 @@ function histCounts(h) { // counts per bucket from cumulative series
 const PAL = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373", "#ba68c8", "#4db6ac", "#fff176", "#f06292", "#90a4ae", "#aed581", "#64b5f6", "#ffd54f"];
 const OUTCOME_COLORS = { hit_cache: "#56d364", success: "#4fc3f7", too_large: "#ffb74d", no_network: "#f85149", not_admitted: "#ba68c8", no_channel: "#e57373" };
 const LOOKUP_COLORS = { hit: "#56d364", miss_absent: "#ffb74d", miss_expired: "#d29922", miss_model_mismatch: "#ba68c8", miss_schema: "#f78166", disabled: "#8b949e", error: "#f85149" };
-const HEDGE_COLORS = { rescued: "#56d364", faster: "#4fc3f7", redundant: "#8b949e", no_hedge: "#d29922" };
-const RACE_COLORS = { first_won: "#8b949e", later_won: "#4fc3f7", rescued: "#56d364" };
 const charts = {};
 Chart.defaults.color = "#8b949e";
 Chart.defaults.borderColor = "rgba(42, 49, 60, 0.9)";
@@ -419,7 +446,7 @@ function lineDs(label, color, opts) {
 }
 
 // == charts ==
-makeLine("hist_rate", [lineDs("req/min", "#4fc3f7")]);
+makeLine("hist_rate", [lineDs("req/min per scrape", "#4fc3f7"), lineDs("req/min, 5 min rolling", "#81c784")]);
 makeLine("hist_latency", [
   lineDs("upstream p50", "#4fc3f7"),
   lineDs("upstream p90", "#81c784"),
@@ -431,8 +458,6 @@ makeLine("hist_mem", [lineDs("RSS MB", "#4fc3f7"), lineDs("cache MB", "#81c784")
 
 makeDoughnut("snap_outcomes", ["hit_cache", "success", "too_large", "no_network", "not_admitted", "no_channel"], OUTCOME_COLORS);
 makeDoughnut("snap_lookups", ["hit", "miss_absent", "miss_expired", "miss_model_mismatch", "miss_schema", "disabled", "error"], LOOKUP_COLORS);
-makeDoughnut("snap_hedgeout", ["rescued", "faster", "redundant", "no_hedge"], HEDGE_COLORS);
-makeDoughnut("snap_raceout", ["first_won", "later_won", "rescued"], RACE_COLORS);
 makeDoughnut("snap_tokkind", ["prompt", "completion", "reasoning"], { prompt: "#4fc3f7", completion: "#81c784", reasoning: "#ba68c8" });
 
 makeBar("snap_hedgewins",
@@ -503,31 +528,123 @@ for (const [key, label] of TILE_DEFS) {
 }
 
 // == history ==
-const HIST_MAX = 360; // 30 minutes at one scrape every 5 seconds
-const history = []; // {t, rate, up50, up90, rt90, ttft90, tps, rss, cache}
-let prevReq = null, prevT = 0;
+// The rolling charts read the backend's ring: /metrics/history samples the
+// router every five seconds, keeps an hour of it through a restart, and
+// reports each point's own five-second window. The first dashboard version
+// computed the percentiles from the all-time histogram in the browser, which
+// is why its percentile and token-rate lines sat flat.
+const HIST_MAX = 360; // 30 minutes of points on screen
+const history = []; // {t, rate, rate5m, up50, up90, rt90, ttft90, tps, rss, cache}
 
-function pushHistory() {
-  const now = Date.now();
-  const reqTotal = totalOf("router_requests_total");
-  let rate = null;
-  const dt = prevReq === null ? 0 : (now - prevT) / 1000;
-  if (prevReq !== null && dt > 0) rate = ((reqTotal - prevReq) / dt) * 60;
-  prevReq = reqTotal;
-  prevT = now;
-  const up = histMerge("router_latency_seconds", { stage: "upstream" });
-  const rt = histMerge("router_latency_seconds", { stage: "router" });
-  const ttft = histMerge("router_ttft_seconds");
-  const tpsH = histMerge("router_output_tokens_per_second");
-  history.push({
-    t: new Date(now).toTimeString().slice(0, 8),
-    rate, up50: histQuantile(up, 0.5), up90: histQuantile(up, 0.9),
-    rt90: histQuantile(rt, 0.9), ttft90: histQuantile(ttft, 0.9),
-    tps: tpsH.count ? tpsH.sum / tpsH.count : null,
-    rss: totalOf("router_rss_bytes") / 1048576,
-    cache: totalOf("router_cache_bytes") / 1048576,
-  });
-  if (history.length > HIST_MAX) history.splice(0, 1);
+function updateHistory(points) {
+  history.length = 0;
+  for (const p of points.slice(-HIST_MAX)) {
+    history.push({
+      t: new Date(p.t).toTimeString().slice(0, 8),
+      rate: p.rate ?? null,
+      rate5m: p.rate5m ?? null,
+      up50: p.up50 ?? null,
+      up90: p.up90 ?? null,
+      rt90: p.rt90 ?? null,
+      ttft90: p.ttft90 ?? null,
+      tps: p.tps ?? null,
+      rss: (p.rss || 0) / 1048576,
+      cache: (p.cache || 0) / 1048576,
+    });
+  }
+}
+
+async function fetchHistory() {
+  try {
+    const res = await fetch("/metrics/history", { cache: "no-store" });
+    if (!res.ok) return;
+    const points = await res.json();
+    if (Array.isArray(points)) updateHistory(points);
+  } catch {
+    // Telemetry: a failed history read leaves the last known lines up.
+  }
+}
+
+// == hedging cards ==
+function tableRows(id, rows) {
+  $(id).tBodies[0].innerHTML = rows
+    .map((r) => "<tr><td>" + r.join("</td><td>") + "</td></tr>")
+    .join("");
+}
+
+function renderHedgeCards() {
+  const resc = sumWhere("router_hedge_outcome_total", (l) => l.result === "rescued");
+  const fast = sumWhere("router_hedge_outcome_total", (l) => l.result === "faster");
+  const redn = sumWhere("router_hedge_outcome_total", (l) => l.result === "redundant");
+  const nohedge = sumWhere("router_hedge_outcome_total", (l) => l.result === "no_hedge");
+  const decided = resc + fast + redn;
+  tableRows("hedge_m", [
+    ["Hedge copies answered the whole trial:",
+      fmtInt(resc + fast + redn + nohedge) + " won trials, of which"],
+    ["rescued — the first copy had failed, so the hedge saved the request:",
+      fmtInt(resc) + (decided ? " (" + fmtPct(resc / decided) + ")" : "")],
+    ["faster — the hedge copy beat a first copy still running:",
+      fmtInt(fast) + (decided ? " (" + fmtPct(fast / decided) + ")" : "")],
+    ["redundant — the first copy answered anyway:",
+      fmtInt(redn) + (decided ? " (" + fmtPct(redn / decided) + ")" : "")],
+    ["no hedge fired (max_per_channel is 1):",
+      fmtInt(nohedge)],
+    ["Wins by copy index (stacked chart above):",
+      ["0", "1", "2", "3+"].map((ix) =>
+        ix + ": " + fmtInt(sumWhere("router_hedge_wins_total", (l) => l.copy === ix))
+      ).join(", ")],
+  ]);
+  const firstWon = sumWhere("router_race_outcome_total", (l) => l.result === "first_won");
+  const laterWon = sumWhere("router_race_outcome_total", (l) => l.result === "later_won");
+  const raceRescued = sumWhere("router_race_outcome_total", (l) => l.result === "rescued");
+  const won = firstWon + laterWon + raceRescued;
+  tableRows("hedge_n", [
+    ["Walks with an answer:", fmtInt(won)],
+    ["first_won — the first channel fired won anyway:",
+      fmtInt(firstWon) + (won ? " (" + fmtPct(firstWon / won) + ")" : "")],
+    ["later_won — a later channel was faster:",
+      fmtInt(laterWon) + (won ? " (" + fmtPct(laterWon / won) + ")" : "")],
+    ["rescued — a later channel won after an earlier channel failed:",
+      fmtInt(raceRescued) + (won ? " (" + fmtPct(raceRescued / won) + ")" : "")],
+  ]);
+}
+
+// == request log ==
+const reqlogCache = [];
+function renderRequests(entries) {
+  const rows = (entries || []).slice(0, 200).map((e) => [
+    new Date(e.ts).toTimeString().slice(0, 8),
+    e.client || "-",
+    e.endpoint || "-",
+    e.model || "-",
+    e.provider || "-",
+    e.status,
+    e.outcome,
+    e.ttft_ms === null || e.ttft_ms === undefined ? "-" : Math.round(e.ttft_ms) + "ms",
+    Math.round(e.total_ms || 0) + "ms",
+    e.tps ? e.tps.toFixed(1) : "-",
+    (e.tokens_in === null || e.tokens_in === undefined) && (e.tokens_out === null || e.tokens_out === undefined) ? "-" : (e.tokens_in || 0) + "/" + (e.tokens_out || 0),
+    e.attempts,
+    snippet(e.request),
+    snippet(e.response),
+  ]);
+  $("#reqtable").tBodies[0].innerHTML = rows
+    .map((r) => "<tr><td>" + r.join("</td><td>") + "</td></tr>")
+    .join("");
+}
+function snippet(text) {
+  if (!text) return "-";
+  const t = String(text);
+  return t.length > 200 ? t.slice(0, 200) + "…" : t;
+}
+async function fetchRequests() {
+  try {
+    const res = await fetch("/metrics/requests", { cache: "no-store" });
+    if (!res.ok) return;
+    renderRequests(await res.json());
+  } catch {
+    // Telemetry: leave the last table up.
+  }
 }
 
 // == rendering helpers ==
@@ -553,8 +670,10 @@ function renderTiles() {
   const redundant = sumWhere("router_hedge_outcome_total", (l) => l.result === "redundant");
   tileEls.requests.value.textContent = fmtInt(req);
   tileEls.requests.sub.textContent = "by outcome: " + Array.from(byLabel("router_requests_total", "outcome"), ([k, v]) => k + " " + fmtInt(v)).join(", ");
-  tileEls.rate.value.textContent = history.length > 1 && history[history.length - 1].rate !== null ? fmtNum1(history[history.length - 1].rate) : "-";
-  tileEls.rate.sub.textContent = "requests per minute over the last scrape interval";
+  const latestPoint = history.length ? history[history.length - 1] : null;
+  const rolling = latestPoint && latestPoint.rate5m !== null ? latestPoint.rate5m : null;
+  tileEls.rate.value.textContent = rolling !== null ? fmtNum1(rolling) : (latestPoint && latestPoint.rate !== null ? fmtNum1(latestPoint.rate) : "-");
+  tileEls.rate.sub.textContent = "requests per minute, five-minute rolling average";
   tileEls.channels.value.textContent = fmtInt(chanElig) + " / " + fmtInt(chanAll);
   tileEls.channels.sub.textContent = "eligible / total";
   tileEls.cache.value.textContent = lookDen ? fmtPct(lookHit / lookDen) : "-";
@@ -578,6 +697,7 @@ function renderHistoryCharts() {
   const labels = history.map((p) => p.t);
   setLabels(charts.hist_rate, labels);
   setDs(charts.hist_rate, history.map((p) => p.rate));
+  charts.hist_rate.data.datasets[1].data = history.map((p) => (p.rate5m === undefined ? null : p.rate5m));
   setLabels(charts.hist_latency, labels);
   const lat = charts.hist_latency.data.datasets;
   lat[0].data = history.map((p) => p.up50);
@@ -599,13 +719,11 @@ function renderSnapshots() {
   };
   fillDoughnut(charts.snap_outcomes, byLabel("router_requests_total", "outcome"));
   fillDoughnut(charts.snap_lookups, byLabel("router_cache_lookups_total", "result"));
-  fillDoughnut(charts.snap_hedgeout, byLabel("router_hedge_outcome_total", "result"));
-  fillDoughnut(charts.snap_raceout, byLabel("router_race_outcome_total", "result"));
   fillDoughnut(charts.snap_tokkind, byLabel("router_tokens_total", "kind"));
 
   // hedge wins stacked bar: one dataset per provider over x = 0, 1, 2, 3+
   const providers = allProviders();
-  const hw = byLabelMulti("router_hedge_wins_total", "provider", "hedge_index");
+  const hw = byLabelMulti("router_hedge_wins_total", "provider", "copy");
   const hwDatasets = providers.map((p, i) => ({
     label: p,
     data: ["0", "1", "2", "3+"].map((ix) => (hw.get(p) || new Map()).get(ix) || 0),
@@ -701,13 +819,13 @@ function renderTable() {
 function ingest(text) {
   latest = parseMetrics(text);
   hists = buildHistograms();
-  pushHistory();
   renderTiles();
   renderHistoryCharts();
   renderSnapshots();
   renderErrors();
   renderBackoff();
   renderTable();
+  renderHedgeCards();
   for (const c of Object.values(charts)) c.update("none");
 }
 
@@ -726,6 +844,8 @@ async function tick() {
     const res = await fetch("/metrics", { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     ingest(await res.text());
+    fetchHistory();
+    fetchRequests();
     failStreak = 0;
     lastOk = Date.now();
     setPill("live", "live");
@@ -765,38 +885,6 @@ setInterval(() => {
   el.textContent = "last scrape " + Math.round((Date.now() - lastOk) / 1000) + "s ago";
 }, 1000);
 
-// seed the rolling history charts from the backend so a refresh keeps the lines
-async function seedHistory() {
-  let points;
-  try {
-    const res = await fetch("/metrics/history", { cache: "no-store" });
-    if (!res.ok) return;
-    points = await res.json();
-  } catch {
-    return;
-  }
-  if (!Array.isArray(points) || points.length === 0) return;
-  // A live scrape that landed while the seed fetched has already pushed a
-  // newer point, so the older backend points would append after it and draw
-  // the lines backwards. Skip the seed and let the live history stand.
-  if (history.length > 0) return;
-  for (const p of points.slice(-HIST_MAX)) {
-    history.push({
-      t: new Date(p.t).toTimeString().slice(0, 8),
-      rate: p.rate ?? null,
-      up50: p.up50, up90: p.up90,
-      rt90: p.rt90, ttft90: p.ttft90,
-      tps: p.tps,
-      rss: p.rss / 1048576,
-      cache: p.cache / 1048576,
-    });
-  }
-  prevReq = points[points.length - 1].requests;
-  prevT = points[points.length - 1].t;
-  renderHistoryCharts();
-}
-
-seedHistory();
 setPill("connecting", "connecting");
 tick();
 </script>

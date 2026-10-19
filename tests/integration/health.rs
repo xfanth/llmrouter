@@ -181,6 +181,7 @@ impl Harness {
                     filter,
                     streaming: false,
                     named_model: None,
+                    exclude: std::collections::HashSet::new(),
                 },
                 CancellationToken::new(),
             )

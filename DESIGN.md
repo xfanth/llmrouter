@@ -337,7 +337,12 @@ request makes many channel calls.
 **Channel** = one provider/model/key tuple. Not a provider. Gemini with 9 keys
 and 75 models is 675 channels, not one.
 
-**N** (`race_width`) = concurrent calls to *different* channels.
+**N** (`race_width`) = concurrent calls to *different* channels. A walk opens
+at `race_width` and escalates: one more channel every `race_escalation_ms`
+while the request is in progress, up to `race_width_max`, in intelligence
+order, so a request the providers are slow on ends up racing the best 32
+channels across every provider. `race_escalation_ms: 0` holds N at
+`race_width` for the whole walk.
 
 **M** (`max_per_channel`) = concurrent calls to the *same* channel. A hedged
 duplicate of the identical request to the identical provider, model and key.
@@ -1697,6 +1702,17 @@ names the crate.
 
 ## What it records
 
+Beyond the Prometheus counters, the router keeps two telemetry stores of its
+own for the dashboard. The history sampler renders its own `/metrics` every
+five seconds and records one point per window: each point's percentiles and
+mean token rate are that five-second window's, not the all-time shape, and
+`rate5m` is the trailing five-minute request rate. The ring holds an hour of
+points and is written through to redb, so a refresh or a restart keeps the
+lines. The request log keeps the last 256 finished requests — endpoint,
+client key prefix, model, provider, status, outcome, times, tokens, and a
+snippet of each payload — served at `/metrics/requests` and drawn as the
+dashboard's bottom table.
+
 Omniroute died quietly and nobody was watching. `/metrics` exists so this one
 does not.
 
@@ -1998,7 +2014,9 @@ provider whose every chat call fails. `llmrouter-make-config` therefore copies
 `router.yml`:
 
 ```yaml
-race_width: 32           # N: concurrent channel calls, different channels
+race_width: 2            # N at the start of a walk
+race_width_max: 32       # the most N may reach
+race_escalation_ms: 1    # every 1ms in progress, one more channel joins
 max_per_channel: 2       # M: hedged copies of one channel call
 hedge_delay_ms: 1        # 1 = the M copies start 1ms after the first one
 streaming: true

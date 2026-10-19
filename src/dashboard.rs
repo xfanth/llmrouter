@@ -112,6 +112,23 @@ mod tests {
         assert!(body.contains("id=\"tiles\""));
         assert!(body.contains("/metrics"));
         assert_pins(&body, "dashboard.html");
+        // The hedge-wins chart reads the `copy` label the metrics write; the
+        // first version read a label name that never existed, so the chart
+        // sat empty however much hedged traffic ran.
+        assert!(
+            body.contains("byLabelMulti(\"router_hedge_wins_total\", \"provider\", \"copy\")"),
+            "the hedge wins chart must read the copy label"
+        );
+        // The rolling charts read the backend ring, whose points carry each
+        // window's own percentiles and the five-minute rolling rate.
+        assert!(body.contains("/metrics/history"));
+        assert!(body.contains("rate5m"));
+        // The request log table reads its own endpoint.
+        assert!(body.contains("/metrics/requests"));
+        assert!(body.contains("id=\"reqtable\""));
+        // The hedging cards explain themselves in plain words.
+        assert!(body.contains("Per-channel hedging (M)"));
+        assert!(body.contains("Router-wide race (N)"));
     }
 
     #[tokio::test]

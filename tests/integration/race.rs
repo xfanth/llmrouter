@@ -93,6 +93,9 @@ struct Harness {
     catalogue: Arc<Catalogue>,
     /// Held so the server outlives the race that calls it.
     _link: Option<MockServer>,
+    /// The metrics the racer and the health table write to, so a test can
+    /// scrape the in-flight gauge while a walk runs.
+    metrics: std::sync::Arc<llmrouter::Metrics>,
     _dir: TempDir,
 }
 
@@ -170,13 +173,14 @@ impl Harness {
             Arc::clone(&health),
             upstream,
             net,
-            metrics,
+            std::sync::Arc::clone(&metrics),
         );
 
         Self {
             racer,
             health,
             catalogue,
+            metrics,
             _link: link_server,
             _dir: dir,
         }
@@ -230,6 +234,7 @@ fn input(streaming: bool) -> RaceInput {
         },
         streaming,
         named_model: None,
+        exclude: std::collections::HashSet::new(),
     }
 }
 
@@ -1004,4 +1009,91 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
     );
 
     broken_task.abort();
+}
+
+/// A provider whose listener accepts the connection and never answers. The
+/// call hangs until `request_timeout`, so the walk only advances through the
+/// escalation clock, which is the behaviour under test.
+async fn hanging_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is free");
+    let addr = listener.local_addr().expect("the port is known");
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // Read the request so the upload completes, then hold the
+                // socket open: no response bytes, no close, no shutdown.
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), task)
+}
+
+/// A walk in progress adds one channel every `race_escalation_ms`, up to
+/// `race_width_max`, with nothing but the escalation clock moving the walk.
+/// The in-flight gauge is the reading: with the escalation on, the walk is
+/// soon holding `race_width_max` calls at once; with it off, N stays at
+/// `race_width` for the whole walk.
+#[tokio::test]
+async fn an_in_progress_walk_escalates_its_width_over_time() {
+    let (base_url, hang_task) = hanging_upstream().await;
+    let mk_channels = |base_url: &str| {
+        (0..8)
+            .map(|rank| channel(&format!("hang{rank}"), base_url, rank))
+            .collect::<Vec<Channel>>()
+    };
+
+    // request_timeout bounds every hanging call, so the walk cannot run away.
+    let config = |escalation: u64| RouterConfig {
+        race_width: 1,
+        race_width_max: 4,
+        race_escalation_ms: escalation,
+        request_timeout: Duration::from_secs(30),
+        spill_path: std::env::temp_dir().join("llmrouter-escalation"),
+        ..RouterConfig::default()
+    };
+
+    // With the escalation on: width 1 at t=0, 4 by t=150ms on an idle
+    // machine. The nextest run races 479 tests at once, so the climb is
+    // waited for rather than assumed: poll the gauge for up to five seconds.
+    let harness = Harness::new(config(50), mk_channels(&base_url), Link::Up).await;
+    let metrics = std::sync::Arc::clone(&harness.metrics);
+    let walk = tokio::spawn(async move { harness.run(input(true)).await });
+    let mut escalated = false;
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if metrics.render().contains("router_trials_inflight 4") {
+            escalated = true;
+            break;
+        }
+    }
+    assert!(
+        escalated,
+        "the escalation should hold 4 calls in flight within five seconds: {}",
+        metrics.render()
+    );
+    walk.abort();
+
+    // With the escalation off (0), N never leaves `race_width`: the same
+    // walk holds exactly one call in flight, however long the machine makes
+    // it wait.
+    let harness = Harness::new(config(0), mk_channels(&base_url), Link::Up).await;
+    let metrics = std::sync::Arc::clone(&harness.metrics);
+    let walk = tokio::spawn(async move { harness.run(input(true)).await });
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let text = metrics.render();
+        assert!(
+            text.contains("router_trials_inflight 1"),
+            "with the escalation off the walk stays at race_width: {text}"
+        );
+    }
+    walk.abort();
+    hang_task.abort();
 }
