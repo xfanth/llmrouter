@@ -129,6 +129,13 @@ mod tests {
         // The hedging cards explain themselves in plain words.
         assert!(body.contains("Per-channel hedging (M)"));
         assert!(body.contains("Router-wide race (N)"));
+        // The page's $ takes a bare element id, not a selector: a "#"-prefixed
+        // lookup returns null, the render throws, and the fetch's catch
+        // swallows it, which is how the first request table stayed empty.
+        assert!(
+            !body.contains("$(\"#"),
+            "a $ lookup carries a # prefix the helper does not take"
+        );
     }
 
     #[tokio::test]
