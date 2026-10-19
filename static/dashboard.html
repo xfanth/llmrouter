@@ -140,7 +140,7 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   <div class="card"><h3>Memory</h3><div class="sub">resident set and cache, MB</div><canvas id="hist_mem"></canvas></div>
 </div>
 <div class="charts">
-  <div class="card wide"><h3>Request flow</h3><div class="sub" id="flow_sub">requests, split by where the answer came from and how they ended</div><canvas id="flow"></canvas></div>
+  <div class="card wide"><h3>Request flow</h3><div class="sub" id="flow_sub">requests, split by where the answer came from and how they ended</div><div id="flow"></div></div>
   <div class="card"><h3>Cache lookups</h3><div class="sub">cumulative</div><canvas id="snap_lookups"></canvas></div>
   <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider; copy 0 is the first call a channel makes</div><canvas id="snap_hedgewins"></canvas></div>
   <div class="card"><h3>Latency histogram by stage</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_lathist"></canvas></div>
@@ -156,12 +156,12 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   <div class="card wide">
     <h3>Per-channel hedging (M)</h3>
     <div class="sub" id="hedge_m_sub">A hedge copy is a second call to the same channel, fired 1ms after the first.</div>
-    <canvas id="hedge_m_flow"></canvas>
+    <div id="hedge_m_flow"></div>
   </div>
   <div class="card wide">
     <h3>Router-wide race (N)</h3>
     <div class="sub" id="race_n_sub">The router fires several channels at once and replaces failures as they land.</div>
-    <canvas id="race_n_flow"></canvas>
+    <div id="race_n_flow"></div>
   </div>
 </div>
 <div class="charts">
@@ -199,7 +199,10 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   </nav>
 </footer>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.js" integrity="sha384-hfkuqrKeWFmnTMWN31VWyoe8xgdTADD11kgxmdpx2uyE6j5Az5uZq6u6AKYYmAOw" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@0.19.1/dist/chartjs-chart-sankey.min.js" integrity="sha384-tyfMlmj49YbRIKL6uEc56v5SKCiRUiidm2KCw+rQ6kdFSHUGC+eerZ4KlqEPt+7/" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-path@3.1.0/dist/d3-path.min.js" integrity="sha384-6OLefW2YM92GNdyDHuNLXurfMxkbKBdNCBrbc9U57gThqvcmrFrR6V4h46q9RXH6" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-array@3.2.4/dist/d3-array.min.js" integrity="sha384-VpKMdU+TlpggHFip46tJ/xkFUs8NFBwLqUMo3+3uiu411lU6eUQYsHVU+JFpA5ja" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-shape@3.2.0/dist/d3-shape.min.js" integrity="sha384-Pf8DSN0/EBE+hYfdD/WOvxYZPh8+AUL27jVmgRJ2az/EQxJWjgJsZrKFEuFT7DYq" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3/dist/d3-sankey.min.js" integrity="sha384-SM54CE5h+qdDI046d2Y5ym7wq1kq4uxcQ1cqGq5/+5jrE5tPLeDJSq711Q8sIska" crossorigin="anonymous"></script>
 <script>
 "use strict";
 // == formatters ==
@@ -467,17 +470,6 @@ makeBar("snap_hedgewins",
 // The request flow: one answer per request, from one of two paths. The old
 // doughnut mixed the path (cache hit) with the result (success or which
 // error), which read as if a hit were an alternative to a success.
-charts.flow = new Chart(canvasOf("flow"), {
-  type: "sankey",
-  data: { labels: [], datasets: [{ label: "requests", data: [] }] },
-  options: {
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: false,
-    plugins: { legend: { display: false } },
-  },
-});
-
 function renderFlow() {
   const out = (o) => sumWhere("router_requests_total", (l) => l.outcome === o);
   const hit = out("hit_cache");
@@ -500,9 +492,7 @@ function renderFlow() {
   for (const [name, count] of errors) {
     if (count > 0) links.push({ from: "error", to: name, flow: count });
   }
-  const ds = charts.flow.data.datasets[0];
-  ds.data = links.filter((l) => l.flow > 0);
-  charts.flow.update("none");
+  drawSankey("flow", links);
   $("flow_sub").textContent =
     fmtInt(hit + missed) + " requests: " +
     fmtInt(hit) + " served from the cache, " +
@@ -610,27 +600,75 @@ async function fetchHistory() {
   }
 }
 
-// == hedging flows ==
-function sankeyOf(id) {
-  charts[id] = new Chart(canvasOf(id), {
-    type: "sankey",
-    data: { labels: [], datasets: [{ label: id, data: [] }] },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: { legend: { display: false } },
-    },
-  });
-  return charts[id];
-}
-sankeyOf("hedge_m_flow");
-sankeyOf("race_n_flow");
+// == sankey flows, laid out by d3-sankey and drawn as svg ==
+// d3-sankey is the layout; the drawing is ours, so the page keeps one chart
+// engine (chart.js) for everything else and pins four small modules for this.
+const SANKEY_H = 230;
 
 function drawSankey(id, links) {
-  const ds = charts[id].data.datasets[0];
-  ds.data = links.filter((l) => l.flow > 0);
-  charts[id].update("none");
+  const host = $(id);
+  if (!host) return;
+  const alive = links.filter((l) => l.flow > 0);
+  const W = Math.max(host.clientWidth || 860, 320);
+  let svg = host.firstChild;
+  if (!svg) {
+    svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    host.appendChild(svg);
+  }
+  svg.setAttribute("viewBox", "0 0 " + W + " " + SANKEY_H);
+  svg.setAttribute("style", "width:100%;height:" + SANKEY_H + "px;display:block");
+  if (!alive.length || typeof d3 === "undefined" || !d3.sankey) {
+    if (svg.innerHTML !== "") svg.innerHTML = '<text x="8" y="20" fill="#8b949e" font-size="11">no flow yet</text>';
+    return;
+  }
+  // d3 wants node indices: take the names in first-seen order.
+  const names = [];
+  const idx = {};
+  for (const l of alive) {
+    for (const n of [l.from, l.to]) {
+      if (!(n in idx)) { idx[n] = names.length; names.push(n); }
+    }
+  }
+  let graph;
+  try {
+    graph = d3.sankey()
+      .nodeWidth(12)
+      .nodePadding(12)
+      .extent([[1, 5], [W - 1, SANKEY_H - 18]])({
+        nodes: names.map((n) => ({ name: n })),
+        links: alive.map((l) => ({ source: idx[l.from], target: idx[l.to], value: l.flow })),
+      });
+  } catch (err) {
+    console.error("sankey layout failed", err);
+    return;
+  }
+  const parts = [];
+  for (const l of graph.links) {
+    const d = d3.sankeyLinkHorizontal()(l);
+    parts.push(
+      '<path d="' + d + '" fill="none" stroke="#4fc3f7" stroke-opacity="0.4" stroke-width="' +
+      Math.max(1, l.width) + '"><title>' + names[l.source.index] + ' → ' +
+      names[l.target.index] + ': ' + fmtInt(l.value) + '</title></path>'
+    );
+  }
+  const maxDepth = Math.max.apply(null, graph.nodes.map((n) => n.depth));
+  for (const n of graph.nodes) {
+    parts.push(
+      '<rect x="' + n.x0 + '" y="' + n.y0 + '" width="' + (n.x1 - n.x0) + '" height="' +
+      Math.max(1, n.y1 - n.y0) + '" fill="#81c784"><title>' + n.name + ': ' +
+      fmtInt(n.value) + '</title></rect>'
+    );
+    const mid = (n.x0 + n.x1) / 2;
+    let x, anchor, y = n.y0 + (n.y1 - n.y0) / 2 + 4;
+    if (n.depth === 0) { x = n.x0 - 4; anchor = "end"; }
+    else if (n.depth === maxDepth) { x = n.x1 + 4; anchor = "start"; }
+    else { x = mid; anchor = "middle"; y = n.y0 - 6; }
+    parts.push(
+      '<text x="' + x + '" y="' + y + '" text-anchor="' + anchor + '" fill="#e6edf3" font-size="11">' +
+      n.name + ' (' + fmtInt(n.value) + ')</text>'
+    );
+  }
+  svg.innerHTML = parts.join("");
 }
 
 function renderHedgeFlows() {

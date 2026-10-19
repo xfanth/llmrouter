@@ -147,13 +147,27 @@ mod tests {
             "a $ lookup carries a # prefix the helper does not take"
         );
         // The outcomes doughnut is gone: it mixed the serving path (cache
-        // hit) with the result (success or which error). The flow chart
-        // separates the two, on a sankey plugin pinned like every other
-        // remote asset.
+        // hit) with the result (success or which error). The flows are drawn
+        // by d3-sankey, the reference layout under the d3 organisation, with
+        // every script pinned like the rest of the page's remote assets.
         assert!(
-            body.contains("chartjs-chart-sankey@0.19.1"),
-            "the sankey plugin is pinned to its exact version"
+            !body.contains("chartjs-chart-sankey"),
+            "the chart.js sankey plugin is gone"
         );
+        for pinned in [
+            "d3-sankey@0.12.3",
+            "d3-array@3",
+            "d3-shape@3",
+            "d3-path@3",
+            "integrity=\"sha384-",
+        ] {
+            assert!(body.contains(pinned), "the page pins {pinned}");
+        }
+        assert!(
+            !body.contains("type: \"sankey\""),
+            "no sankey is registered as a chart.js type any more"
+        );
+        assert!(body.contains("d3.sankey()"), "the layout runs through d3");
         assert!(body.contains("Request flow"), "the flow chart card exists");
         assert!(!body.contains("snap_outcomes"), "the doughnut is gone");
     }
