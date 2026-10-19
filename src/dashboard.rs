@@ -126,9 +126,19 @@ mod tests {
         // The request log table reads its own endpoint.
         assert!(body.contains("/metrics/requests"));
         assert!(body.contains("id=\"reqtable\""));
-        // The hedging cards explain themselves in plain words.
+        // The hedging cards explain themselves in plain words, as flows:
+        // the M card splits trials by what hedging bought, the N card splits
+        // walks by what the race bought.
         assert!(body.contains("Per-channel hedging (M)"));
         assert!(body.contains("Router-wide race (N)"));
+        assert!(
+            body.contains("id=\"hedge_m_flow\"") && body.contains("id=\"race_n_flow\""),
+            "both hedging cards carry their own sankey canvas"
+        );
+        assert!(
+            !body.contains("id=\"hedge_m\"") && !body.contains("id=\"hedge_n\""),
+            "the old hedge tables are gone"
+        );
         // The page's $ takes a bare element id, not a selector: a "#"-prefixed
         // lookup returns null, the render throws, and the fetch's catch
         // swallows it, which is how the first request table stayed empty.
