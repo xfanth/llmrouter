@@ -140,7 +140,7 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   <div class="card"><h3>Memory</h3><div class="sub">resident set and cache, MB</div><canvas id="hist_mem"></canvas></div>
 </div>
 <div class="charts">
-  <div class="card"><h3>Request outcomes</h3><div class="sub">cumulative</div><canvas id="snap_outcomes"></canvas></div>
+  <div class="card wide"><h3>Request flow</h3><div class="sub" id="flow_sub">requests, split by where the answer came from and how they ended</div><canvas id="flow"></canvas></div>
   <div class="card"><h3>Cache lookups</h3><div class="sub">cumulative</div><canvas id="snap_lookups"></canvas></div>
   <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider; copy 0 is the first call a channel makes</div><canvas id="snap_hedgewins"></canvas></div>
   <div class="card"><h3>Latency histogram by stage</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_lathist"></canvas></div>
@@ -199,6 +199,7 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   </nav>
 </footer>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.js" integrity="sha384-hfkuqrKeWFmnTMWN31VWyoe8xgdTADD11kgxmdpx2uyE6j5Az5uZq6u6AKYYmAOw" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-chart-sankey@0.19.1/dist/chartjs-chart-sankey.min.js" integrity="sha384-tyfMlmj49YbRIKL6uEc56v5SKCiRUiidm2KCw+rQ6kdFSHUGC+eerZ4KlqEPt+7/" crossorigin="anonymous"></script>
 <script>
 "use strict";
 // == formatters ==
@@ -381,7 +382,6 @@ function histCounts(h) { // counts per bucket from cumulative series
 }
 // == chart plumbing ==
 const PAL = ["#4fc3f7", "#81c784", "#ffb74d", "#e57373", "#ba68c8", "#4db6ac", "#fff176", "#f06292", "#90a4ae", "#aed581", "#64b5f6", "#ffd54f"];
-const OUTCOME_COLORS = { hit_cache: "#56d364", success: "#4fc3f7", too_large: "#ffb74d", no_network: "#f85149", not_admitted: "#ba68c8", no_channel: "#e57373" };
 const LOOKUP_COLORS = { hit: "#56d364", miss_absent: "#ffb74d", miss_expired: "#d29922", miss_model_mismatch: "#ba68c8", miss_schema: "#f78166", disabled: "#8b949e", error: "#f85149" };
 const charts = {};
 Chart.defaults.color = "#8b949e";
@@ -456,7 +456,6 @@ makeLine("hist_latency", [
 makeLine("hist_tps", [lineDs("mean tokens/s", "#ba68c8")]);
 makeLine("hist_mem", [lineDs("RSS MB", "#4fc3f7"), lineDs("cache MB", "#81c784")]);
 
-makeDoughnut("snap_outcomes", ["hit_cache", "success", "too_large", "no_network", "not_admitted", "no_channel"], OUTCOME_COLORS);
 makeDoughnut("snap_lookups", ["hit", "miss_absent", "miss_expired", "miss_model_mismatch", "miss_schema", "disabled", "error"], LOOKUP_COLORS);
 makeDoughnut("snap_tokkind", ["prompt", "completion", "reasoning"], { prompt: "#4fc3f7", completion: "#81c784", reasoning: "#ba68c8" });
 
@@ -464,6 +463,52 @@ makeBar("snap_hedgewins",
   ["0", "1", "2", "3+"],
   [],
   { scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, grid: { color: "rgba(42, 49, 60, 0.9)" } } } });
+
+// The request flow: one answer per request, from one of two paths. The old
+// doughnut mixed the path (cache hit) with the result (success or which
+// error), which read as if a hit were an alternative to a success.
+charts.flow = new Chart(canvasOf("flow"), {
+  type: "sankey",
+  data: { labels: [], datasets: [{ label: "requests", data: [] }] },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false,
+    plugins: { legend: { display: false } },
+  },
+});
+
+function renderFlow() {
+  const out = (o) => sumWhere("router_requests_total", (l) => l.outcome === o);
+  const hit = out("hit_cache");
+  const success = out("success");
+  const errors = [
+    ["too_large (413)", out("too_large")],
+    ["no_network (502)", out("no_network")],
+    ["not_admitted (503)", out("not_admitted")],
+    ["no_channel (504)", out("no_channel")],
+  ];
+  const errorTotal = errors.reduce((s, e) => s + e[1], 0);
+  const missed = success + errorTotal;
+  const links = [
+    ["requests", "cache hit", hit],
+    ["requests", "cache miss", missed],
+    ["cache hit", "answered (200)", hit],
+    ["cache miss", "answered (200)", success],
+    ["cache miss", "error", errorTotal],
+  ].map((l) => ({ from: l[0], to: l[1], flow: l[2] }));
+  for (const [name, count] of errors) {
+    if (count > 0) links.push({ from: "error", to: name, flow: count });
+  }
+  const ds = charts.flow.data.datasets[0];
+  ds.data = links.filter((l) => l.flow > 0);
+  charts.flow.update("none");
+  $("flow_sub").textContent =
+    fmtInt(hit + missed) + " requests: " +
+    fmtInt(hit) + " served from the cache, " +
+    fmtInt(success) + " raced and answered, " +
+    fmtInt(errorTotal) + " errored";
+}
 
 makeBar("snap_lathist", [], [
   { label: "upstream", data: [], backgroundColor: "#4fc3f7aa" },
@@ -717,7 +762,6 @@ function renderSnapshots() {
     d.length = 0;
     for (const lbl of chart.data.labels) d.push(map.get(lbl) || 0);
   };
-  fillDoughnut(charts.snap_outcomes, byLabel("router_requests_total", "outcome"));
   fillDoughnut(charts.snap_lookups, byLabel("router_cache_lookups_total", "result"));
   fillDoughnut(charts.snap_tokkind, byLabel("router_tokens_total", "kind"));
 
@@ -826,6 +870,7 @@ function ingest(text) {
   renderBackoff();
   renderTable();
   renderHedgeCards();
+  renderFlow();
   for (const c of Object.values(charts)) c.update("none");
 }
 
