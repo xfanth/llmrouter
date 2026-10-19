@@ -199,6 +199,7 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
         racer,
         metrics,
         history,
+        reqlog: Arc::new(llmrouter::reqlog::RequestLog::new()),
         started_at: Instant::now(),
     }))
 }

@@ -84,6 +84,10 @@ pub struct Point {
     /// Requests per minute since the previous point. `None` on the first
     /// sample after a start, and whenever the gap is unknown.
     pub rate: Option<f64>,
+    /// Requests per minute over the trailing five minutes. `None` until the
+    /// ring holds two points no further apart than the window.
+    #[serde(default)]
+    pub rate5m: Option<f64>,
     /// Median upstream latency, seconds.
     pub up50: Option<f64>,
     /// 90th percentile upstream latency, seconds.
@@ -102,10 +106,107 @@ pub struct Point {
     pub entries: u64,
 }
 
+/// The cumulative readings behind one sample, kept so the next sample can
+/// report what happened in its own window instead of since the process
+/// started. A percentile over the all-time histogram barely moves from hour
+/// to hour, which is exactly the flat line the first dashboard drew.
+#[derive(Debug, Clone, Default)]
+struct RawCounters {
+    requests: f64,
+    upstream: Vec<(f64, f64)>,
+    upstream_count: f64,
+    router: Vec<(f64, f64)>,
+    router_count: f64,
+    ttft: Vec<(f64, f64)>,
+    ttft_count: f64,
+    tps_sum: f64,
+    tps_count: f64,
+}
+
+/// One sample's per-window readings: the deltas of every cumulative series
+/// the point reports.
+struct Window {
+    upstream: Vec<(f64, f64)>,
+    upstream_count: f64,
+    router: Vec<(f64, f64)>,
+    router_count: f64,
+    ttft: Vec<(f64, f64)>,
+    ttft_count: f64,
+    tps_sum: f64,
+    tps_count: f64,
+}
+
+impl RawCounters {
+    /// The raw readings of one scrape.
+    fn new(samples: &[Sample]) -> Self {
+        Self {
+            requests: total(samples, "router_requests_total", None),
+            upstream: merged_buckets(
+                samples,
+                "router_latency_seconds",
+                Some(("stage", "upstream")),
+            ),
+            upstream_count: total(
+                samples,
+                "router_latency_seconds_count",
+                Some(("stage", "upstream")),
+            ),
+            router: merged_buckets(samples, "router_latency_seconds", Some(("stage", "router"))),
+            router_count: total(
+                samples,
+                "router_latency_seconds_count",
+                Some(("stage", "router")),
+            ),
+            ttft: merged_buckets(samples, "router_ttft_seconds", None),
+            ttft_count: total(samples, "router_ttft_seconds_count", None),
+            tps_sum: total(samples, "router_output_tokens_per_second_sum", None),
+            tps_count: total(samples, "router_output_tokens_per_second_count", None),
+        }
+    }
+
+    /// The per-window deltas against a previous reading. `None` when there is
+    /// no previous reading, or when any cumulative series went backwards,
+    /// which is a recorder restart and means the window is not a real window.
+    fn window(&self, previous: Option<&RawCounters>) -> Option<Window> {
+        let previous = previous?;
+        let requests = self.requests - previous.requests;
+        let upstream = delta_buckets(&self.upstream, &previous.upstream)?;
+        let upstream_count = self.upstream_count - previous.upstream_count;
+        let router = delta_buckets(&self.router, &previous.router)?;
+        let router_count = self.router_count - previous.router_count;
+        let ttft = delta_buckets(&self.ttft, &previous.ttft)?;
+        let ttft_count = self.ttft_count - previous.ttft_count;
+        let tps_sum = self.tps_sum - previous.tps_sum;
+        let tps_count = self.tps_count - previous.tps_count;
+        if requests < 0.0
+            || upstream_count < 0.0
+            || router_count < 0.0
+            || ttft_count < 0.0
+            || tps_sum < 0.0
+            || tps_count < 0.0
+        {
+            return None;
+        }
+        Some(Window {
+            upstream,
+            upstream_count,
+            router,
+            router_count,
+            ttft,
+            ttft_count,
+            tps_sum,
+            tps_count,
+        })
+    }
+}
+
 /// The in-memory ring, optionally backed by a redb file.
 #[derive(Debug)]
 pub struct History {
     points: Mutex<Vec<Point>>,
+    /// The cumulative readings behind the newest point, not kept across a
+    /// restart: the first point of a new process has no window to report.
+    raw: Mutex<Option<RawCounters>>,
     db: Option<Database>,
 }
 
@@ -117,6 +218,7 @@ impl History {
     pub fn open(path: &Path) -> Self {
         let memory_only = Self {
             points: Mutex::new(Vec::new()),
+            raw: Mutex::new(None),
             db: None,
         };
         let db = match Database::create(path) {
@@ -164,6 +266,7 @@ impl History {
         }
         Self {
             points: Mutex::new(seeded),
+            raw: Mutex::new(None),
             db: Some(db),
         }
     }
@@ -175,14 +278,18 @@ impl History {
         let scrape = match Scrape::parse(text.lines().map(|l| Ok(l.to_owned()))) {
             Ok(scrape) => scrape,
             Err(e) => {
-                tracing::warn!(error = %e, "history sample skipped: the scrape did not parse");
+                tracing::warn!(error = %e, "history backend sample skipped: the scrape did not parse");
                 return;
             }
         };
+        let raw_new = RawCounters::new(&scrape.samples);
+        let window = raw_new.window(self.raw.lock().expect("history raw").as_ref());
+        *self.raw.lock().expect("history raw") = Some(raw_new);
         let mut ring = self.points.lock().expect("history ring");
         let previous = ring.last().cloned();
         let point = build_point(&scrape.samples, now_unix_ms, previous);
-        ring.push(point);
+        let rate5m = trailing_rate(&ring, &point);
+        ring.push(point.with_window(window, rate5m));
         if ring.len() > MAX_SAMPLES {
             ring.remove(0);
         }
@@ -330,27 +437,9 @@ pub async fn endpoint(
 /// One point off the scrape, with the rate against the previous point.
 fn build_point(samples: &[Sample], now: u64, previous: Option<Point>) -> Point {
     let requests = total(samples, "router_requests_total", None) as u64;
-    let upstream = merged_buckets(
-        samples,
-        "router_latency_seconds",
-        Some(("stage", "upstream")),
-    );
-    let upstream_count = total(
-        samples,
-        "router_latency_seconds_count",
-        Some(("stage", "upstream")),
-    );
-    let router = merged_buckets(samples, "router_latency_seconds", Some(("stage", "router")));
-    let router_count = total(
-        samples,
-        "router_latency_seconds_count",
-        Some(("stage", "router")),
-    );
-    let ttft = merged_buckets(samples, "router_ttft_seconds", None);
-    let ttft_count = total(samples, "router_ttft_seconds_count", None);
-    let tps_count = total(samples, "router_output_tokens_per_second_count", None);
-    let tps_sum = total(samples, "router_output_tokens_per_second_sum", None);
-
+    // The percentiles and the mean rate are read off the sample's own window
+    // by `with_window`, not off the all-time histogram; `RawCounters` holds
+    // the cumulative readings the window deltas against.
     Point {
         t: now,
         requests,
@@ -359,11 +448,16 @@ fn build_point(samples: &[Sample], now: u64, previous: Option<Point>) -> Point {
             (dt_secs > 0.0)
                 .then_some(requests.saturating_sub(previous.requests) as f64 / dt_secs * 60.0)
         }),
-        up50: percentile(&upstream, upstream_count, 0.5),
-        up90: percentile(&upstream, upstream_count, 0.9),
-        rt90: percentile(&router, router_count, 0.9),
-        ttft90: percentile(&ttft, ttft_count, 0.9),
-        tps: (tps_count > 0.0).then(|| tps_sum / tps_count),
+        rate5m: None,
+        // The percentiles and the mean rate are the window's business now:
+        // `with_window` fills them from the sample's own deltas, and the
+        // all-time shape they used to report is what made the dashboard
+        // lines flat.
+        up50: None,
+        up90: None,
+        rt90: None,
+        ttft90: None,
+        tps: None,
         rss: total(samples, "router_rss_bytes", None) as u64,
         cache: total(samples, "router_cache_bytes", None) as u64,
         entries: total(samples, "router_cache_entries", None) as u64,
@@ -440,6 +534,82 @@ fn percentile(buckets: &[(f64, f64)], total: f64, q: f64) -> Option<f64> {
         .map(|(le, _)| *le)
 }
 
+/// The per-bound difference of two cumulative bucket vectors. `None` when the
+/// two vectors do not line up, which is a recorder that was rebuilt with a
+/// different bucket set, or when any bucket went backwards, which is a
+/// restart. Either way the window is not a real window.
+fn delta_buckets(now: &[(f64, f64)], previous: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+    // A histogram that has never been recorded into produces no series, so
+    // two empty readings are an empty window, not a broken one.
+    if now.is_empty() {
+        return if previous.is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    if previous.is_empty() {
+        // The histogram's first series: the whole cumulative reading is the
+        // window, because there was nothing before it.
+        return Some(now.to_vec());
+    }
+    if now.len() != previous.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(now.len());
+    for ((le_now, cum_now), (_, cum_prev)) in now.iter().zip(previous) {
+        let delta = cum_now - cum_prev;
+        if delta < 0.0 {
+            return None;
+        }
+        out.push((*le_now, delta));
+    }
+    Some(out)
+}
+
+/// Requests per minute over the trailing five minutes, from the ring. The
+/// base is the newest point no older than the window; a restart that set the
+/// request counter backwards gives `None`.
+fn trailing_rate(ring: &[Point], newest: &Point) -> Option<f64> {
+    let cutoff = newest.t.saturating_sub(300_000);
+    let base = ring.iter().rev().find(|p| p.t >= cutoff)?;
+    let dt = newest.t.saturating_sub(base.t) as f64 / 1000.0;
+    if dt <= 0.0 {
+        return None;
+    }
+    let delta = newest.requests as f64 - base.requests as f64;
+    (delta >= 0.0).then(|| delta / dt * 60.0)
+}
+
+impl Point {
+    /// Fills the windowed fields from this sample's window. `None` keeps
+    /// whatever the all-time reading was, which is the first point after a
+    /// start: it has no window, so it reports the all-time shape once and
+    /// then drops out of the chart as newer windows replace it.
+    fn with_window(mut self, window: Option<Window>, rate5m: Option<f64>) -> Self {
+        self.rate5m = rate5m;
+        let Some(window) = window else {
+            return self;
+        };
+        if let Some(value) = percentile(&window.upstream, window.upstream_count, 0.5) {
+            self.up50 = Some(value);
+        }
+        if let Some(value) = percentile(&window.upstream, window.upstream_count, 0.9) {
+            self.up90 = Some(value);
+        }
+        if let Some(value) = percentile(&window.router, window.router_count, 0.9) {
+            self.rt90 = Some(value);
+        }
+        if let Some(value) = percentile(&window.ttft, window.ttft_count, 0.9) {
+            self.ttft90 = Some(value);
+        }
+        if window.tps_count > 0.0 {
+            self.tps = Some(window.tps_sum / window.tps_count);
+        }
+        self
+    }
+}
+
 /// Unix time in milliseconds.
 fn now_unix_ms() -> u64 {
     SystemTime::now()
@@ -464,14 +634,25 @@ mod tests {
     fn memory_history() -> History {
         History {
             points: Mutex::new(Vec::new()),
+            raw: Mutex::new(None),
             db: None,
         }
     }
 
+    /// The first point of a process has no previous reading, so its window
+    /// and its rate are both unknown; the second point reports exactly what
+    /// happened between the two samples.
     #[test]
     fn one_sample_computes_the_fields() {
         let h = memory_history();
         let m = metrics();
+        h.sample_once(&m, 0);
+        let first = &h.points()[0];
+        assert_eq!(first.requests, 0);
+        assert_eq!(first.rate, None);
+        assert_eq!(first.rate5m, None);
+        assert_eq!(first.up50, None);
+
         m.record_request(Outcome::Success);
         m.record_request(Outcome::Success);
         m.record_latency(Duration::from_secs(1), Duration::from_millis(10));
@@ -481,11 +662,11 @@ mod tests {
         m.set_cache_bytes(1 << 20);
         m.set_cache_entries(7);
 
-        h.sample_once(&m, 1_000);
-        let point = &h.points()[0];
+        h.sample_once(&m, 5_000);
+        let point = &h.points()[1];
         assert_eq!(point.requests, 2);
-        // One 1.0s upstream latency: the smallest bucket bound at or past the
-        // 0.5 and 0.9 quantiles is 1.0 itself.
+        // One 1.0s upstream latency this window: the smallest bucket bound at
+        // or past the 0.5 and 0.9 quantiles is 1.0 itself.
         assert_eq!(point.up50, Some(1.0));
         assert_eq!(point.up90, Some(1.0));
         assert_eq!(point.rt90, Some(0.01));
@@ -494,7 +675,64 @@ mod tests {
         assert_eq!(point.rss, 1 << 30);
         assert_eq!(point.cache, 1 << 20);
         assert_eq!(point.entries, 7);
-        assert_eq!(point.rate, None);
+        assert_eq!(point.rate, Some(24.0));
+        // Two requests over five seconds of history is twenty four a minute
+        // over the trailing window too.
+        assert_eq!(point.rate5m, Some(24.0));
+    }
+
+    /// A percentile over the all-time histogram barely moves as new requests
+    /// land, which is the flat dashboard line the first version drew. Each
+    /// point must report its own window: a fast window follows a slow one and
+    /// the lines move with it.
+    #[test]
+    fn a_point_reports_its_own_window_not_the_all_time_shape() {
+        let h = memory_history();
+        let m = metrics();
+        h.sample_once(&m, 0);
+
+        m.record_latency(Duration::from_secs(10), Duration::ZERO);
+        m.record_output_rate(140.0);
+        h.sample_once(&m, 5_000);
+        let point = &h.points()[1];
+        assert_eq!(point.up50, Some(10.0));
+        assert_eq!(point.tps, Some(140.0));
+
+        // A fast window follows. The all-time shape is still dominated by the
+        // slow request, so the old cumulative percentile would have stayed on
+        // 10.0 and 70.0; the window reports the new request alone.
+        m.record_latency(Duration::from_millis(5), Duration::ZERO);
+        m.record_output_rate(10.0);
+        h.sample_once(&m, 10_000);
+        let point = &h.points()[2];
+        assert_eq!(point.up50, Some(0.005));
+        assert_eq!(point.tps, Some(10.0));
+    }
+
+    /// A window with no activity reports no numbers: `None`, not the all-time
+    /// shape, so a quiet stretch draws a gap rather than a stale flat line.
+    #[test]
+    fn a_window_with_no_activity_reports_none() {
+        let h = memory_history();
+        let m = metrics();
+        h.sample_once(&m, 0);
+        // A quiet window: nothing new to report, so every windowed field is
+        // None rather than the all-time shape.
+        h.sample_once(&m, 5_000);
+        let point = &h.points()[1];
+        assert_eq!(point.up50, None);
+        assert_eq!(point.tps, None);
+
+        m.record_latency(Duration::from_secs(10), Duration::ZERO);
+        h.sample_once(&m, 10_000);
+        let point = &h.points()[2];
+        assert_eq!(point.up50, Some(10.0));
+
+        // Quiet again: the line drops out instead of going flat.
+        h.sample_once(&m, 15_000);
+        let point = &h.points()[3];
+        assert_eq!(point.up50, None);
+        assert_eq!(point.tps, None);
     }
 
     #[test]

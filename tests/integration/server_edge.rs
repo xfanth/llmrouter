@@ -187,6 +187,7 @@ impl Edge {
             cache,
             racer,
             metrics,
+            reqlog: Arc::new(llmrouter::reqlog::RequestLog::new()),
             history: Arc::new(llmrouter::history::History::open(
                 &router.cache.path.with_file_name("history.redb"),
             )),
@@ -1610,6 +1611,10 @@ async fn time_spent_on_failed_channels_is_upstream_time_not_router_overhead() {
 
     let config = RouterConfig {
         race_width: 1,
+        // The point is the sequential walk: the slow channel fails, then the
+        // fast one is tried. The escalation would fire the fast channel
+        // alongside the slow one, which is a different walk.
+        race_escalation_ms: 0,
         ..plain_config()
     };
     let edge = Edge::new(config, vec![doomed, good], Link::Up).await;
@@ -1786,4 +1791,123 @@ async fn generation_after_the_first_token_is_upstream_time_for_a_plain_client() 
         "the router half holds {}ms, which is the provider's generation time:\n{text}",
         sum("router") * 1000.0
     );
+}
+
+/// A provider that opens a stream, sends one content frame and closes the
+/// socket with the body unfinished. wiremock cannot cut a connection
+/// mid-answer, so this is a raw listener.
+async fn dying_stream_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port is free");
+    let addr = listener.local_addr().expect("the port is known");
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"half an \"}}]}\n\n";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{frame}\r\n",
+                    frame.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.flush().await;
+                // Hold the body open past the hedge decision window, then
+                // drop it: the death has to land after the stream has won,
+                // which is the case the fold's failover exists for.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                // No terminating chunk, no shutdown: the body breaks off.
+            });
+        }
+    });
+    (format!("http://{addr}/v1"), task)
+}
+
+/// A winning stream that dies before anything reaches a client that asked
+/// for one piece costs the client nothing: the walk is re-run on fresh
+/// channels and the answer arrives complete. Before the failover this was a
+/// 504 naming the upstream error.
+#[tokio::test]
+async fn a_stream_that_dies_before_anything_reaches_a_plain_client_retries_invisibly() {
+    let (dying_url, dying_task) = dying_stream_upstream().await;
+    // The good channel streams, because the walk streams whatever the client
+    // asked for when `streaming` is on, and the retry walk streams like the
+    // first one did.
+    let answer = "the complete answer from the fresh channel";
+    let mut sse_body = String::new();
+    for _ in 0..2 {
+        sse_body.push_str(&format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-fake",
+                "object": "chat.completion.chunk",
+                "model": "fake",
+                "choices": [{ "index": 0, "delta": { "content": answer }, "finish_reason": Value::Null }],
+            })
+        ));
+    }
+    sse_body.push_str(&format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "id": "chatcmpl-fake",
+            "object": "chat.completion.chunk",
+            "model": "fake",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+        })
+    ));
+    let good = upstream_serving(
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse_body),
+    )
+    .await;
+
+    let mut doomed = channel(&dying_url, "doomed-model", FAKE_KEY, 200_000);
+    doomed.intelligence = 900;
+    doomed.intelligence_rank = 1;
+    let mut good = channel(&base_url(&good), "good-model", FAKE_KEY, 200_000);
+    good.intelligence = 100;
+    good.intelligence_rank = 2;
+
+    let config = RouterConfig {
+        race_width: 1,
+        // The escalation would fire the good channel alongside the doomed
+        // one, and then the good channel would simply win the race; the
+        // point here is the death after the race, so hold the walk at one
+        // channel at a time.
+        race_escalation_ms: 0,
+        max_per_channel: 1,
+        streaming: true,
+        keepalive_interval: Duration::ZERO,
+        request_timeout: Duration::from_secs(30),
+        ..RouterConfig::default()
+    };
+    let edge = Edge::new(config, vec![doomed, good], Link::Up).await;
+
+    let response = edge.post_chat(&chat_request("retry me", false)).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the retry lands on a fresh channel and answers"
+    );
+    let body = text_body(response).await;
+    assert!(
+        body.contains("the complete answer from the fresh channel"),
+        "the client gets the fresh channel's whole answer: {body}"
+    );
+
+    // The dead stream is charged to the channel, so the next walk skips it.
+    let text = text_body(edge.get("/metrics").await).await;
+    assert!(
+        text.contains("router_errors_total{"),
+        "the dead stream is counted as an error: {text}"
+    );
+    assert!(
+        text.contains("router_cache_writes_total{result=\"stored\"} 1"),
+        "the fresh channel's complete answer is cached: {text}"
+    );
+    dying_task.abort();
 }

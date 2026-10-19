@@ -3,6 +3,12 @@
 //! N channels in flight, M hedged copies each. `hedge_delay_ms` is 1 by
 //! default, 1ms behind the first one.
 //!
+//! N escalates. A walk opens at `race_width` channels and adds one more every
+//! `race_escalation_ms` while it runs, up to `race_width_max`, in intelligence
+//! order: the slowest channels are still growing the race while the fastest
+//! are answering. An escalation period of 0 holds N at `race_width` for the
+//! whole walk.
+//!
 //! The M copies are one trial, not M. Any copy returning 2xx with content makes
 //! the channel healthy. Every copy failing bumps `retry_counter` by 1, and the
 //! longest `Retry-After` among them sets `retry_base`.
@@ -57,6 +63,7 @@ use crate::upstream::{CallError, SharedBody, Upstream};
 use crate::wire::{self, ChunkStream, NeutralResponse};
 
 /// Everything one client request hands the race.
+#[derive(Clone)]
 pub struct RaceInput {
     /// The body every channel call sends, encoded once and shared. It is
     /// either held in RAM or spilled to a scratch file, and each channel call
@@ -72,6 +79,9 @@ pub struct RaceInput {
     /// The caller's model, for the `404` when nothing matches and for the
     /// cache rules. `auto` and no model both mean `None`.
     pub named_model: Option<String>,
+    /// Channels this walk must not call. The server lists the channel whose
+    /// winning stream died, so the failover walk finds fresh channels.
+    pub exclude: std::collections::HashSet<ChannelId>,
 }
 
 /// A channel call that returned 2xx with non-empty content.
@@ -281,7 +291,7 @@ impl Racer {
         // without touching the client's token.
         let race_cancel = cancel.child_token();
 
-        let mut excluded: Excluded = HashSet::new();
+        let mut excluded: Excluded = input.exclude.clone();
         let mut last_error: Option<String> = None;
         // Failed trials so far, which is what the N-race outcome reads at the
         // moment a winner emerges.
@@ -292,6 +302,24 @@ impl Racer {
         let mut held: Vec<PendingFailure> = Vec::new();
         let mut link_up = false;
 
+        // The escalation clock. N starts at `race_width` and climbs one
+        // channel at a time, one `race_escalation_ms` apart, up to
+        // `race_width_max`, so a request the providers are slow on ends up
+        // racing every channel the catalogue can serve, in intelligence
+        // order. A period of 0 holds N at `race_width` for the whole walk.
+        let max_width = self
+            .config
+            .router
+            .race_width_max
+            .max(1)
+            .max(self.config.router.race_width);
+        let mut width = self.config.router.race_width.max(1).min(max_width);
+        let escalates = self.config.router.race_escalation_ms > 0;
+        let escalation = Duration::from_millis(self.config.router.race_escalation_ms.max(1));
+        let mut escalator = tokio::time::interval(escalation);
+        escalator.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        escalator.tick().await;
+
         let mut inflight: Trials = Trials::new();
         self.top_up(
             &mut inflight,
@@ -301,6 +329,7 @@ impl Racer {
             &race_cancel,
             fired,
             walk_started,
+            width,
         );
 
         if inflight.is_empty() {
@@ -338,6 +367,21 @@ impl Racer {
                     // were the channels' own, and they can be written now.
                     link_up = true;
                     self.apply_held(&mut held);
+                    continue;
+                }
+
+                _ = escalator.tick(), if escalates && width < max_width => {
+                    width = (width + 1).min(max_width);
+                    self.top_up(
+                        &mut inflight,
+                        &snapshot,
+                        &input,
+                        &mut excluded,
+                        &race_cancel,
+                        fired,
+                        walk_started,
+                        width,
+                    );
                     continue;
                 }
 
@@ -431,7 +475,8 @@ impl Racer {
                         }
                         // The dead channels are replaced here, which also
                         // covers the trials that died inside the window: the
-                        // set goes back to N whatever the window cost it.
+                        // set goes back to the walk's current width whatever
+                        // the window cost it.
                         self.top_up(
                             &mut inflight,
                             &snapshot,
@@ -440,6 +485,7 @@ impl Racer {
                             &race_cancel,
                             fired,
                             walk_started,
+                            width,
                         );
                         if inflight.is_empty() {
                             let outcome =
@@ -505,7 +551,8 @@ impl Racer {
                         }
                     }
                     // Replace the failed channel at once. One finishes, one
-                    // starts: a sliding window of N, not waves of N.
+                    // starts: a sliding window of the walk's current width,
+                    // not waves of N.
                     self.top_up(
                         &mut inflight,
                         &snapshot,
@@ -514,6 +561,7 @@ impl Racer {
                         &race_cancel,
                         fired,
                         walk_started,
+                        width,
                     );
                 }
             }
@@ -527,7 +575,9 @@ impl Racer {
         }
     }
 
-    /// Tops the trials in flight back up to `race_width`.
+    /// Tops the trials in flight back up to `width`, which is the walk's
+    /// current width: `race_width` at the start, then one more channel every
+    /// `race_escalation_ms` while the walk runs, to `race_width_max`.
     ///
     /// Every path that loses a trial comes through here, so a stream that
     /// broke pulls in untried channels exactly as a buffered failure does. A
@@ -543,14 +593,10 @@ impl Racer {
         cancel: &CancellationToken,
         fired: &'a WalkCount,
         walk_started: tokio::time::Instant,
+        width: usize,
     ) {
         let copies = self.config.router.max_per_channel.max(1) as u32;
-        let wanted = self
-            .config
-            .router
-            .race_width
-            .max(1)
-            .saturating_sub(inflight.len());
+        let wanted = width.max(1).saturating_sub(inflight.len());
         if wanted == 0 {
             return;
         }

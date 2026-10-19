@@ -321,8 +321,23 @@ pub async fn aggregate_stream(
 /// the caller can fold it and offer it to the cache. A stream that fails or is
 /// dropped part way sends nothing, which is the cache rule: only a complete
 /// stream goes in.
-/// Passes a stream through untouched and hands back the usage block the
-/// provider reported, once the stream has run to its end.
+/// What one stream did, as watched by [`tap_stream`]: the answer text and
+/// the usage block the provider reported.
+#[derive(Debug, Default)]
+pub struct StreamFacts {
+    /// The first part of the answer text, capped at [`TAP_TEXT_CHARS`].
+    pub text: String,
+    /// The provider's usage block, on a stream that ran to its end. A broken
+    /// stream sends no usage: a partial answer is not a whole one.
+    pub usage: Option<NeutralUsage>,
+}
+
+/// How much answer text one tap keeps for the request log.
+const TAP_TEXT_CHARS: usize = 2_000;
+
+/// Passes a stream through untouched and hands back what it produced: the
+/// first part of the answer text and the usage block, once the stream has
+/// run to its end or died.
 ///
 /// Separate from [`tee_stream`], which keeps a copy of every event so the
 /// whole answer can be folded for the cache. Counting tokens does not need
@@ -335,37 +350,50 @@ pub async fn aggregate_stream(
 ///
 /// Nothing is sent when the provider reported no usage, so a receiver that
 /// resolves to an error means there was nothing to count.
-pub fn tap_usage(
+pub fn tap_stream(
     chunks: ChunkStream,
-) -> (ChunkStream, tokio::sync::oneshot::Receiver<NeutralUsage>) {
+) -> (ChunkStream, tokio::sync::oneshot::Receiver<StreamFacts>) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let mut inner = chunks.0;
     let forwarded = async_stream::stream! {
-        let mut usage: Option<NeutralUsage> = None;
+        let mut facts = StreamFacts { usage: None, text: String::new() };
         while let Some(item) = inner.next().await {
             if let Ok(event) = &item {
-                // The last one wins. A provider may report usage more than
+                // The last usage block wins: a provider may report more than
                 // once over a stream, and the final figure is the whole
                 // answer's rather than a running part of it.
                 for chunk in event.normalized().iter() {
-                    if let switchyard_protocol::stream::LlmResponseChunk::Usage(reported) = chunk {
-                        usage = Some(reported.clone());
+                    match chunk {
+                        switchyard_protocol::stream::LlmResponseChunk::Usage(reported) => {
+                            facts.usage = Some(reported.clone());
+                        }
+                        switchyard_protocol::stream::LlmResponseChunk::TextDelta { text, .. } => {
+                            push_capped(&mut facts.text, text, TAP_TEXT_CHARS);
+                        }
+                        _ => {}
                     }
                 }
             }
             let failed = item.is_err();
             yield item;
             if failed {
-                // A broken stream is a partial answer, and counting its
-                // tokens would read as a complete one.
+                // A broken stream is a partial answer: the text so far goes
+                // to the request log's row, the usage block does not.
+                let _ = sender.send(facts);
                 return;
             }
         }
-        if let Some(usage) = usage {
-            let _ = sender.send(usage);
-        }
+        let _ = sender.send(facts);
     };
     (ChunkStream(Box::pin(forwarded)), receiver)
+}
+
+/// Appends to a string up to a character cap.
+fn push_capped(target: &mut String, add: &str, cap: usize) {
+    let room = cap.saturating_sub(target.chars().count());
+    if room > 0 {
+        target.push_str(&add.chars().take(room).collect::<String>());
+    }
 }
 
 pub fn tee_stream(

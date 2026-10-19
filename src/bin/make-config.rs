@@ -1225,7 +1225,9 @@ cloudflare-workers-ai,@cf/meta/llama,1,0,,128000,4096,\"[\"\"text\"\"]\",llama,1
 
         let parsed: RouterConfig = serde_yaml::from_str(&text).expect("router.yml parses back");
         let defaults = RouterConfig::default();
-        assert_eq!(parsed.race_width, 32);
+        assert_eq!(parsed.race_width, 2);
+        assert_eq!(parsed.race_width_max, 32);
+        assert_eq!(parsed.race_escalation_ms, 1);
         assert_eq!(parsed.max_per_channel, 2);
         assert_eq!(parsed.hedge_delay_ms, 1);
         assert!(parsed.streaming);

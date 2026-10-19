@@ -18,6 +18,7 @@ pub mod models_api;
 pub mod net;
 pub mod probe;
 pub mod race;
+pub mod reqlog;
 pub mod server;
 pub mod upstream;
 pub mod wire;
