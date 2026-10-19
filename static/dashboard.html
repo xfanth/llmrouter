@@ -155,13 +155,13 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
 <div class="charts">
   <div class="card wide">
     <h3>Per-channel hedging (M)</h3>
-    <div class="sub">A hedge copy is a second call to the same channel, fired <span id="hedge_delay_note">1ms</span> after the first.</div>
-    <table id="hedge_m"><tbody></tbody></table>
+    <div class="sub" id="hedge_m_sub">A hedge copy is a second call to the same channel, fired 1ms after the first.</div>
+    <canvas id="hedge_m_flow"></canvas>
   </div>
   <div class="card wide">
     <h3>Router-wide race (N)</h3>
-    <div class="sub">The router fires several channels at once and replaces failures as they land; these say what that bought.</div>
-    <table id="hedge_n"><tbody></tbody></table>
+    <div class="sub" id="race_n_sub">The router fires several channels at once and replaces failures as they land.</div>
+    <canvas id="race_n_flow"></canvas>
   </div>
 </div>
 <div class="charts">
@@ -610,48 +610,71 @@ async function fetchHistory() {
   }
 }
 
-// == hedging cards ==
-function tableRows(id, rows) {
-  $(id).tBodies[0].innerHTML = rows
-    .map((r) => "<tr><td>" + r.join("</td><td>") + "</td></tr>")
-    .join("");
+// == hedging flows ==
+function sankeyOf(id) {
+  charts[id] = new Chart(canvasOf(id), {
+    type: "sankey",
+    data: { labels: [], datasets: [{ label: id, data: [] }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { display: false } },
+    },
+  });
+  return charts[id];
+}
+sankeyOf("hedge_m_flow");
+sankeyOf("race_n_flow");
+
+function drawSankey(id, links) {
+  const ds = charts[id].data.datasets[0];
+  ds.data = links.filter((l) => l.flow > 0);
+  charts[id].update("none");
 }
 
-function renderHedgeCards() {
+function renderHedgeFlows() {
   const resc = sumWhere("router_hedge_outcome_total", (l) => l.result === "rescued");
   const fast = sumWhere("router_hedge_outcome_total", (l) => l.result === "faster");
   const redn = sumWhere("router_hedge_outcome_total", (l) => l.result === "redundant");
   const nohedge = sumWhere("router_hedge_outcome_total", (l) => l.result === "no_hedge");
   const decided = resc + fast + redn;
-  tableRows("hedge_m", [
-    ["Hedge copies answered the whole trial:",
-      fmtInt(resc + fast + redn + nohedge) + " won trials, of which"],
-    ["rescued — the first copy had failed, so the hedge saved the request:",
-      fmtInt(resc) + (decided ? " (" + fmtPct(resc / decided) + ")" : "")],
-    ["faster — the hedge copy beat a first copy still running:",
-      fmtInt(fast) + (decided ? " (" + fmtPct(fast / decided) + ")" : "")],
-    ["redundant — the first copy answered anyway:",
-      fmtInt(redn) + (decided ? " (" + fmtPct(redn / decided) + ")" : "")],
-    ["no hedge fired (max_per_channel is 1):",
-      fmtInt(nohedge)],
-    ["Wins by copy index (stacked chart above):",
-      ["0", "1", "2", "3+"].map((ix) =>
-        ix + ": " + fmtInt(sumWhere("router_hedge_wins_total", (l) => l.copy === ix))
-      ).join(", ")],
+  drawSankey("hedge_m_flow", [
+    { from: "channel trials", to: "won", flow: resc + fast + redn + nohedge },
+    { from: "channel trials", to: "failed", flow: sumWhere("router_trials_total", (l) => l.outcome === "failed") },
+    { from: "channel trials", to: "cancelled", flow: sumWhere("router_trials_total", (l) => l.outcome === "cancelled") },
+    { from: "won", to: "no hedge fired (M=1)", flow: nohedge },
+    { from: "won", to: "first copy won anyway", flow: redn },
+    { from: "won", to: "hedge copy rescued it", flow: resc },
+    { from: "won", to: "hedge copy was faster", flow: fast },
   ]);
+  $("hedge_m_sub").textContent =
+    "of " + fmtInt(resc + fast + redn + nohedge) + " won trials: " +
+    fmtInt(nohedge) + " had no hedge, " +
+    fmtInt(redn) + " won by the first copy anyway, " +
+    fmtInt(resc) + " rescued by a hedge copy, " +
+    fmtInt(fast) + " won faster by a hedge copy";
+
   const firstWon = sumWhere("router_race_outcome_total", (l) => l.result === "first_won");
   const laterWon = sumWhere("router_race_outcome_total", (l) => l.result === "later_won");
   const raceRescued = sumWhere("router_race_outcome_total", (l) => l.result === "rescued");
-  const won = firstWon + laterWon + raceRescued;
-  tableRows("hedge_n", [
-    ["Walks with an answer:", fmtInt(won)],
-    ["first_won — the first channel fired won anyway:",
-      fmtInt(firstWon) + (won ? " (" + fmtPct(firstWon / won) + ")" : "")],
-    ["later_won — a later channel was faster:",
-      fmtInt(laterWon) + (won ? " (" + fmtPct(laterWon / won) + ")" : "")],
-    ["rescued — a later channel won after an earlier channel failed:",
-      fmtInt(raceRescued) + (won ? " (" + fmtPct(raceRescued / won) + ")" : "")],
+  const answered = firstWon + laterWon + raceRescued;
+  const noChannel = sumWhere("router_requests_total", (l) => l.outcome === "no_channel");
+  const noNetwork = sumWhere("router_requests_total", (l) => l.outcome === "no_network");
+  drawSankey("race_n_flow", [
+    { from: "walks", to: "answered", flow: answered },
+    { from: "walks", to: "no channel (504)", flow: noChannel },
+    { from: "walks", to: "no network (502)", flow: noNetwork },
+    { from: "answered", to: "first channel won anyway", flow: firstWon },
+    { from: "answered", to: "a later channel was faster", flow: laterWon },
+    { from: "answered", to: "a later channel rescued it", flow: raceRescued },
   ]);
+  $("race_n_sub").textContent =
+    "of " + fmtInt(answered + noChannel + noNetwork) + " walks: " +
+    fmtInt(answered) + " answered, of which " +
+    fmtInt(firstWon) + " the first channel won anyway, " +
+    fmtInt(laterWon) + " a later channel was faster, " +
+    fmtInt(raceRescued) + " a later channel rescued";
 }
 
 // == request log ==
@@ -869,7 +892,7 @@ function ingest(text) {
   renderErrors();
   renderBackoff();
   renderTable();
-  renderHedgeCards();
+  renderHedgeFlows();
   renderFlow();
   for (const c of Object.values(charts)) c.update("none");
 }
