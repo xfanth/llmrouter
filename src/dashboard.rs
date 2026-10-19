@@ -136,6 +136,16 @@ mod tests {
             !body.contains("$(\"#"),
             "a $ lookup carries a # prefix the helper does not take"
         );
+        // The outcomes doughnut is gone: it mixed the serving path (cache
+        // hit) with the result (success or which error). The flow chart
+        // separates the two, on a sankey plugin pinned like every other
+        // remote asset.
+        assert!(
+            body.contains("chartjs-chart-sankey@0.19.1"),
+            "the sankey plugin is pinned to its exact version"
+        );
+        assert!(body.contains("Request flow"), "the flow chart card exists");
+        assert!(!body.contains("snap_outcomes"), "the doughnut is gone");
     }
 
     #[tokio::test]
