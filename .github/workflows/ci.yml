@@ -4,205 +4,23 @@ on:
   pull_request:
   push:
     branches: [master]
+  workflow_dispatch:
 
 # A new push to a pull request makes the running check pointless, so cancel it.
-# Master pushes are never cancelled or queued behind each other, so every
-# commit on master gets its own complete run (they never skip, see changes).
-# Hence a group per run on push (a shared group with cancel-in-progress false
-# still drops pending runs).
+# Master pushes are never cancelled, so every commit on master gets its own
+# complete run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
-  # dorny/paths-filter lists a pull request's files through the API.
-  pull-requests: read
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
-  # Decides whether anything that can change the build, the tests or the image
-  # moved. A deny-list, not an allow-list: the tests read files from all over
-  # the repo (DESIGN.md, build_providers.py, .gitignore, the CSVs, the compose
-  # file), so only files proven to be read by nothing are skipped. A false
-  # "yes" costs minutes, a false "no" lets a broken change go green. Before
-  # adding a file here, grep src/ and tests/ for its name.
-  changes:
-    name: what changed
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Only pull requests may skip. On a master push the filter would diff
-    # against the previous push alone, so a docs-only push after a failed or
-    # cancelled Rust run would go green untested. Master always runs everything.
-    outputs:
-      rust: ${{ github.event_name == 'pull_request' && steps.filter.outputs.rust || 'true' }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request'
-      - id: filter
-        if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
-        with:
-          # 'every': a file counts only if it matches all patterns, which is
-          # what makes the '!' lines exclusions.
-          predicate-quantifier: every
-          filters: |
-            rust:
-              - '**'
-              - '!ARCHITECTURE.md'
-              - '!tests/README.md'
-
-  clippy:
-    name: fmt, clippy
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      # Installs the toolchain and components named in rust-toolchain.toml, so
-      # CI runs the same Rust as ci.sh rather than whatever stable is today.
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      # The target dir has to stay inside the checkout. rust-cache joins the
-      # workspace root with the target path, so an absolute path would resolve
-      # to a directory that never exists and nothing of the build is cached.
-      # Each job has its own key so the three jobs never evict each other.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-          key: clippy
-
-      - name: cargo fmt --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      # Everything else builds the bins in debug, and the image build only
-      # compiles llmrouter, so nothing would otherwise compile
-      # src/bin/make-config.rs under [profile.release]. A
-      # cfg(not(debug_assertions)) block, a monomorphisation-time error or a
-      # panic = "abort" incompatibility in it would go green. A check would not
-      # catch the last two: it stops at metadata, so it never monomorphises and
-      # never links. So build it for real. It is the only bin without a release
-      # build elsewhere, and it is small. Matches job_clippy in ci.sh.
-      - name: cargo build --release --bin llmrouter-make-config
-        run: cargo build --release --bin llmrouter-make-config
-
-  # Carries the tests. The instrumented run passing is the proof they pass, so
-  # there is no separate plain cargo test.
-  coverage:
-    name: tests and coverage
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      # Installs the toolchain and components named in rust-toolchain.toml, so
-      # CI runs the same Rust as ci.sh rather than whatever stable is today.
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-          key: coverage
-
-      - uses: taiki-e/install-action@v2
-        with:
-          # Same versions as NEXTEST_VERSION and LLVM_COV_VERSION in ci.sh,
-          # held there by the_test_tools_are_pinned_to_the_same_versions_in_ci_sh_and_ci_yml.
-          tool: cargo-nextest@0.9.148,cargo-llvm-cov@0.9.1
-
-      - name: Tests under coverage, with the 80/80 gate
-        run: |
-          # Matches ci.sh. rust-cache restores target/ between runs, so
-          # profile data from an earlier run can survive and skew the figure.
-          # --profraw-only drops that stale data and keeps the restored build:
-          # a bare clean would bin target/llvm-cov-target and rebuild all
-          # dependencies from cold, wasting the cache rust-cache just restored.
-          cargo llvm-cov clean --workspace --profraw-only
-          # clean --profraw-only stops before deleting the merged profile. If
-          # a run then produces no profraw, cargo-llvm-cov reports off the
-          # leftover profdata and the gate passes on the previous run's
-          # figures. Bin it.
-          # Glob because the file is named after the checkout directory, not
-          # the crate.
-          rm -f target/llvm-cov-target/*.profdata
-          cargo llvm-cov nextest --all-features --workspace --no-report \
-            --lib --bins --test contract --test integration
-          cargo llvm-cov report --lcov --output-path lcov.info
-          cargo llvm-cov report --summary-only \
-            --fail-under-lines 80 --fail-under-regions 80
-
-      - name: Upload the lcov report
-        # Wanted even when the gate fails: that is when you want to read it.
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: lcov
-          path: lcov.info
-
-  smoke:
-    name: smoke tier (docker compose)
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Warms the buildx builder from the gha cache. It only fills the cache;
-      # the image the smoke tier tests is built by 'compose up --build' below,
-      # through the overlay's build section, exactly as ci.sh does.
-      # mode=max keeps the build stage's layers too, so an unchanged
-      # dependency set is not recompiled on the next run.
-      - name: Warm the image build cache
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          outputs: type=cacheonly
-          cache-from: type=gha,scope=smoke
-          cache-to: type=gha,scope=smoke,mode=max
-
-      # Installs the toolchain and components named in rust-toolchain.toml, so
-      # CI runs the same Rust as ci.sh rather than whatever stable is today.
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-          key: smoke
-
-      # The smoke test runs 'compose up --build', as it does under ci.sh.
-      # BUILDX_BUILDER points that build at the builder warmed above, so when
-      # the compose build section matches the Dockerfile it is a cache hit.
-      - name: Run the smoke tier
-        env:
-          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-        run: cargo test --test smoke -- --nocapture
-
-  # The one required check. A job skipped because nothing Rust changed reports
-  # "skipped", which is fine; a failed or cancelled one fails this job.
-  ci:
-    name: ci
-    if: always()
-    needs: [changes, clippy, coverage, smoke]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Fail if any job failed or was cancelled
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
-        run: exit 1
-      - run: echo "every job passed or was skipped as unaffected"
+  # The organisation's shared Rust gate: the repository's own ci.sh, run on
+  # the TrueNAS self-hosted runner, so CI consumes no GitHub-hosted minutes.
+  # The workflow lives in xfanth/.github; the branch ref tracks it until it
+  # is tagged there.
+  quality:
+    name: quality gate
+    uses: xfanth/.github/.github/workflows/rust-quality.yml@rust-quality

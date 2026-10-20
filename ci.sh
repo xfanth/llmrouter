@@ -148,6 +148,16 @@ job_coverage() {
 }
 
 job_smoke() {
+    # A runner without a docker daemon cannot build the image: the org's
+    # self-hosted TrueNAS runner has no docker socket, by the central
+    # platform's security policy. The tier reports itself skipped rather
+    # than failing there, and the summary shows why. Anything dockerless
+    # therefore leans on the local gate, which is where the smoke tier
+    # is meant to run anyway.
+    if ! docker info > /dev/null 2>&1; then
+        echo "skipped (no docker)" > "$LOG_DIR/smoke.result"
+        return 0
+    fi
     export CARGO_TARGET_DIR="$BASE_TARGET_DIR/smoke"
     # CI=1 is what GitHub Actions sets, and the image test demands a working
     # docker daemon when it is set rather than skipping. Setting it here keeps
