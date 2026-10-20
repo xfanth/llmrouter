@@ -300,7 +300,7 @@ async fn wait_for_healthz(
                 .output();
             match probe {
                 Ok(out) if out.status.success() => {
-                    let body = String::from_utf8_lossy(&out.stdout).to_owned();
+                    let body = String::from_utf8_lossy(&out.stdout).into_owned();
                     let parsed: Value = serde_json::from_str(body.trim())
                         .map_err(|error| format!("/healthz is not JSON: {error}"))?;
                     if parsed["channels"]["total"].is_u64() {
