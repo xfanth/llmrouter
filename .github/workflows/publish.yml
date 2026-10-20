@@ -23,8 +23,11 @@ jobs:
     # A cancelled or failed CI run never publishes.
     if: github.event.workflow_run.conclusion == 'success'
     name: build and push to ghcr
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The organisation's self-hosted runner: GitHub-hosted runners fail at
+    # startup for this repository. The runner has a working docker daemon
+    # and the compose plugin is installed by the gate.
+    runs-on: [self-hosted, Linux, X64, truenas]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
