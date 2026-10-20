@@ -25,7 +25,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// `docker-compose.ci.yml` publishes a kernel-chosen port on the loopback
 /// address, so the base URL is read back from compose after `up` rather than
 /// pinned here. Pinning it raced anything else holding the fixed port.
-fn base_url() -> Result<String, String> {
+///
+/// A runner whose docker cannot publish ports (no iptables in the container)
+/// returns an address that refuses every connection while the router inside
+/// answers fine, so the container's own bridge IP is offered as a second
+/// candidate: it needs no port publishing at all, only a route to the docker
+/// bridge, which the host always has.
+fn base_urls() -> Result<Vec<String>, String> {
     let printed = compose_command(&["port", "llmrouter", "8080"])
         .output()
         .map_err(|error| format!("docker compose port failed: {error}"))?;
@@ -43,7 +49,25 @@ fn base_url() -> Result<String, String> {
         .map(|(_, port)| port)
         .filter(|port| port.parse::<u16>().is_ok())
         .ok_or_else(|| format!("docker compose port printed {printed:?}"))?;
-    Ok(format!("http://127.0.0.1:{port}"))
+    let mut bases = vec![format!("http://127.0.0.1:{port}")];
+    let id = compose_command(&["ps", "-q", "llmrouter"])
+        .output()
+        .map_err(|error| format!("docker compose ps failed: {error}"))?;
+    let id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
+    if let Ok(inspect) = compose_command(&[
+        "inspect",
+        "-f",
+        "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        &id,
+    ])
+    .output()
+    {
+        let ip = String::from_utf8_lossy(&inspect.stdout).trim().to_owned();
+        if !ip.is_empty() {
+            bases.push(format!("http://{ip}:8080"));
+        }
+    }
+    Ok(bases)
 }
 
 fn docker_available() -> bool {
@@ -121,8 +145,8 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
     // context, dockerfile, target or args fails here, locally and in CI alike.
     let built = compose(&["up", "-d", "--build"]).success();
     let result = if built {
-        match base_url() {
-            Ok(base) => check_endpoints(&reqwest::Client::new(), &base).await,
+        match base_urls() {
+            Ok(bases) => check_endpoints(&reqwest::Client::new(), &bases[0], &bases).await,
             Err(reason) => Err(reason),
         }
     } else {
@@ -174,39 +198,45 @@ fn teardown_dumps_the_logs_before_it_destroys_the_stack() {
     assert_eq!(order.into_inner(), ["down"]);
 }
 
-async fn check_endpoints(client: &reqwest::Client, base: &str) -> Result<(), String> {
-    wait_for_healthz(client, base).await?;
+async fn check_endpoints(
+    client: &reqwest::Client,
+    base: &str,
+    bases: &[String],
+) -> Result<(), String> {
+    wait_for_healthz(client, bases).await?;
     check_metrics(client, base).await?;
     check_models(client, base).await
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
 /// the server builds, not merely when the port accepts a connection.
-async fn wait_for_healthz(client: &reqwest::Client, base: &str) -> Result<(), String> {
+async fn wait_for_healthz(client: &reqwest::Client, bases: &[String]) -> Result<(), String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        let attempt = client.get(format!("{base}/healthz")).send().await;
-        match attempt {
-            Ok(reply) if reply.status().is_success() => {
-                let body: Value = reply
-                    .json()
-                    .await
-                    .map_err(|error| format!("/healthz is not JSON: {error}"))?;
-                if body["status"] != "ok" {
-                    return Err(format!("/healthz status field was {}", body["status"]));
+        for base in bases {
+            let attempt = client.get(format!("{base}/healthz")).send().await;
+            match attempt {
+                Ok(reply) if reply.status().is_success() => {
+                    let body: Value = reply
+                        .json()
+                        .await
+                        .map_err(|error| format!("/healthz is not JSON: {error}"))?;
+                    if body["status"] != "ok" {
+                        return Err(format!("/healthz status field was {}", body["status"]));
+                    }
+                    if !body["channels"]["total"].is_u64() {
+                        return Err(format!("/healthz had no channel count: {body}"));
+                    }
+                    return Ok(());
                 }
-                if !body["channels"]["total"].is_u64() {
-                    return Err(format!("/healthz had no channel count: {body}"));
+                other => {
+                    if Instant::now() >= deadline {
+                        return Err(format!("/healthz never came up: {other:?}"));
+                    }
                 }
-                return Ok(());
-            }
-            other => {
-                if Instant::now() >= deadline {
-                    return Err(format!("/healthz never came up: {other:?}"));
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
