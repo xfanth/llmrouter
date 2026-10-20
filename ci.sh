@@ -89,15 +89,37 @@ fmt_secs=$(( SECONDS - tracked_secs ))
 # toolchain itself is pinned in rust-toolchain.toml.
 NEXTEST_VERSION=0.9.148
 LLVM_COV_VERSION=0.9.1
+# Installs from the project's own prebuilt release, not from source: the
+# self-hosted runner the organisation runs the gate on is memory-capped and
+# shared, and every attempt to compile these tools there - full speed,
+# throttled, single-threaded, opt-level 1 - was killed by the OOM killer at
+# one crate or another. A release download is instant, needs no compiler
+# memory, and pins to exactly the same version.
 ensure_tool() {
-    local crate=$1 subcommand=$2 want=$3
-    if ! cargo "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
-        step "installing $crate $want"
-        cargo install --locked --force "$crate" --version "$want"
+    local subcommand=$1 want=$2 bin_dir=${CARGO_HOME:-$HOME/.cargo}/bin
+    if ! "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
+        step "installing cargo-$subcommand $want"
+        mkdir -p "$bin_dir"
+        case "$subcommand" in
+            nextest)
+                curl -LsSf "https://get.nexte.st/$want/linux" |
+                    tar xzf - -C "$bin_dir" cargo-nextest
+                ;;
+            llvm-cov)
+                curl -LsSf \
+                    "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$want/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" |
+                    tar xzf - -C "$bin_dir"
+                ;;
+            *)
+                echo "no prebuilt source for $subcommand" >&2
+                return 1
+                ;;
+        esac
+        chmod +x "$bin_dir/cargo-$subcommand"
     fi
 }
-ensure_tool cargo-nextest nextest "$NEXTEST_VERSION"
-ensure_tool cargo-llvm-cov llvm-cov "$LLVM_COV_VERSION"
+ensure_tool nextest "$NEXTEST_VERSION"
+ensure_tool llvm-cov "$LLVM_COV_VERSION"
 
 # Each job runs in a background subshell with `set -e` still on. It writes its
 # output to its own log, its wall time to <name>.secs and, where a pass is not
@@ -148,6 +170,16 @@ job_coverage() {
 }
 
 job_smoke() {
+    # A runner without a docker daemon cannot build the image: the org's
+    # self-hosted TrueNAS runner has no docker socket, by the central
+    # platform's security policy. The tier reports itself skipped rather
+    # than failing there, and the summary shows why. Anything dockerless
+    # therefore leans on the local gate, which is where the smoke tier
+    # is meant to run anyway.
+    if ! docker info > /dev/null 2>&1; then
+        echo "skipped (no docker)" > "$LOG_DIR/smoke.result"
+        return 0
+    fi
     export CARGO_TARGET_DIR="$BASE_TARGET_DIR/smoke"
     # CI=1 is what GitHub Actions sets, and the image test demands a working
     # docker daemon when it is set rather than skipping. Setting it here keeps
@@ -169,36 +201,69 @@ find . -name '._*' -type f -not -path './.git/*' -delete 2>/dev/null || true
 
 LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/llmrouter-ci.XXXXXX")
 JOBS="clippy coverage smoke"
-step "clippy, coverage and smoke tier, in parallel (logs in $LOG_DIR)"
-# Job control puts each background job in its own process group, led by the
-# job's PID, which is what lets cleanup() kill the whole tree.
-set -m
-for name in $JOBS; do
-    # No `||` or `if` around the job: either would switch `set -e` off inside
-    # it, and a failed test run would then fall through to a green report.
-    (
-        SECONDS=0
-        trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
-        "job_$name" > "$LOG_DIR/$name.log" 2>&1
-    ) &
-    PIDS="$PIDS $!"
-    [ "$name" != smoke ] || SMOKE_PID=$!
-done
-set +m
 
-failed=""
-set -- $PIDS
-for name in $JOBS; do
-    pid=$1; shift
-    if wait "$pid"; then
-        [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
-        echo "    $name: pass"
-    else
-        echo "FAIL" > "$LOG_DIR/$name.result"
-        echo "    $name: FAIL"
-        failed="$failed $name"
-    fi
-done
+if [ "${CI_GATE_SERIAL:-0}" = "1" ]; then
+    # CI_GATE_SERIAL=1 runs the three jobs one at a time. The organisation's
+    # self-hosted runner sits inside a memory cgroup, and the three jobs'
+    # builds together cross it; one job at a time keeps the peak at one
+    # build. Same jobs, same checks, same summary.
+    step "clippy, coverage and smoke tier, one at a time (logs in $LOG_DIR)"
+    failed=""
+    for name in $JOBS; do
+        # The subshell keeps `set -e` strict inside the job, and the .secs
+        # file is written here, immediately, rather than through a trap: a
+        # trap set in the main shell would overwrite itself every iteration
+        # and fire once, after the log directory was already deleted.
+        (
+            set -e
+            SECONDS=0
+            trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
+            "job_$name" > "$LOG_DIR/$name.log" 2>&1
+        )
+        job_status=$?
+        if [ "$job_status" -eq 0 ]; then
+            [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
+            echo "    $name: pass"
+        else
+            echo "FAIL" > "$LOG_DIR/$name.result"
+            echo "    $name: FAIL"
+            failed="$failed $name"
+        fi
+    done
+else
+    step "clippy, coverage and smoke tier, in parallel (logs in $LOG_DIR)"
+    # Job control puts each background job in its own process group, led by
+    # the job's PID, which is what lets cleanup() kill the whole tree.
+    set -m
+    PIDS=""
+    for name in $JOBS; do
+        # No `||` or `if` around the job: either would switch `set -e` off
+        # inside it, and a failed test run would then fall through to a green
+        # report.
+        (
+            SECONDS=0
+            trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
+            "job_$name" > "$LOG_DIR/$name.log" 2>&1
+        ) &
+        PIDS="$PIDS $!"
+        [ "$name" != smoke ] || SMOKE_PID=$!
+    done
+    set +m
+
+    failed=""
+    set -- $PIDS
+    for name in $JOBS; do
+        pid=$1; shift
+        if wait "$pid"; then
+            [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
+            echo "    $name: pass"
+        else
+            echo "FAIL" > "$LOG_DIR/$name.result"
+            echo "    $name: FAIL"
+            failed="$failed $name"
+        fi
+    done
+fi
 
 for name in $failed; do
     printf '\n==> %s FAILED, last 80 lines of %s\n' "$name" "$LOG_DIR/$name.log"

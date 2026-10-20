@@ -291,7 +291,9 @@ impl Racer {
         // without touching the client's token.
         let race_cancel = cancel.child_token();
 
-        let mut excluded: Excluded = input.exclude.clone();
+        // Behind a lock so the decision window can refill without holding
+        // a mutable borrow across its await.
+        let excluded = std::sync::RwLock::new(input.exclude.clone());
         let mut last_error: Option<String> = None;
         // Failed trials so far, which is what the N-race outcome reads at the
         // moment a winner emerges.
@@ -325,7 +327,7 @@ impl Racer {
             &mut inflight,
             &snapshot,
             &input,
-            &mut excluded,
+            &excluded,
             &race_cancel,
             fired,
             walk_started,
@@ -376,7 +378,7 @@ impl Racer {
                         &mut inflight,
                         &snapshot,
                         &input,
-                        &mut excluded,
+                        &excluded,
                         &race_cancel,
                         fired,
                         walk_started,
@@ -446,7 +448,18 @@ impl Racer {
                         // Nothing goes to the client until the window closes.
                         HedgeStrategy::Tps => {
                             match self
-                                .stream_window(ready, &snapshot, &mut inflight, &mut held, &cancel)
+                                .stream_window(
+                                    ready,
+                                    &snapshot,
+                                    &mut inflight,
+                                    &mut held,
+                                    &input,
+                                    &excluded,
+                                    &cancel,
+                                    fired,
+                                    walk_started,
+                                    width,
+                                )
                                 .await
                             {
                                 WindowOutcome::Winner(winner) => Some(winner),
@@ -481,7 +494,7 @@ impl Racer {
                             &mut inflight,
                             &snapshot,
                             &input,
-                            &mut excluded,
+                            &excluded,
                             &race_cancel,
                             fired,
                             walk_started,
@@ -557,7 +570,7 @@ impl Racer {
                         &mut inflight,
                         &snapshot,
                         &input,
-                        &mut excluded,
+                        &excluded,
                         &race_cancel,
                         fired,
                         walk_started,
@@ -589,13 +602,14 @@ impl Racer {
         inflight: &mut Trials<'a>,
         snapshot: &'a [Channel],
         input: &RaceInput,
-        excluded: &mut Excluded,
+        excluded: &std::sync::RwLock<Excluded>,
         cancel: &CancellationToken,
         fired: &'a WalkCount,
         walk_started: tokio::time::Instant,
         width: usize,
     ) {
         let copies = self.config.router.max_per_channel.max(1) as u32;
+        let excluded = &mut *excluded.write().unwrap();
         let wanted = width.max(1).saturating_sub(inflight.len());
         if wanted == 0 {
             return;
@@ -776,19 +790,37 @@ impl Racer {
     ///
     /// Trials that fail inside the window still owe their health move, so they
     /// are held like any other failure.
-    async fn stream_window<'a, F>(
-        &self,
+    #[allow(clippy::too_many_arguments)] // the refill context rides the same list
+    async fn stream_window<'a>(
+        &'a self,
         first: Box<ReadyStream>,
         channels: &'a [Channel],
-        inflight: &mut FuturesUnordered<F>,
+        inflight: &mut Trials<'a>,
         held: &mut Vec<PendingFailure<'a>>,
+        input: &RaceInput,
+        excluded: &std::sync::RwLock<Excluded>,
         cancel: &CancellationToken,
-    ) -> WindowOutcome
-    where
-        F: std::future::Future<Output = TrialOutcome<'a>>,
-    {
+        fired: &'a WalkCount,
+        walk_started: tokio::time::Instant,
+        width: usize,
+    ) -> WindowOutcome {
         let window = Duration::from_millis(self.config.router.hedge_window_ms);
-        watch_window(first, channels, inflight, held, cancel, window).await
+        // The refill the window calls on every failure, keeping the pending
+        // count full while the comparison runs. It takes the trial set as an
+        // argument: the window holds the set's borrow.
+        let refill = |trials: &mut Trials<'a>| {
+            self.top_up(
+                trials,
+                channels,
+                input,
+                excluded,
+                cancel,
+                fired,
+                walk_started,
+                width,
+            );
+        };
+        watch_window(first, channels, inflight, held, cancel, refill, window).await
     }
 
     /// Turns the picked stream into the winner the server forwards, with the
@@ -1896,17 +1928,18 @@ impl FrameCounter {
 /// now and the window runs for `window` from here. Every live stream is
 /// buffered and nothing reaches the client. Trials that fail inside the window
 /// still owe their health move, so they are held like any other failure.
-async fn watch_window<'a, F>(
+/// The window keeps the pending count full: a channel that fails inside it is
+/// replaced at once, so creating requests never pauses while the comparison
+/// runs. Alex's spec, 20 Oct 2026.
+async fn watch_window<'a>(
     first: Box<ReadyStream>,
     channels: &'a [Channel],
-    inflight: &mut FuturesUnordered<F>,
+    inflight: &mut Trials<'a>,
     held: &mut Vec<PendingFailure<'a>>,
     cancel: &CancellationToken,
+    mut refill: impl FnMut(&mut Trials<'a>),
     window: Duration,
-) -> WindowOutcome
-where
-    F: std::future::Future<Output = TrialOutcome<'a>>,
-{
+) -> WindowOutcome {
     let deadline = tokio::time::Instant::now() + window;
 
     let mut pumping = FuturesUnordered::new();
@@ -1934,11 +1967,6 @@ where
 
             _ = &mut window_closed, if !closed => closed = true,
 
-            // No top-up inside the window: a channel started with under a
-            // second to run cannot plausibly out-token one already
-            // mid-answer. A trial that dies in here shrinks the set only
-            // until the window closes, because the caller tops back up to
-            // N before the walk goes on.
             Some(outcome) = inflight.next(), if !inflight.is_empty() && !closed => {
                 match outcome {
                     // A second channel got through prefill inside the
@@ -1946,7 +1974,14 @@ where
                     TrialOutcome::WonStreaming(ready) => {
                         pumping.push(pump_until(*ready, deadline));
                     }
-                    TrialOutcome::Failed { pending: Some(pending), .. } => held.push(pending),
+                    TrialOutcome::Failed { pending: Some(pending), .. } => {
+                        held.push(pending);
+                        // Creating requests never pauses, even while the
+                        // comparison runs: replace the failure at once, so
+                        // the pending count stays full for the rest of the
+                        // window.
+                        refill(inflight);
+                    }
                     // A channel answering proves the link is up whatever
                     // the network test is still doing, and every trial in
                     // a streamed walk streams, so a buffered reply cannot
@@ -3631,6 +3666,7 @@ mod tests {
             &mut inflight,
             &mut held,
             &cancel,
+            |_| {},
             WINDOW,
         )
         .await;
@@ -3665,6 +3701,7 @@ mod tests {
             &mut inflight,
             &mut held,
             &cancel,
+            |_| {},
             WINDOW,
         )
         .await;

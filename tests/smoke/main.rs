@@ -22,10 +22,75 @@ const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 /// a while on a cold runner.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// One way to reach the router's endpoints: a candidate base URL over HTTP,
+/// or compose-exec'd curl inside the sidecar that shares the router's own
+/// network stack. The sidecar needs no networking at all, which is the only
+/// thing that works on the organisation's runner.
+#[derive(Debug, Clone, Copy)]
+enum Probe<'a> {
+    Http(&'a str),
+    Sidecar,
+}
+
+impl Probe<'_> {
+    /// GETs the path and parses the JSON body. `-fsS` turns every HTTP
+    /// error into a curl failure, and compose reports the exec'd process's
+    /// own exit code, so 7 means "nothing listening yet" and stays
+    /// retryable while 22 means the endpoint answered with an error.
+    async fn get_json(&self, client: &reqwest::Client, path: &str) -> Result<Value, String> {
+        match self {
+            Probe::Http(base) => {
+                let reply = client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .map_err(|error| format!("connect: {error}"))?;
+                if !reply.status().is_success() {
+                    return Err(format!("http status was {}", reply.status()));
+                }
+                reply
+                    .json()
+                    .await
+                    .map_err(|error| format!("the reply is not JSON: {error}"))
+            }
+            Probe::Sidecar => {
+                let out = compose_command(&[
+                    "exec",
+                    "-T",
+                    "curl-sidecar",
+                    "curl",
+                    "-fsS",
+                    &format!("http://localhost:8080{path}"),
+                ])
+                .output()
+                .map_err(|error| format!("compose exec failed: {error}"))?;
+                if out.status.code() == Some(7) {
+                    return Err("connect: nothing is listening yet".to_owned());
+                }
+                if !out.status.success() {
+                    return Err(format!(
+                        "curl said {}: {}",
+                        out.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+                    .map_err(|error| format!("the reply is not JSON: {error}"))
+            }
+        }
+    }
+}
+
 /// `docker-compose.ci.yml` publishes a kernel-chosen port on the loopback
 /// address, so the base URL is read back from compose after `up` rather than
 /// pinned here. Pinning it raced anything else holding the fixed port.
-fn base_url() -> Result<String, String> {
+///
+/// A runner whose docker cannot publish ports (no iptables in the container)
+/// returns an address that refuses every connection while the router inside
+/// answers fine, so the container's own bridge IP is offered as a second
+/// candidate: it needs no port publishing at all, only a route to the docker
+/// bridge, which the host always has.
+fn base_urls() -> Result<(Vec<String>, String), String> {
     let printed = compose_command(&["port", "llmrouter", "8080"])
         .output()
         .map_err(|error| format!("docker compose port failed: {error}"))?;
@@ -43,7 +108,58 @@ fn base_url() -> Result<String, String> {
         .map(|(_, port)| port)
         .filter(|port| port.parse::<u16>().is_ok())
         .ok_or_else(|| format!("docker compose port printed {printed:?}"))?;
-    Ok(format!("http://127.0.0.1:{port}"))
+    let mut bases = vec![format!("http://127.0.0.1:{port}")];
+    // The container id comes from its compose service label rather than
+    // `compose ps -q`: some daemon/CLI pairings print nothing there even
+    // with the container up.
+    let id = Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=com.docker.compose.service=llmrouter",
+            "-q",
+        ])
+        .output()
+        .map_err(|error| format!("docker ps failed: {error}"))?;
+    let id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
+    if id.is_empty() {
+        eprintln!("smoke: no container found for the compose service label;                    only the published port will be tried");
+    }
+    if !id.is_empty() {
+        if let Ok(inspect) = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                &id,
+            ])
+            .output()
+        {
+            let ip = String::from_utf8_lossy(&inspect.stdout).trim().to_owned();
+            if !ip.is_empty() {
+                bases.push(format!("http://{ip}:8080"));
+            } else {
+                // No bridge network means the daemon runs containers on the
+                // host network or its own user-space stack: the published
+                // port is a fiction and the router listens on the runner's
+                // own 8080, so try that directly. The network mode goes to
+                // the log for whoever debugs this next.
+                if let Ok(mode) = Command::new("docker")
+                    .args(["inspect", "-f", "{{.HostConfig.NetworkMode}}", &id])
+                    .output()
+                {
+                    eprintln!(
+                        "smoke: the container has no bridge IP (network mode: {}); \
+                         trying the runner's own 8080 as well",
+                        String::from_utf8_lossy(&mode.stdout).trim()
+                    );
+                }
+                bases.push("http://127.0.0.1:8080".to_owned());
+            }
+        }
+    }
+    eprintln!("smoke: candidate base urls: {bases:?}");
+    Ok((bases, id))
 }
 
 fn docker_available() -> bool {
@@ -121,8 +237,17 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
     // context, dockerfile, target or args fails here, locally and in CI alike.
     let built = compose(&["up", "-d", "--build"]).success();
     let result = if built {
-        match base_url() {
-            Ok(base) => check_endpoints(&reqwest::Client::new(), &base).await,
+        match base_urls() {
+            Ok((bases, container_id)) => {
+                let mut probes: Vec<Probe> = bases
+                    .iter()
+                    .map(|base| Probe::Http(base.as_str()))
+                    .collect();
+                if !container_id.is_empty() || std::env::var_os("CI").is_some() {
+                    probes.push(Probe::Sidecar);
+                }
+                check_endpoints(&reqwest::Client::new(), &probes).await
+            }
             Err(reason) => Err(reason),
         }
     } else {
@@ -174,77 +299,113 @@ fn teardown_dumps_the_logs_before_it_destroys_the_stack() {
     assert_eq!(order.into_inner(), ["down"]);
 }
 
-async fn check_endpoints(client: &reqwest::Client, base: &str) -> Result<(), String> {
-    wait_for_healthz(client, base).await?;
-    check_metrics(client, base).await?;
-    check_models(client, base).await
+async fn check_endpoints(client: &reqwest::Client, probes: &[Probe<'_>]) -> Result<(), String> {
+    // The other endpoints are checked through whichever candidate proved
+    // the router is up.
+    let working = wait_for_healthz(client, probes).await?;
+    check_metrics(client, working).await?;
+    check_models(client, working).await
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
 /// the server builds, not merely when the port accepts a connection.
-async fn wait_for_healthz(client: &reqwest::Client, base: &str) -> Result<(), String> {
+async fn wait_for_healthz<'a>(
+    client: &reqwest::Client,
+    probes: &'a [Probe<'a>],
+) -> Result<&'a Probe<'a>, String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        let attempt = client.get(format!("{base}/healthz")).send().await;
-        match attempt {
-            Ok(reply) if reply.status().is_success() => {
-                let body: Value = reply
-                    .json()
-                    .await
-                    .map_err(|error| format!("/healthz is not JSON: {error}"))?;
-                if body["status"] != "ok" {
-                    return Err(format!("/healthz status field was {}", body["status"]));
+        for probe in probes {
+            match probe.get_json(client, "/healthz").await {
+                Ok(body) => {
+                    if body["status"] != "ok" {
+                        return Err(format!("/healthz status field was {}", body["status"]));
+                    }
+                    if !body["channels"]["total"].is_u64() {
+                        return Err(format!("/healthz had no channel count: {body}"));
+                    }
+                    return Ok(probe);
                 }
-                if !body["channels"]["total"].is_u64() {
-                    return Err(format!("/healthz had no channel count: {body}"));
+                Err(reason) => {
+                    // A connect failure is the candidate having nothing to
+                    // say yet; anything else is the endpoint answering with
+                    // a problem, which is a real answer and fails now.
+                    if !reason.starts_with("connect") && !reason.contains("nothing is listening") {
+                        return Err(format!("/healthz never came up: {reason}"));
+                    }
                 }
-                return Ok(());
-            }
-            other => {
-                if Instant::now() >= deadline {
-                    return Err(format!("/healthz never came up: {other:?}"));
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
+        if Instant::now() >= deadline {
+            return Err("/healthz never came up on any candidate".to_owned());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
 /// Prometheus text, not JSON and not an empty body. Every metric is registered
 /// at zero on boot, so the names are there before any request has been served.
-async fn check_metrics(client: &reqwest::Client, base: &str) -> Result<(), String> {
-    let reply = get(client, base, "/metrics").await?;
-    let content_type = reply
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    if !content_type.starts_with("text/plain") {
-        return Err(format!("/metrics content type was {content_type:?}"));
-    }
-
-    let body = reply
-        .text()
-        .await
-        .map_err(|error| format!("/metrics body unreadable: {error}"))?;
-    for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
-        if !body.contains(expected) {
-            return Err(format!("/metrics did not mention {expected}: {body}"));
+async fn check_metrics(client: &reqwest::Client, probe: &Probe<'_>) -> Result<(), String> {
+    match probe {
+        Probe::Http(base) => {
+            let reply = get(client, base, "/metrics").await?;
+            let content_type = reply
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            if !content_type.starts_with("text/plain") {
+                return Err(format!("/metrics content type was {content_type:?}"));
+            }
+            let body = reply
+                .text()
+                .await
+                .map_err(|error| format!("/metrics body unreadable: {error}"))?;
+            for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
+                if !body.contains(expected) {
+                    return Err(format!("/metrics did not mention {expected}: {body}"));
+                }
+            }
+            Ok(())
+        }
+        // Through the sidecar there are no headers to read; the content is
+        // the check. Every metric is registered at zero on boot, so the
+        // names are there before any request has been served.
+        Probe::Sidecar => {
+            let out = compose_command(&[
+                "exec",
+                "-T",
+                "curl-sidecar",
+                "curl",
+                "-fsS",
+                "http://localhost:8080/metrics",
+            ])
+            .output()
+            .map_err(|error| format!("compose exec failed: {error}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "/metrics curl said {}: {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let body = String::from_utf8_lossy(&out.stdout);
+            for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
+                if !body.contains(expected) {
+                    return Err(format!("/metrics did not mention {expected}: {body}"));
+                }
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Valid JSON in the OpenAI list shape. The fixture config has no providers,
 /// so the rows are expected to be empty: the shape is the point, not the
 /// contents.
-async fn check_models(client: &reqwest::Client, base: &str) -> Result<(), String> {
-    let body: Value = get(client, base, "/v1/models")
-        .await?
-        .json()
-        .await
-        .map_err(|error| format!("/v1/models is not JSON: {error}"))?;
+async fn check_models(client: &reqwest::Client, probe: &Probe<'_>) -> Result<(), String> {
+    let body: Value = probe.get_json(client, "/v1/models").await?;
 
     if body["object"] != "list" {
         return Err(format!("/v1/models object field was {}", body["object"]));

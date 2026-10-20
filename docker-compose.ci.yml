@@ -35,5 +35,18 @@ services:
     ports: !override
       - "127.0.0.1::8080"
 
+  # A curl sidecar joined to the router's own network stack. On runners
+  # whose docker daemon publishes no working route to the container - the
+  # organisation's self-hosted runner behaves so - the smoke test checks the
+  # endpoints by exec-ing curl here: same network namespace as the router,
+  # nothing needed but loopback. The sleep keeps it alive for the run.
+  curl-sidecar:
+    image: curlimages/curl:latest
+    network_mode: "service:llmrouter"
+    entrypoint: ["sleep", "infinity"]
+    restart: !override "no"
+    depends_on:
+      - llmrouter
+
 volumes:
   smoke-data:
