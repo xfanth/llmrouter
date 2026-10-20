@@ -1105,3 +1105,57 @@ async fn an_in_progress_walk_escalates_its_width_over_time() {
     walk.abort();
     hang_task.abort();
 }
+
+/// A channel that fails inside the decision window is replaced at once, not
+/// when the window closes. Alex's spec: creating requests to channels never
+/// pauses while the race is being judged. The observable: the replacement
+/// channel is called, joins the comparison, and the walk ends with three
+/// attempts - the failure would leave it at two for the whole second.
+#[tokio::test]
+async fn a_failure_inside_the_decision_window_is_replaced_at_once() {
+    // The winner: three fast frames, judged fastest at the window close.
+    let winner_server = upstream(stream_body("win words here ", 3)).await;
+    // The instant failure: a 500, but 200ms late, so it lands inside the
+    // window that the winner's first token opened.
+    let late_failure =
+        upstream(ResponseTemplate::new(500).set_delay(Duration::from_millis(200))).await;
+    // The replacement: one frame, slow enough to lose the comparison.
+    let replacement = upstream(stream_body("slow ", 1)).await;
+
+    let mut channels = Vec::new();
+    let mut first = channel("winner", &winner_server.uri(), 1);
+    first.intelligence_rank = 1;
+    channels.push(first);
+    let mut failing = channel("fails-late", &late_failure.uri(), 2);
+    failing.intelligence_rank = 2;
+    channels.push(failing);
+    let mut spare = channel("replacement", &replacement.uri(), 3);
+    spare.intelligence_rank = 3;
+    channels.push(spare);
+
+    let config = RouterConfig {
+        race_width: 2,
+        race_escalation_ms: 0,
+        max_per_channel: 1,
+        spill_path: std::env::temp_dir().join("llmrouter-window-refill"),
+        ..RouterConfig::default()
+    };
+    let harness = Harness::new(config, channels, Link::Up).await;
+    let (outcome, _) = harness.run(input(true)).await;
+
+    match &outcome {
+        RaceOutcome::Streamed {
+            winner, attempts, ..
+        } => {
+            assert_eq!(winner.model_id, "winner-model", "the fastest stream wins");
+            assert_eq!(*attempts, 3, "the replacement fired inside the window");
+        }
+        other => panic!("expected a streamed win, got {}", name_of(other)),
+    }
+    // The replacement channel was actually called during the window.
+    let calls_on_replacement = calls(&replacement).await;
+    assert!(
+        calls_on_replacement >= 1,
+        "the spare channel fired during the window, not after it"
+    );
+}
