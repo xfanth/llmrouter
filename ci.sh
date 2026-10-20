@@ -210,9 +210,18 @@ if [ "${CI_GATE_SERIAL:-0}" = "1" ]; then
     step "clippy, coverage and smoke tier, one at a time (logs in $LOG_DIR)"
     failed=""
     for name in $JOBS; do
-        SECONDS=0
-        trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
-        if "job_$name" > "$LOG_DIR/$name.log" 2>&1; then
+        # The subshell keeps `set -e` strict inside the job, and the .secs
+        # file is written here, immediately, rather than through a trap: a
+        # trap set in the main shell would overwrite itself every iteration
+        # and fire once, after the log directory was already deleted.
+        (
+            set -e
+            SECONDS=0
+            trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
+            "job_$name" > "$LOG_DIR/$name.log" 2>&1
+        )
+        job_status=$?
+        if [ "$job_status" -eq 0 ]; then
             [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
             echo "    $name: pass"
         else
