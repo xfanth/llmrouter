@@ -93,12 +93,13 @@ ensure_tool() {
     local crate=$1 subcommand=$2 want=$3
     if ! cargo "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
         step "installing $crate $want"
-        # Low parallelism at every level keeps the peak memory down: a
-        # release build of nextest with every core at once was SIGKILLed by
-        # the memory-capped self-hosted runner the organisation runs the
-        # gate on. aws-lc-sys drives its own cmake and make, so cargo's job
-        # count alone does not bound it.
+        # Low parallelism and a low optimisation level keep the peak memory
+        # down: a full-speed release build of nextest was SIGKILLed by the
+        # memory-capped self-hosted runner the organisation runs the gate
+        # on - even alone, and even single-threaded. The tools are test
+        # infrastructure; a slower binary costs nothing that matters.
         CARGO_BUILD_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1 \
+            CARGO_PROFILE_RELEASE_OPT_LEVEL=1 \
             cargo install --locked --force --jobs 2 "$crate" --version "$want"
     fi
 }
