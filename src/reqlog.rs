@@ -47,6 +47,11 @@ pub struct Entry {
     pub ttft_ms: Option<u64>,
     /// Milliseconds from accepting the request to its end.
     pub total_ms: u64,
+    /// Milliseconds from the winning channel's first token to the answer's
+    /// end: the provider generating, as against the walk before it. `None`
+    /// when nothing streamed.
+    #[serde(default)]
+    pub gen_ms: Option<u64>,
     /// Output tokens per second of the winning stream over its own
     /// generation window.
     pub tps: Option<f64>,
@@ -83,6 +88,7 @@ impl Entry {
             streamed,
             attempts: 0,
             ttft_ms: None,
+            gen_ms: None,
             total_ms: 0,
             tps: None,
             tokens_in: None,
@@ -95,6 +101,13 @@ impl Entry {
     /// Cuts a payload down to the snippet cap, on character boundaries.
     pub fn snippet(text: impl AsRef<str>) -> String {
         text.as_ref().chars().take(SNIPPET_CHARS).collect()
+    }
+
+    /// The router's own token estimate for a payload size, the same
+    /// characters-divided-by-3.5 the channel filter runs on. Used when no
+    /// provider reported a count, so every row can still show a size.
+    pub fn estimate_tokens(characters: usize) -> u64 {
+        u64::from(crate::catalogue::estimate_tokens(characters))
     }
 }
 
@@ -160,6 +173,14 @@ mod tests {
         // Newest first: the last one recorded leads.
         assert_eq!(entries[0].request, format!("request {}", CAP + 9));
         assert_eq!(entries[CAP - 1].request, "request 10".to_string());
+    }
+
+    #[test]
+    fn generated_time_defaults_to_none_and_estimates_match_the_filter() {
+        let entry = Entry::finished("/v1/messages", None, false, 200, "success");
+        assert_eq!(entry.gen_ms, None);
+        // 7000 characters at 3.5 a token is 2000 tokens, matching the filter.
+        assert_eq!(Entry::estimate_tokens(7_000), 2_000);
     }
 
     #[test]

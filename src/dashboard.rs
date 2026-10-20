@@ -126,6 +126,25 @@ mod tests {
         // The request log table reads its own endpoint.
         assert!(body.contains("/metrics/requests"));
         assert!(body.contains("id=\"reqtable\""));
+        // The request table carries both payload sizes and the generation
+        // window, and the flows carry a legend and a hover tooltip.
+        assert!(
+            body.contains("Req tokens"),
+            "the table shows request tokens"
+        );
+        assert!(
+            body.contains("Resp tokens"),
+            "the table shows response tokens"
+        );
+        assert!(
+            body.contains("Gen"),
+            "the table shows the generation window"
+        );
+        assert!(body.contains("id=\"sanktip\""), "the shared tooltip exists");
+        assert!(
+            body.contains("answered flows") && body.contains("error flows"),
+            "the legend explains the ribbon colours"
+        );
         // The hedging cards explain themselves in plain words, as flows:
         // the M card splits trials by what hedging bought, the N card splits
         // walks by what the race bought.

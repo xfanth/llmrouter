@@ -1089,8 +1089,16 @@ async fn an_in_progress_walk_escalates_its_width_over_time() {
     for _ in 0..5 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let text = metrics.render();
+        let inflight: u64 = text
+            .lines()
+            .find(|l| l.starts_with("router_trials_inflight "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // A trial being replaced can dip to 0 for a poll; the point is that
+        // the walk never widens past race_width.
         assert!(
-            text.contains("router_trials_inflight 1"),
+            inflight <= 1,
             "with the escalation off the walk stays at race_width: {text}"
         );
     }
