@@ -89,22 +89,37 @@ fmt_secs=$(( SECONDS - tracked_secs ))
 # toolchain itself is pinned in rust-toolchain.toml.
 NEXTEST_VERSION=0.9.148
 LLVM_COV_VERSION=0.9.1
+# Installs from the project's own prebuilt release, not from source: the
+# self-hosted runner the organisation runs the gate on is memory-capped and
+# shared, and every attempt to compile these tools there - full speed,
+# throttled, single-threaded, opt-level 1 - was killed by the OOM killer at
+# one crate or another. A release download is instant, needs no compiler
+# memory, and pins to exactly the same version.
 ensure_tool() {
-    local crate=$1 subcommand=$2 want=$3
-    if ! cargo "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
-        step "installing $crate $want"
-        # Low parallelism and a low optimisation level keep the peak memory
-        # down: a full-speed release build of nextest was SIGKILLed by the
-        # memory-capped self-hosted runner the organisation runs the gate
-        # on - even alone, and even single-threaded. The tools are test
-        # infrastructure; a slower binary costs nothing that matters.
-        CARGO_BUILD_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=1 MAKEFLAGS=-j1 \
-            CARGO_PROFILE_RELEASE_OPT_LEVEL=1 \
-            cargo install --locked --force --jobs 2 "$crate" --version "$want"
+    local subcommand=$1 want=$2 bin_dir=${CARGO_HOME:-$HOME/.cargo}/bin
+    if ! "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
+        step "installing cargo-$subcommand $want"
+        mkdir -p "$bin_dir"
+        case "$subcommand" in
+            nextest)
+                curl -LsSf "https://get.nexte.st/$want/linux" |
+                    tar xzf - -C "$bin_dir" cargo-nextest
+                ;;
+            llvm-cov)
+                curl -LsSf \
+                    "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$want/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" |
+                    tar xzf - -C "$bin_dir"
+                ;;
+            *)
+                echo "no prebuilt source for $subcommand" >&2
+                return 1
+                ;;
+        esac
+        chmod +x "$bin_dir/cargo-$subcommand"
     fi
 }
-ensure_tool cargo-nextest nextest "$NEXTEST_VERSION"
-ensure_tool cargo-llvm-cov llvm-cov "$LLVM_COV_VERSION"
+ensure_tool nextest "$NEXTEST_VERSION"
+ensure_tool llvm-cov "$LLVM_COV_VERSION"
 
 # Each job runs in a background subshell with `set -e` still on. It writes its
 # output to its own log, its wall time to <name>.secs and, where a pass is not

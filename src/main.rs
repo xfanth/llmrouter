@@ -352,113 +352,74 @@ mod tests {
         assert_eq!(check["start_period"].as_str(), Some("10s"));
     }
 
-    /// Swatinem/rust-cache resolves "$root -> $target" by joining the two, so
-    /// an absolute target path lands on a directory that never exists and the
-    /// build output is never cached. Every run would then be a cold build
-    /// while the cache still reports a hit on the registry.
+    /// ci.yml is a thin caller of the organisation's shared Rust gate: one
+    /// job, no runners chosen here, no tooling installed here, no caching of
+    /// its own. Anything the caller adds beyond the call is a second opinion
+    /// that drifts from the platform.
     #[test]
-    fn the_ci_workflow_keeps_the_target_dir_inside_the_checkout() {
+    fn the_ci_workflow_is_a_thin_caller_of_the_shared_gate() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
             .expect(".github/workflows/ci.yml is missing");
         let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
-
-        if let Some(dir) = ci["env"]["CARGO_TARGET_DIR"].as_str() {
+        let jobs = ci["jobs"].as_mapping().expect("jobs");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the caller carries exactly one job: the shared gate"
+        );
+        for (_, job) in jobs {
+            let uses = job["uses"]
+                .as_str()
+                .expect("the job is a call of the shared workflow");
             assert!(
-                !dir.starts_with('/'),
-                "CARGO_TARGET_DIR must be relative to the checkout: {dir}"
+                uses.starts_with("xfanth/.github/.github/workflows/rust-quality.yml@"),
+                "the caller calls the organisation's Rust gate: {uses}"
+            );
+            assert!(
+                job.get("steps").is_none() && job.get("runs-on").is_none(),
+                "the caller adds no steps and picks no runner"
             );
         }
-
-        let mut seen = 0;
-        for (name, job) in ci["jobs"].as_mapping().expect("jobs") {
-            for step in job["steps"].as_sequence().expect("steps") {
-                if !step["uses"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with("Swatinem/rust-cache@"))
-                {
-                    continue;
-                }
-                let spec = step["with"]["workspaces"]
-                    .as_str()
-                    .expect("the cache step must name a workspace");
-                let target = spec.split("->").nth(1).expect("workspaces needs a target");
-                assert!(
-                    !target.trim().starts_with('/'),
-                    "job {name:?} caches an absolute target dir, which caches nothing: {spec}"
-                );
-                seen += 1;
-            }
+        for leftover in [
+            "taiki-e/install-action",
+            "Swatinem/rust-cache",
+            "runs-on: ubuntu-latest",
+        ] {
+            assert!(
+                !text.contains(leftover),
+                "the caller still carries a piece of the old workflow: {leftover}"
+            );
         }
-        assert_eq!(
-            seen, 3,
-            "clippy, coverage and smoke should each cache the build"
-        );
     }
 
-    /// The tests read files from all over the repo (DESIGN.md, .gitignore,
-    /// build_providers.py, the CSVs), so an allow-list paths filter lets a
-    /// change to one of them skip the tests and go green. The filter must be a
-    /// deny-list, and nothing it skips may be named anywhere in src/ or tests/.
+    /// Every test reads files from all over the repo, so nothing may gate
+    /// CI on changed paths: a filter that skips a run is a filter that
+    /// eventually skips a broken change. The caller runs on every push and
+    /// every pull request, and the shared gate runs everything.
     #[test]
-    fn the_ci_paths_filter_skips_only_files_nothing_reads() {
+    fn the_ci_workflow_runs_on_every_push_and_pull_request() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
             .expect(".github/workflows/ci.yml is missing");
-        let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
-        let with = &ci["jobs"]["changes"]["steps"][1]["with"];
-        assert_eq!(with["predicate-quantifier"].as_str(), Some("every"));
-        let filters: serde_yaml::Value =
-            serde_yaml::from_str(with["filters"].as_str().expect("filters"))
-                .expect("filters parse");
-        let rust: Vec<&str> = filters["rust"]
-            .as_sequence()
-            .expect("a rust filter")
-            .iter()
-            .map(|p| p.as_str().expect("a pattern"))
-            .collect();
-        assert_eq!(
-            rust.first(),
-            Some(&"**"),
-            "the filter must start from every file"
+        assert!(
+            text.contains("pull_request:")
+                && text.contains("push:")
+                && text.contains("workflow_dispatch:"),
+            "the caller triggers on pull requests, master pushes and manual runs: {text}"
         );
-
-        let mut sources = String::new();
-        let mut dirs = vec![root.join("src"), root.join("tests")];
-        while let Some(dir) = dirs.pop() {
-            for entry in std::fs::read_dir(&dir).expect("readable") {
-                let path = entry.expect("a directory entry").path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    sources += &std::fs::read_to_string(&path).unwrap_or_default();
-                }
-            }
-        }
-        for skipped in &rust[1..] {
-            let path = skipped
-                .strip_prefix('!')
-                .expect("only exclusions after '**'");
-            let name = path.rsplit('/').next().expect("a file name");
-            // git reads .gitignore itself (check-ignore, ls-files), so no test
-            // names it and the grep below cannot see that it is an input.
-            assert!(
-                !name.starts_with(".git"),
-                "the paths filter skips {path}, but the git tests read it"
-            );
-            assert!(
-                !sources.contains(&format!("\"{name}\""))
-                    && !sources.contains(&format!("/{name}\"")),
-                "the paths filter skips {path}, but the code reads it"
-            );
-        }
+        assert!(
+            !text.contains("paths:"),
+            "the caller must not gate the run on changed paths"
+        );
     }
 
-    /// ci.sh and ci.yml install the test runner and the coverage
-    /// instrumenter separately, so a bump in one file quietly changes what a
-    /// local pass proves about CI. The two lists must stay identical.
+    /// ci.sh pins and installs the test runner and the coverage instrumenter
+    /// itself, from their projects' prebuilt releases. ci.yml is a caller of
+    /// the organisation's shared gate and installs nothing: a second
+    /// installer there would drift from ci.sh's pins.
     #[test]
-    fn the_test_tools_are_pinned_to_the_same_versions_in_ci_sh_and_ci_yml() {
+    fn the_test_tools_are_pinned_in_ci_sh_and_ci_yml_installs_nothing() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let sh = std::fs::read_to_string(root.join("ci.sh")).expect("ci.sh is missing");
         let version = |name: &str| {
@@ -468,42 +429,24 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        let mut want = vec![
-            format!("cargo-nextest@{}", version("NEXTEST_VERSION")),
-            format!("cargo-llvm-cov@{}", version("LLVM_COV_VERSION")),
-        ];
-        want.sort();
+        let nextest = version("NEXTEST_VERSION");
+        let llvm_cov = version("LLVM_COV_VERSION");
+        // The pins are real version numbers, not placeholders.
+        for version in [&nextest, &llvm_cov] {
+            let digits = version.chars().filter(|c| c.is_ascii_digit()).count();
+            assert!(digits >= 3, "a plausible pinned version, got {version}");
+        }
 
         let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
             .expect(".github/workflows/ci.yml is missing");
-        let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
-        let mut seen = 0;
-        for (name, job) in ci["jobs"].as_mapping().expect("jobs") {
-            let Some(steps) = job["steps"].as_sequence() else {
-                continue;
-            };
-            for step in steps {
-                if !step["uses"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with("taiki-e/install-action@"))
-                {
-                    continue;
-                }
-                let mut tools: Vec<String> = step["with"]["tool"]
-                    .as_str()
-                    .expect("the install step must name its tools")
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .collect();
-                tools.sort();
-                assert_eq!(
-                    tools, want,
-                    "job {name:?} installs tool versions that ci.sh does not pin"
-                );
-                seen += 1;
-            }
-        }
-        assert_eq!(seen, 1, "ci.yml must install the pinned test tools once");
+        assert!(
+            !text.contains("taiki-e/install-action"),
+            "ci.yml must not install the test tools; ci.sh alone does"
+        );
+        assert!(
+            text.contains("xfanth/.github/.github/workflows/rust-quality.yml@"),
+            "ci.yml calls the organisation's shared Rust gate"
+        );
     }
 
     /// Scratch directories named after the process id collide between runs: a
