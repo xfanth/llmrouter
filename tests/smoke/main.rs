@@ -50,23 +50,41 @@ fn base_urls() -> Result<Vec<String>, String> {
         .filter(|port| port.parse::<u16>().is_ok())
         .ok_or_else(|| format!("docker compose port printed {printed:?}"))?;
     let mut bases = vec![format!("http://127.0.0.1:{port}")];
-    let id = compose_command(&["ps", "-q", "llmrouter"])
+    // The container id comes from its compose service label rather than
+    // `compose ps -q`: some daemon/CLI pairings print nothing there even
+    // with the container up.
+    let id = Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=com.docker.compose.service=llmrouter",
+            "-q",
+        ])
         .output()
-        .map_err(|error| format!("docker compose ps failed: {error}"))?;
+        .map_err(|error| format!("docker ps failed: {error}"))?;
     let id = String::from_utf8_lossy(&id.stdout).trim().to_owned();
-    if let Ok(inspect) = compose_command(&[
-        "inspect",
-        "-f",
-        "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-        &id,
-    ])
-    .output()
-    {
-        let ip = String::from_utf8_lossy(&inspect.stdout).trim().to_owned();
-        if !ip.is_empty() {
-            bases.push(format!("http://{ip}:8080"));
+    if id.is_empty() {
+        eprintln!("smoke: no container found for the compose service label;                    only the published port will be tried");
+    }
+    if !id.is_empty() {
+        if let Ok(inspect) = Command::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                &id,
+            ])
+            .output()
+        {
+            let ip = String::from_utf8_lossy(&inspect.stdout).trim().to_owned();
+            if !ip.is_empty() {
+                bases.push(format!("http://{ip}:8080"));
+            } else {
+                eprintln!("smoke: the container has no bridge IP to fall back to");
+            }
         }
     }
+    eprintln!("smoke: candidate base urls: {bases:?}");
     Ok(bases)
 }
 
