@@ -93,7 +93,10 @@ ensure_tool() {
     local crate=$1 subcommand=$2 want=$3
     if ! cargo "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
         step "installing $crate $want"
-        cargo install --locked --force "$crate" --version "$want"
+        # A low job count keeps the peak memory down: a release build of
+        # nextest with every core at once was SIGKILLed by the memory-capped
+        # self-hosted runner the organisation runs the gate on.
+        cargo install --locked --force --jobs 2 "$crate" --version "$want"
     fi
 }
 ensure_tool cargo-nextest nextest "$NEXTEST_VERSION"
