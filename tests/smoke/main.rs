@@ -31,7 +31,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// answers fine, so the container's own bridge IP is offered as a second
 /// candidate: it needs no port publishing at all, only a route to the docker
 /// bridge, which the host always has.
-fn base_urls() -> Result<Vec<String>, String> {
+fn base_urls() -> Result<(Vec<String>, String), String> {
     let printed = compose_command(&["port", "llmrouter", "8080"])
         .output()
         .map_err(|error| format!("docker compose port failed: {error}"))?;
@@ -100,7 +100,7 @@ fn base_urls() -> Result<Vec<String>, String> {
         }
     }
     eprintln!("smoke: candidate base urls: {bases:?}");
-    Ok(bases)
+    Ok((bases, id))
 }
 
 fn docker_available() -> bool {
@@ -179,7 +179,9 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
     let built = compose(&["up", "-d", "--build"]).success();
     let result = if built {
         match base_urls() {
-            Ok(bases) => check_endpoints(&reqwest::Client::new(), &bases[0], &bases).await,
+            Ok((bases, container_id)) => {
+                check_endpoints(&reqwest::Client::new(), &bases[0], &bases, &container_id).await
+            }
             Err(reason) => Err(reason),
         }
     } else {
@@ -235,16 +237,29 @@ async fn check_endpoints(
     client: &reqwest::Client,
     base: &str,
     bases: &[String],
+    container_id: &str,
 ) -> Result<(), String> {
-    wait_for_healthz(client, bases).await?;
+    wait_for_healthz(client, bases, container_id).await?;
     check_metrics(client, base).await?;
     check_models(client, base).await
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
 /// the server builds, not merely when the port accepts a connection.
-async fn wait_for_healthz(client: &reqwest::Client, bases: &[String]) -> Result<(), String> {
+async fn wait_for_healthz(
+    client: &reqwest::Client,
+    bases: &[String],
+    container_id: &str,
+) -> Result<(), String> {
     let deadline = Instant::now() + READY_TIMEOUT;
+    // One pull up front, so the per-poll sidecar runs from the local image.
+    // A failed pull only disables the sidecar probe; the HTTP candidates
+    // still run.
+    if !container_id.is_empty() {
+        let _ = Command::new("docker")
+            .args(["pull", "curlimages/curl:latest"])
+            .output();
+    }
     loop {
         for base in bases {
             let attempt = client.get(format!("{base}/healthz")).send().await;
@@ -265,6 +280,46 @@ async fn wait_for_healthz(client: &reqwest::Client, bases: &[String]) -> Result<
                 other => {
                     if Instant::now() >= deadline {
                         return Err(format!("/healthz never came up: {other:?}"));
+                    }
+                }
+            }
+        }
+        // The network-namespace probe: a sidecar joined to the router's own
+        // stack, for daemons whose containers have no working network path
+        // from the runner at all - this runner's does not.
+        if !container_id.is_empty() {
+            let probe = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    &format!("--network=container:{container_id}"),
+                    "curlimages/curl:latest",
+                    "-fsS",
+                    "http://127.0.0.1:8080/healthz",
+                ])
+                .output();
+            match probe {
+                Ok(out) if out.status.success() => {
+                    let body = String::from_utf8_lossy(&out.stdout).to_owned();
+                    let parsed: Value = serde_json::from_str(body.trim())
+                        .map_err(|error| format!("/healthz is not JSON: {error}"))?;
+                    if parsed["channels"]["total"].is_u64() {
+                        return Ok(());
+                    }
+                    return Err(format!("/healthz had no channel count: {parsed}"));
+                }
+                Ok(out) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "/healthz never came up through any of the candidates; the \
+                             sidecar probe said: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        return Err(format!("/healthz never came up: {error}"));
                     }
                 }
             }
