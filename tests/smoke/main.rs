@@ -22,6 +22,65 @@ const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 /// a while on a cold runner.
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// One way to reach the router's endpoints: a candidate base URL over HTTP,
+/// or compose-exec'd curl inside the sidecar that shares the router's own
+/// network stack. The sidecar needs no networking at all, which is the only
+/// thing that works on the organisation's runner.
+#[derive(Debug, Clone, Copy)]
+enum Probe<'a> {
+    Http(&'a str),
+    Sidecar,
+}
+
+impl Probe<'_> {
+    /// GETs the path and parses the JSON body. `-fsS` turns every HTTP
+    /// error into a curl failure, and compose reports the exec'd process's
+    /// own exit code, so 7 means "nothing listening yet" and stays
+    /// retryable while 22 means the endpoint answered with an error.
+    async fn get_json(&self, client: &reqwest::Client, path: &str) -> Result<Value, String> {
+        match self {
+            Probe::Http(base) => {
+                let reply = client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .map_err(|error| format!("connect: {error}"))?;
+                if !reply.status().is_success() {
+                    return Err(format!("http status was {}", reply.status()));
+                }
+                reply
+                    .json()
+                    .await
+                    .map_err(|error| format!("the reply is not JSON: {error}"))
+            }
+            Probe::Sidecar => {
+                let out = compose_command(&[
+                    "exec",
+                    "-T",
+                    "curl-sidecar",
+                    "curl",
+                    "-fsS",
+                    &format!("http://localhost:8080{path}"),
+                ])
+                .output()
+                .map_err(|error| format!("compose exec failed: {error}"))?;
+                if out.status.code() == Some(7) {
+                    return Err("connect: nothing is listening yet".to_owned());
+                }
+                if !out.status.success() {
+                    return Err(format!(
+                        "curl said {}: {}",
+                        out.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+                    .map_err(|error| format!("the reply is not JSON: {error}"))
+            }
+        }
+    }
+}
+
 /// `docker-compose.ci.yml` publishes a kernel-chosen port on the loopback
 /// address, so the base URL is read back from compose after `up` rather than
 /// pinned here. Pinning it raced anything else holding the fixed port.
@@ -180,7 +239,15 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
     let result = if built {
         match base_urls() {
             Ok((bases, container_id)) => {
-                check_endpoints(&reqwest::Client::new(), &bases[0], &bases, &container_id).await
+                let mut probes: Vec<Probe> = bases
+                    .iter()
+                    .map(|base| Probe::Http(base.as_str()))
+                    .collect();
+                if !container_id.is_empty() || std::env::var_os("CI").is_some() {
+                    probes.push(Probe::Sidecar);
+                }
+                let first = bases.first().cloned().unwrap_or_default();
+                check_endpoints(&reqwest::Client::new(), &first, &probes).await
             }
             Err(reason) => Err(reason),
         }
@@ -236,39 +303,21 @@ fn teardown_dumps_the_logs_before_it_destroys_the_stack() {
 async fn check_endpoints(
     client: &reqwest::Client,
     base: &str,
-    bases: &[String],
-    container_id: &str,
+    probes: &[Probe<'_>],
 ) -> Result<(), String> {
-    wait_for_healthz(client, bases, container_id).await?;
-    check_metrics(client, base).await?;
-    check_models(client, base).await
+    wait_for_healthz(client, probes).await?;
+    check_metrics(client, base, &probes[0]).await?;
+    check_models(client, &probes[0]).await
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
 /// the server builds, not merely when the port accepts a connection.
-async fn wait_for_healthz(
-    client: &reqwest::Client,
-    bases: &[String],
-    container_id: &str,
-) -> Result<(), String> {
+async fn wait_for_healthz(client: &reqwest::Client, probes: &[Probe<'_>]) -> Result<(), String> {
     let deadline = Instant::now() + READY_TIMEOUT;
-    // One pull up front, so the per-poll sidecar runs from the local image.
-    // A failed pull only disables the sidecar probe; the HTTP candidates
-    // still run.
-    if !container_id.is_empty() {
-        let _ = Command::new("docker")
-            .args(["pull", "curlimages/curl:latest"])
-            .output();
-    }
     loop {
-        for base in bases {
-            let attempt = client.get(format!("{base}/healthz")).send().await;
-            match attempt {
-                Ok(reply) if reply.status().is_success() => {
-                    let body: Value = reply
-                        .json()
-                        .await
-                        .map_err(|error| format!("/healthz is not JSON: {error}"))?;
+        for probe in probes {
+            match probe.get_json(client, "/healthz").await {
+                Ok(body) => {
                     if body["status"] != "ok" {
                         return Err(format!("/healthz status field was {}", body["status"]));
                     }
@@ -277,52 +326,18 @@ async fn wait_for_healthz(
                     }
                     return Ok(());
                 }
-                other => {
-                    if Instant::now() >= deadline {
-                        return Err(format!("/healthz never came up: {other:?}"));
+                Err(reason) => {
+                    // A connect failure is the candidate having nothing to
+                    // say yet; anything else is the endpoint answering with
+                    // a problem, which is a real answer and fails now.
+                    if !reason.starts_with("connect") && !reason.contains("nothing is listening") {
+                        return Err(format!("/healthz never came up: {reason}"));
                     }
                 }
             }
         }
-        // The network-namespace probe: a sidecar joined to the router's own
-        // stack, for daemons whose containers have no working network path
-        // from the runner at all - this runner's does not.
-        if !container_id.is_empty() {
-            let probe = Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    &format!("--network=container:{container_id}"),
-                    "curlimages/curl:latest",
-                    "-fsS",
-                    "http://127.0.0.1:8080/healthz",
-                ])
-                .output();
-            match probe {
-                Ok(out) if out.status.success() => {
-                    let body = String::from_utf8_lossy(&out.stdout).into_owned();
-                    let parsed: Value = serde_json::from_str(body.trim())
-                        .map_err(|error| format!("/healthz is not JSON: {error}"))?;
-                    if parsed["channels"]["total"].is_u64() {
-                        return Ok(());
-                    }
-                    return Err(format!("/healthz had no channel count: {parsed}"));
-                }
-                Ok(out) => {
-                    if Instant::now() >= deadline {
-                        return Err(format!(
-                            "/healthz never came up through any of the candidates; the \
-                             sidecar probe said: {}",
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        ));
-                    }
-                }
-                Err(error) => {
-                    if Instant::now() >= deadline {
-                        return Err(format!("/healthz never came up: {error}"));
-                    }
-                }
-            }
+        if Instant::now() >= deadline {
+            return Err("/healthz never came up on any candidate".to_owned());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -330,39 +345,71 @@ async fn wait_for_healthz(
 
 /// Prometheus text, not JSON and not an empty body. Every metric is registered
 /// at zero on boot, so the names are there before any request has been served.
-async fn check_metrics(client: &reqwest::Client, base: &str) -> Result<(), String> {
-    let reply = get(client, base, "/metrics").await?;
-    let content_type = reply
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    if !content_type.starts_with("text/plain") {
-        return Err(format!("/metrics content type was {content_type:?}"));
-    }
-
-    let body = reply
-        .text()
-        .await
-        .map_err(|error| format!("/metrics body unreadable: {error}"))?;
-    for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
-        if !body.contains(expected) {
-            return Err(format!("/metrics did not mention {expected}: {body}"));
+async fn check_metrics(
+    client: &reqwest::Client,
+    base: &str,
+    probe: &Probe<'_>,
+) -> Result<(), String> {
+    match probe {
+        Probe::Http(_) => {
+            let reply = get(client, base, "/metrics").await?;
+            let content_type = reply
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            if !content_type.starts_with("text/plain") {
+                return Err(format!("/metrics content type was {content_type:?}"));
+            }
+            let body = reply
+                .text()
+                .await
+                .map_err(|error| format!("/metrics body unreadable: {error}"))?;
+            for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
+                if !body.contains(expected) {
+                    return Err(format!("/metrics did not mention {expected}: {body}"));
+                }
+            }
+            Ok(())
+        }
+        // Through the sidecar there are no headers to read; the content is
+        // the check. Every metric is registered at zero on boot, so the
+        // names are there before any request has been served.
+        Probe::Sidecar => {
+            let out = compose_command(&[
+                "exec",
+                "-T",
+                "curl-sidecar",
+                "curl",
+                "-fsS",
+                "http://localhost:8080/metrics",
+            ])
+            .output()
+            .map_err(|error| format!("compose exec failed: {error}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "/metrics curl said {}: {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let body = String::from_utf8_lossy(&out.stdout);
+            for expected in ["# HELP router_requests_total", "router_rss_bytes"] {
+                if !body.contains(expected) {
+                    return Err(format!("/metrics did not mention {expected}: {body}"));
+                }
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 /// Valid JSON in the OpenAI list shape. The fixture config has no providers,
 /// so the rows are expected to be empty: the shape is the point, not the
 /// contents.
-async fn check_models(client: &reqwest::Client, base: &str) -> Result<(), String> {
-    let body: Value = get(client, base, "/v1/models")
-        .await?
-        .json()
-        .await
-        .map_err(|error| format!("/v1/models is not JSON: {error}"))?;
+async fn check_models(client: &reqwest::Client, probe: &Probe<'_>) -> Result<(), String> {
+    let body: Value = probe.get_json(client, "/v1/models").await?;
 
     if body["object"] != "list" {
         return Err(format!("/v1/models object field was {}", body["object"]));
