@@ -246,8 +246,7 @@ async fn the_built_image_starts_and_serves_its_read_only_endpoints() {
                 if !container_id.is_empty() || std::env::var_os("CI").is_some() {
                     probes.push(Probe::Sidecar);
                 }
-                let first = bases.first().cloned().unwrap_or_default();
-                check_endpoints(&reqwest::Client::new(), &first, &probes).await
+                check_endpoints(&reqwest::Client::new(), &probes).await
             }
             Err(reason) => Err(reason),
         }
@@ -300,19 +299,20 @@ fn teardown_dumps_the_logs_before_it_destroys_the_stack() {
     assert_eq!(order.into_inner(), ["down"]);
 }
 
-async fn check_endpoints(
-    client: &reqwest::Client,
-    base: &str,
-    probes: &[Probe<'_>],
-) -> Result<(), String> {
-    wait_for_healthz(client, probes).await?;
-    check_metrics(client, base, &probes[0]).await?;
-    check_models(client, &probes[0]).await
+async fn check_endpoints(client: &reqwest::Client, probes: &[Probe<'_>]) -> Result<(), String> {
+    // The other endpoints are checked through whichever candidate proved
+    // the router is up.
+    let working = wait_for_healthz(client, probes).await?;
+    check_metrics(client, working).await?;
+    check_models(client, working).await
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
 /// the server builds, not merely when the port accepts a connection.
-async fn wait_for_healthz(client: &reqwest::Client, probes: &[Probe<'_>]) -> Result<(), String> {
+async fn wait_for_healthz<'a>(
+    client: &reqwest::Client,
+    probes: &'a [Probe<'a>],
+) -> Result<&'a Probe<'a>, String> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         for probe in probes {
@@ -324,7 +324,7 @@ async fn wait_for_healthz(client: &reqwest::Client, probes: &[Probe<'_>]) -> Res
                     if !body["channels"]["total"].is_u64() {
                         return Err(format!("/healthz had no channel count: {body}"));
                     }
-                    return Ok(());
+                    return Ok(probe);
                 }
                 Err(reason) => {
                     // A connect failure is the candidate having nothing to
@@ -345,13 +345,9 @@ async fn wait_for_healthz(client: &reqwest::Client, probes: &[Probe<'_>]) -> Res
 
 /// Prometheus text, not JSON and not an empty body. Every metric is registered
 /// at zero on boot, so the names are there before any request has been served.
-async fn check_metrics(
-    client: &reqwest::Client,
-    base: &str,
-    probe: &Probe<'_>,
-) -> Result<(), String> {
+async fn check_metrics(client: &reqwest::Client, probe: &Probe<'_>) -> Result<(), String> {
     match probe {
-        Probe::Http(_) => {
+        Probe::Http(base) => {
             let reply = get(client, base, "/metrics").await?;
             let content_type = reply
                 .headers()
