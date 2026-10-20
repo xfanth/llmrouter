@@ -80,7 +80,22 @@ fn base_urls() -> Result<Vec<String>, String> {
             if !ip.is_empty() {
                 bases.push(format!("http://{ip}:8080"));
             } else {
-                eprintln!("smoke: the container has no bridge IP to fall back to");
+                // No bridge network means the daemon runs containers on the
+                // host network or its own user-space stack: the published
+                // port is a fiction and the router listens on the runner's
+                // own 8080, so try that directly. The network mode goes to
+                // the log for whoever debugs this next.
+                if let Ok(mode) = Command::new("docker")
+                    .args(["inspect", "-f", "{{.HostConfig.NetworkMode}}", &id])
+                    .output()
+                {
+                    eprintln!(
+                        "smoke: the container has no bridge IP (network mode: {}); \
+                         trying the runner's own 8080 as well",
+                        String::from_utf8_lossy(&mode.stdout).trim()
+                    );
+                }
+                bases.push("http://127.0.0.1:8080".to_owned());
             }
         }
     }
