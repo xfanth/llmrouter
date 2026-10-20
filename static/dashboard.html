@@ -118,7 +118,25 @@ footer {
   gap: 14px;
 }
 footer .links { margin-left: auto; display: flex; gap: 14px; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 4px 0 6px; color: var(--muted); font-size: 11px; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+#sanktip {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text);
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+}
+#sanktip b { color: var(--accent); }
 </style>
+<div id="sanktip"></div>
 </head>
 <body>
 <header>
@@ -140,7 +158,9 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   <div class="card"><h3>Memory</h3><div class="sub">resident set and cache, MB</div><canvas id="hist_mem"></canvas></div>
 </div>
 <div class="charts">
-  <div class="card wide"><h3>Request flow</h3><div class="sub" id="flow_sub">requests, split by where the answer came from and how they ended</div><div id="flow"></div></div>
+  <div class="card wide"><h3>Request flow</h3><div class="sub" id="flow_sub">requests, split by where the answer came from and how they ended</div>
+    <div class="legend"><span><span class="sw" style="background:#4fc3f7"></span>routing flows</span><span><span class="sw" style="background:#56d364"></span>answered flows</span><span><span class="sw" style="background:#f85149"></span>error flows</span><span>hover a ribbon or a box for its count</span></div>
+    <div id="flow"></div></div>
   <div class="card"><h3>Cache lookups</h3><div class="sub">cumulative</div><canvas id="snap_lookups"></canvas></div>
   <div class="card"><h3>Hedge wins by copy index</h3><div class="sub">stacked per provider; copy 0 is the first call a channel makes</div><canvas id="snap_hedgewins"></canvas></div>
   <div class="card"><h3>Latency histogram by stage</h3><div class="sub">count per bucket, seconds</div><canvas id="snap_lathist"></canvas></div>
@@ -156,11 +176,13 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   <div class="card wide">
     <h3>Per-channel hedging (M)</h3>
     <div class="sub" id="hedge_m_sub">A hedge copy is a second call to the same channel, fired 1ms after the first.</div>
+    <div class="legend"><span><span class="sw" style="background:#4fc3f7"></span>routing flows</span><span><span class="sw" style="background:#56d364"></span>trial won</span><span><span class="sw" style="background:#f85149"></span>trial failed or cancelled</span><span>hover a ribbon or a box for its count</span></div>
     <div id="hedge_m_flow"></div>
   </div>
   <div class="card wide">
     <h3>Router-wide race (N)</h3>
     <div class="sub" id="race_n_sub">The router fires several channels at once and replaces failures as they land.</div>
+    <div class="legend"><span><span class="sw" style="background:#4fc3f7"></span>routing flows</span><span><span class="sw" style="background:#56d364"></span>walk answered</span><span><span class="sw" style="background:#f85149"></span>walk failed</span><span>hover a ribbon or a box for its count</span></div>
     <div id="race_n_flow"></div>
   </div>
 </div>
@@ -185,7 +207,7 @@ sec="output, one point per five-second window"></div><canvas id="hist_tps"></can
   <table id="reqtable">
     <thead><tr>
       <th>Time</th><th>Client</th><th>Endpoint</th><th>Model</th><th>Provider</th><th>Status</th><th>Outcome</th>
-      <th>TTFT</th><th>Total</th><th>tok/s</th><th>Tokens in/out</th><th>Attempts</th><th>Request</th><th>Answer</th>
+      <th>TTFT</th><th>Gen</th><th>Total</th><th>tok/s</th><th>Req tokens</th><th>Resp tokens</th><th>Attempts</th><th>Request</th><th>Answer</th>
     </tr></thead>
     <tbody></tbody>
   </table>
@@ -642,21 +664,24 @@ function drawSankey(id, links) {
     console.error("sankey layout failed", err);
     return;
   }
+  const isBad = (name) => /error|failed|cancelled|no channel|no network|too_large|not_admitted/i.test(name);
+  const isGood = (name) => /answered|won/i.test(name);
+  const colorOf = (name) => (isBad(name) ? "#f85149" : isGood(name) ? "#56d364" : "#4fc3f7");
   const parts = [];
   for (const l of graph.links) {
     const d = d3.sankeyLinkHorizontal()(l);
+    const tip = names[l.source.index] + " → " + names[l.target.index] + ": <b>" + fmtInt(l.value) + "</b>";
     parts.push(
-      '<path d="' + d + '" fill="none" stroke="#4fc3f7" stroke-opacity="0.4" stroke-width="' +
-      Math.max(1, l.width) + '"><title>' + names[l.source.index] + ' → ' +
-      names[l.target.index] + ': ' + fmtInt(l.value) + '</title></path>'
+      '<path d="' + d + '" fill="none" stroke="' + colorOf(names[l.target.index]) +
+      '" stroke-opacity="0.45" stroke-width="' + Math.max(1, l.width) + '" data-tip="' + tip.replace(/"/g, "&quot;") + '"></path>'
     );
   }
   const maxDepth = Math.max.apply(null, graph.nodes.map((n) => n.depth));
   for (const n of graph.nodes) {
     parts.push(
       '<rect x="' + n.x0 + '" y="' + n.y0 + '" width="' + (n.x1 - n.x0) + '" height="' +
-      Math.max(1, n.y1 - n.y0) + '" fill="#81c784"><title>' + n.name + ': ' +
-      fmtInt(n.value) + '</title></rect>'
+      Math.max(1, n.y1 - n.y0) + '" fill="' + colorOf(n.name) + '" data-tip="' +
+      (n.name + ": <b>" + fmtInt(n.value) + "</b>").replace(/"/g, "&quot;") + '"></rect>'
     );
     const mid = (n.x0 + n.x1) / 2;
     let x, anchor, y = n.y0 + (n.y1 - n.y0) / 2 + 4;
@@ -669,6 +694,16 @@ function drawSankey(id, links) {
     );
   }
   svg.innerHTML = parts.join("");
+  const tip = $("sanktip");
+  for (const el of svg.querySelectorAll("[data-tip]")) {
+    el.addEventListener("mousemove", (e) => {
+      tip.style.display = "block";
+      tip.innerHTML = el.getAttribute("data-tip");
+      tip.style.left = Math.min(e.clientX + 14, window.innerWidth - 220) + "px";
+      tip.style.top = (e.clientY + 12) + "px";
+    });
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  }
 }
 
 function renderHedgeFlows() {
@@ -717,6 +752,12 @@ function renderHedgeFlows() {
 
 // == request log ==
 const reqlogCache = [];
+function fmtMs(ms) {
+  if (ms === null || ms === undefined) return "-";
+  if (ms < 1000) return Math.round(ms) + "ms";
+  if (ms < 90000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + "s";
+  return Math.round(ms / 1000) + "s";
+}
 function renderRequests(entries) {
   const rows = (entries || []).slice(0, 200).map((e) => [
     new Date(e.ts).toTimeString().slice(0, 8),
@@ -726,10 +767,12 @@ function renderRequests(entries) {
     e.provider || "-",
     e.status,
     e.outcome,
-    e.ttft_ms === null || e.ttft_ms === undefined ? "-" : Math.round(e.ttft_ms) + "ms",
-    Math.round(e.total_ms || 0) + "ms",
+    fmtMs(e.ttft_ms),
+    fmtMs(e.gen_ms),
+    fmtMs(e.total_ms),
     e.tps ? e.tps.toFixed(1) : "-",
-    (e.tokens_in === null || e.tokens_in === undefined) && (e.tokens_out === null || e.tokens_out === undefined) ? "-" : (e.tokens_in || 0) + "/" + (e.tokens_out || 0),
+    e.tokens_in === null || e.tokens_in === undefined ? "-" : fmtInt(e.tokens_in),
+    e.tokens_out === null || e.tokens_out === undefined ? "-" : fmtInt(e.tokens_out),
     e.attempts,
     snippet(e.request),
     snippet(e.response),

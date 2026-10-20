@@ -416,6 +416,7 @@ async fn respond(
             "not_admitted",
         );
         entry.client = client.clone();
+        entry.tokens_in = Some(request_tokens_of(&body));
         entry.total_ms = started.elapsed().as_millis() as u64;
         state.reqlog.record(entry);
         return ApiError::NotAdmitted {
@@ -444,6 +445,7 @@ async fn respond(
             );
             entry.client = client.clone();
             entry.request = request_snippet;
+            entry.tokens_in = Some(request_tokens_of(&body));
             entry.total_ms = started.elapsed().as_millis() as u64;
             state.reqlog.record(entry);
             return ApiError::BadRequest {
@@ -481,6 +483,12 @@ async fn respond(
         interval,
     )
     .await
+}
+
+/// The request's size in tokens, on the raw body, for rows built before the
+/// body was parsed.
+fn request_tokens_of(body: &axum::body::Bytes) -> u64 {
+    crate::reqlog::Entry::estimate_tokens(body.len())
 }
 
 /// Whether a not-yet-parsed body asked for a stream, for the request log's
@@ -754,6 +762,9 @@ async fn handle_completion(
     drop(body);
 
     let named_model = crate::wire::named_model(&request);
+    // The request's size in tokens, on the same estimate the channel filter
+    // runs, so a row can show a size even when no provider reported usage.
+    let request_tokens = crate::reqlog::Entry::estimate_tokens(raw_len);
     let now = now_unix();
 
     // Only a whole answer is ever stored, so every request can be served from
@@ -796,6 +807,7 @@ async fn handle_completion(
                     row.request = request_snippet;
                     row.response =
                         crate::reqlog::Entry::snippet(String::from_utf8_lossy(&entry.body));
+                    row.tokens_in = Some(request_tokens);
                     row.ttft_ms = Some(started.elapsed().as_millis() as u64);
                     row.total_ms = started.elapsed().as_millis() as u64;
                     state.reqlog.record(row);
@@ -839,6 +851,7 @@ async fn handle_completion(
         );
         entry.client = client;
         entry.request = request_snippet;
+        entry.tokens_in = Some(request_tokens);
         entry.total_ms = started.elapsed().as_millis() as u64;
         state.reqlog.record(entry);
         return Served::Whole(error.served(started));
@@ -996,10 +1009,12 @@ async fn handle_completion(
             row.request = request_snippet;
             row.response = reply_snippet.unwrap_or_default();
             row.attempts = attempts;
+            // Nothing streamed on this path: the whole answer arrives at once,
+            // so there is no generation window to show.
             row.ttft_ms = Some(total.as_millis() as u64);
             row.total_ms = total.as_millis() as u64;
             row.tps = rate;
-            row.tokens_in = usage.input_tokens;
+            row.tokens_in = usage.input_tokens.or(Some(request_tokens));
             row.tokens_out = usage.output_tokens;
             state.reqlog.record(row);
             tracing::info!(
@@ -1113,6 +1128,7 @@ async fn handle_completion(
                 let entry_provider = provider.clone();
                 let entry_request = request_snippet;
                 let entry_ttft = first_token_elapsed.as_millis() as u64;
+                let entry_request_tokens = request_tokens;
                 let entry_attempts = attempts;
                 tokio::spawn(async move {
                     let facts = facts.await.ok();
@@ -1140,9 +1156,14 @@ async fn handle_completion(
                         "success",
                     );
                     if let Some(facts) = facts {
+                        entry.tokens_out =
+                            entry
+                                .tokens_out
+                                .or(Some(crate::reqlog::Entry::estimate_tokens(
+                                    facts.text.chars().count(),
+                                )));
                         entry.response = crate::reqlog::Entry::snippet(facts.text);
-                        entry.tokens_in = facts.usage.as_ref().and_then(|u| u.input_tokens);
-                        entry.tokens_out = facts.usage.as_ref().and_then(|u| u.output_tokens);
+                        entry.tokens_in = entry.tokens_in.or(Some(entry_request_tokens));
                         if let Some(usage) = facts.usage.as_ref() {
                             let generated = first_token_at.elapsed();
                             entry.tps = usage
@@ -1157,6 +1178,10 @@ async fn handle_completion(
                     entry.ttft_ms = Some(entry_ttft);
                     entry.request = entry_request;
                     entry.total_ms = started.elapsed().as_millis() as u64;
+                    // From the winning channel's first token to the end of
+                    // the answer: the provider generating, as against the
+                    // walk before it.
+                    entry.gen_ms = Some(entry.total_ms.saturating_sub(entry_ttft));
                     reqlog.record(entry);
                 });
 
@@ -1308,14 +1333,26 @@ async fn handle_completion(
                                 row.provider = Some(provider.clone());
                                 row.request = request_snippet;
                                 row.attempts = attempts;
-                                row.response = crate::reqlog::Entry::snippet(value.to_string());
+                                // Serialise once: the snippet and the token
+                                // estimate read the same encoded reply.
+                                let encoded_text = value.to_string();
+                                row.response = crate::reqlog::Entry::snippet(encoded_text.as_str());
                                 row.tps = rate;
-                                row.tokens_in = winner.response.usage.input_tokens;
-                                row.tokens_out = winner.response.usage.output_tokens;
+                                row.tokens_in =
+                                    winner.response.usage.input_tokens.or(Some(request_tokens));
+                                row.tokens_out = winner.response.usage.output_tokens.or(Some(
+                                    crate::reqlog::Entry::estimate_tokens(encoded_text.len()),
+                                ));
                                 row.total_ms = started.elapsed().as_millis() as u64;
-                                // The plain client's first token is its whole
-                                // answer, so the two timings are the same.
-                                row.ttft_ms = Some(row.total_ms);
+                                // The ttft is the winning channel's first
+                                // token, not the moment the fold finished:
+                                // the provider's own latency, which the
+                                // generation window then measures against.
+                                row.ttft_ms = Some(first_token_elapsed.as_millis() as u64);
+                                row.gen_ms = Some(
+                                    row.total_ms
+                                        .saturating_sub(first_token_elapsed.as_millis() as u64),
+                                );
                                 state.reqlog.record(row);
                                 Ok(Served::Whole(axum::Json(value).into_response()))
                             }
@@ -1390,6 +1427,7 @@ async fn handle_completion(
                 );
                 row.client = client;
                 row.request = request_snippet;
+                row.tokens_in = Some(request_tokens);
                 row.total_ms = started.elapsed().as_millis() as u64;
                 state.reqlog.record(row);
             }
@@ -1416,6 +1454,7 @@ async fn handle_completion(
                 );
                 row.client = client;
                 row.request = request_snippet;
+                row.tokens_in = Some(request_tokens);
                 row.total_ms = started.elapsed().as_millis() as u64;
                 state.reqlog.record(row);
             }
