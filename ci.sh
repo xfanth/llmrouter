@@ -201,36 +201,60 @@ find . -name '._*' -type f -not -path './.git/*' -delete 2>/dev/null || true
 
 LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/llmrouter-ci.XXXXXX")
 JOBS="clippy coverage smoke"
-step "clippy, coverage and smoke tier, in parallel (logs in $LOG_DIR)"
-# Job control puts each background job in its own process group, led by the
-# job's PID, which is what lets cleanup() kill the whole tree.
-set -m
-for name in $JOBS; do
-    # No `||` or `if` around the job: either would switch `set -e` off inside
-    # it, and a failed test run would then fall through to a green report.
-    (
+
+if [ "${CI_GATE_SERIAL:-0}" = "1" ]; then
+    # CI_GATE_SERIAL=1 runs the three jobs one at a time. The organisation's
+    # self-hosted runner sits inside a memory cgroup, and the three jobs'
+    # builds together cross it; one job at a time keeps the peak at one
+    # build. Same jobs, same checks, same summary.
+    step "clippy, coverage and smoke tier, one at a time (logs in $LOG_DIR)"
+    failed=""
+    for name in $JOBS; do
         SECONDS=0
         trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
-        "job_$name" > "$LOG_DIR/$name.log" 2>&1
-    ) &
-    PIDS="$PIDS $!"
-    [ "$name" != smoke ] || SMOKE_PID=$!
-done
-set +m
+        if "job_$name" > "$LOG_DIR/$name.log" 2>&1; then
+            [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
+            echo "    $name: pass"
+        else
+            echo "FAIL" > "$LOG_DIR/$name.result"
+            echo "    $name: FAIL"
+            failed="$failed $name"
+        fi
+    done
+else
+    step "clippy, coverage and smoke tier, in parallel (logs in $LOG_DIR)"
+    # Job control puts each background job in its own process group, led by
+    # the job's PID, which is what lets cleanup() kill the whole tree.
+    set -m
+    PIDS=""
+    for name in $JOBS; do
+        # No `||` or `if` around the job: either would switch `set -e` off
+        # inside it, and a failed test run would then fall through to a green
+        # report.
+        (
+            SECONDS=0
+            trap 'echo $SECONDS > "$LOG_DIR/$name.secs"' EXIT
+            "job_$name" > "$LOG_DIR/$name.log" 2>&1
+        ) &
+        PIDS="$PIDS $!"
+        [ "$name" != smoke ] || SMOKE_PID=$!
+    done
+    set +m
 
-failed=""
-set -- $PIDS
-for name in $JOBS; do
-    pid=$1; shift
-    if wait "$pid"; then
-        [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
-        echo "    $name: pass"
-    else
-        echo "FAIL" > "$LOG_DIR/$name.result"
-        echo "    $name: FAIL"
-        failed="$failed $name"
-    fi
-done
+    failed=""
+    set -- $PIDS
+    for name in $JOBS; do
+        pid=$1; shift
+        if wait "$pid"; then
+            [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
+            echo "    $name: pass"
+        else
+            echo "FAIL" > "$LOG_DIR/$name.result"
+            echo "    $name: FAIL"
+            failed="$failed $name"
+        fi
+    done
+fi
 
 for name in $failed; do
     printf '\n==> %s FAILED, last 80 lines of %s\n' "$name" "$LOG_DIR/$name.log"
