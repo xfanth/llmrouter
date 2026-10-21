@@ -230,7 +230,7 @@ def _tokens_from_response(parsed, raw: str | None) -> tuple[int | None, int | No
                 frame = json.loads(payload)
             except ValueError:
                 continue
-            if isinstance(frame.get("usage"), dict):
+            if isinstance(frame.get("usage"), dict) and frame["usage"]:
                 usage = frame["usage"]
                 break
     if not isinstance(usage, dict):

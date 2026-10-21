@@ -115,6 +115,20 @@ def test_curl_stream_sse_usage(server_url):
     print("  PASS streaming usage read from the final data frame")
 
 
+def test_sse_empty_usage_skipped():
+    """A frame whose usage is an empty dict carries no counts, so the scan
+    must not stop on it; the real usage block sits on an earlier frame."""
+    raw = (
+        'data: {"id":"t","choices":[{"delta":{"content":"5"}}],"usage":'
+        + json.dumps(USAGE) + "}\n\n"
+        'data: {"id":"t","choices":[],"usage":{}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    tokens_in, tokens_out = redeploy_suite._tokens_from_response(None, raw)
+    assert (tokens_in, tokens_out) == (10, 7), f"tokens=({tokens_in}, {tokens_out})"
+    print("  PASS empty usage dict skipped in favour of the real block")
+
+
 def test_tier_concurrent_captures(server_url):
     """Per-request rows carry status, snippets, tokens and tps; the summary
     carries tps statistics (issue #29)."""
@@ -162,6 +176,7 @@ def main():
         red_checks = [
             ("curl_stream body capture", lambda: test_curl_stream_returns_body(url)),
             ("streaming usage extraction", lambda: test_curl_stream_sse_usage(url)),
+            ("empty usage frame skipped", lambda: test_sse_empty_usage_skipped()),
             ("tier_concurrent capture fields", lambda: test_tier_concurrent_captures(url)),
         ]
         if red:
@@ -171,6 +186,7 @@ def main():
             return 0
         test_curl_stream_returns_body(url)
         test_curl_stream_sse_usage(url)
+        test_sse_empty_usage_skipped()
         test_tier_concurrent_captures(url)
         test_snippet_truncation(url)
         print("ALL PASS")
