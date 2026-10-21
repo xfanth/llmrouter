@@ -6,7 +6,8 @@ fixed JSON body carrying a usage block, or with SSE frames whose final frame
 carries the usage block. The checks then verify that curl_stream returns the
 parsed body, that tier_concurrent rows carry the token counts and snippets,
 and that truncation respects character boundaries. Plain asserts, no
-framework: run with `python3 scripts/test_redeploy_suite.py`.
+framework: run with `uv run --no-project python3 -B
+scripts/test_redeploy_suite.py`.
 """
 
 import json

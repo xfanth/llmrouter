@@ -217,7 +217,8 @@ def _snippet(text: str | None) -> str | None:
 def _tokens_from_response(parsed, raw: str | None) -> tuple[int | None, int | None]:
     """tokens_in/tokens_out from the usage block of a response. A plain JSON
     body carries it at the top level; a streaming body carries it on the
-    final data frame. Returns (None, None) when the body has no usage."""
+    last data frame that holds a non-empty usage block. Returns (None,
+    None) when the body has no usage."""
     usage = parsed.get("usage") if isinstance(parsed, dict) else None
     if not isinstance(usage, dict):
         for line in reversed((raw or "").splitlines()):
