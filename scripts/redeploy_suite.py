@@ -144,6 +144,11 @@ def tier_claude(base: str, key: str | None, model: str) -> dict:
     env["ANTHROPIC_API_KEY"] = key or "sk-no-key"
     env["ANTHROPIC_MODEL"] = model
     env["ANTHROPIC_SMALL_FAST_MODEL"] = model
+    # Claude Code reads its endpoint from its own settings file over the
+    # process environment, so on a machine whose settings point at a proxy
+    # the tier would test the proxy instead of the target. A fresh config
+    # directory isolates the tier from the machine's settings.
+    env["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="claude-tier-config-")
     for name, prompt, expect in tests:
         start = now_ms()
         out = subprocess.run(
