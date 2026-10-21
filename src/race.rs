@@ -3668,7 +3668,10 @@ mod tests {
         let mut counter = FrameCounter::default();
 
         counter.feed(head);
-        assert!(!counter.failed, "a half-read error frame is not a failure yet");
+        assert!(
+            !counter.failed,
+            "a half-read error frame is not a failure yet"
+        );
         counter.feed(tail);
         assert!(counter.failed, "the completed error frame is a failure");
     }
