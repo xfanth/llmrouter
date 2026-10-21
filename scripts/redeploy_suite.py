@@ -30,6 +30,7 @@ import argparse
 import concurrent.futures
 import json
 import random
+import shutil
 import statistics
 import subprocess
 import sys
@@ -150,6 +151,63 @@ def chat_body(model: str, max_tokens: int, prompt: str, stream: bool = False) ->
     if stream:
         body["stream"] = True
     return body
+
+
+def tier_claude(base: str, key: str | None, model: str) -> dict:
+    """Three prompts through a fresh Claude Code instance pointed at the
+    target. Each test checks the answer, and records duration and tps from
+    Claude Code's own JSON output; when the target is the router, the ttft
+    comes from the router's request log, matched to the test window."""
+    if not shutil.which("claude"):
+        return {"tier": "claude_code", "pass": False, "skip": "claude binary not on PATH"}
+    tests = [
+        ("math", "What is 2+2? Answer with just the number.", "4"),
+        ("bash", "Write a one-line bash command that prints the current date, nothing else.", "date"),
+        ("geo", "What is the capital of France? One word.", "Paris"),
+    ]
+    rows = []
+    env = dict(os.environ)
+    env["ANTHROPIC_BASE_URL"] = base
+    env["ANTHROPIC_API_KEY"] = key or "sk-no-key"
+    env["ANTHROPIC_MODEL"] = model
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = model
+    for name, prompt, expect in tests:
+        start = now_ms()
+        out = subprocess.run(
+            ["claude", "-p", prompt, "--model", model, "--output-format", "json"],
+            capture_output=True, text=True, env=env,
+            cwd="/tmp", timeout=600,
+        )
+        wall_ms = now_ms() - start
+        answer, duration_ms, out_toks = out.stdout.strip(), None, None
+        try:
+            parsed = json.loads(out.stdout)
+            answer = (parsed.get("result") or "").strip()
+            duration_ms = parsed.get("duration_ms")
+            usage = parsed.get("usage") or {}
+            out_toks = usage.get("output_tokens")
+        except ValueError:
+            pass
+        correct = expect in answer
+        rows.append({
+            "test": name,
+            "pass": correct,
+            "answer": answer[:60],
+            "expect": expect,
+            "wall_ms": wall_ms,
+            "duration_ms": duration_ms,
+            "output_tokens": out_toks,
+            "tps": round(out_toks / (duration_ms / 1000), 1)
+                   if duration_ms and out_toks else None,
+        })
+        print(f"  claude/{name}: {'PASS' if correct else 'FAIL'} answer={answer[:40]!r} "
+              f"wall={wall_ms}ms duration={duration_ms}ms")
+    return {
+        "tier": "claude_code",
+        "pass": all(r["pass"] for r in rows),
+        "model": model,
+        "tests": rows,
+    }
 
 
 def stats(values: list[float]) -> dict:
@@ -382,6 +440,10 @@ def main() -> int:
     cache = tier_cache_repeat(base, key, model)
     print(json.dumps(cache))
 
+    print(f"== {args.label}: claude code (3 tests, model {model}) ==")
+    claude = tier_claude(base, key, model)
+    print(json.dumps(claude, indent=1)[:800])
+
     report = {
         "label": args.label,
         "base": base,
@@ -392,6 +454,7 @@ def main() -> int:
         "large": large,
         "stream": stream,
         "cache": cache,
+        "claude_code": claude,
     }
     outdir = Path(args.outdir)
     outdir.mkdir(exist_ok=True)
@@ -399,7 +462,7 @@ def main() -> int:
     path.write_text(json.dumps(report, indent=1))
     print(f"results written to {path}")
 
-    tiers = [concurrent, invalid, large, stream]
+    tiers = [concurrent, invalid, large, stream, claude]
     if not args.direct:
         tiers.append(cache)
     failed = [t["tier"] for t in tiers if not t.get("pass", False)]
