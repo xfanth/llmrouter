@@ -151,7 +151,14 @@ def tier_claude(base: str, key: str | None, model: str) -> dict:
         answer, duration_ms, out_toks = out.stdout.strip(), None, None
         try:
             parsed = json.loads(out.stdout)
-            answer = (parsed.get("result") or "").strip()
+            # Some versions emit a single object; others a list of events,
+            # where the result and usage live on the last event that has them.
+            if isinstance(parsed, list):
+                result_obj = {}
+                for event in parsed:
+                    result_obj.update({k: v for k, v in event.items() if v is not None})
+                parsed = result_obj
+            answer = str(parsed.get("result") or "").strip()
             duration_ms = parsed.get("duration_ms")
             usage = parsed.get("usage") or {}
             out_toks = usage.get("output_tokens")
