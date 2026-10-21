@@ -29,11 +29,13 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import random
 import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,27 +47,33 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def curl_json(url: str, body: dict, key: str | None, max_secs: int) -> dict:
-    """POST body, return {status, ttft_s, total_s, body}."""
+def _post(url: str, body_text: str, key: str | None, max_secs: int, keep: bool,
+          out_spec: str, write_spec: str) -> subprocess.CompletedProcess:
+    """POST body_text via a temp file (bodies can exceed the 128KB single-
+    argument cap), returning the completed curl process."""
+    body_file = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    body_file.write(body_text)
+    body_file.close()
     args = [
-        "curl",
-        "-s",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{http_code} %{time_starttransfer} %{time_total}",
-        "--max-time",
-        str(max_secs),
-        "-X",
-        "POST",
-        url,
-        "-H",
-        "content-type: application/json",
+        "curl", "-s",
+        "-o", out_spec,
+        "-w", write_spec,
+        "--max-time", str(max_secs),
+        "-X", "POST", url,
+        "-H", "content-type: application/json",
+        "-d", f"@{body_file.name}",
     ]
     if key:
         args += ["-H", f"authorization: Bearer {key}"]
-    args += ["-d", json.dumps(body)]
     out = subprocess.run(args, capture_output=True, text=True)
+    os.unlink(body_file.name)
+    return out
+
+
+def curl_json(url: str, body: dict, key: str | None, max_secs: int) -> dict:
+    """POST body, return {status, ttft_s, total_s, body}."""
+    out = _post(url, json.dumps(body), key, max_secs, False, "/dev/null",
+                "%{http_code} %{time_starttransfer} %{time_total}")
     parts = out.stdout.split()
     status = int(parts[0]) if parts else 0
     ttft = float(parts[1]) if len(parts) > 1 else 0.0
@@ -74,24 +82,9 @@ def curl_json(url: str, body: dict, key: str | None, max_secs: int) -> dict:
 
 
 def curl_json_with_body(url: str, body: dict, key: str | None, max_secs: int) -> dict:
-    """POST body, return {status, ttft_s, total_s, body}, keeping the body."""
-    args = [
-        "curl",
-        "-s",
-        "-w",
-        "\n__CURL__%{http_code} %{time_starttransfer} %{time_total}",
-        "--max-time",
-        str(max_secs),
-        "-X",
-        "POST",
-        url,
-        "-H",
-        "content-type: application/json",
-    ]
-    if key:
-        args += ["-H", f"authorization: Bearer {key}"]
-    args += ["-d", json.dumps(body)]
-    out = subprocess.run(args, capture_output=True, text=True)
+    """POST body, return {status, ttft_s, total_s, parsed, raw}, keeping the body."""
+    out = _post(url, json.dumps(body), key, max_secs, True, "-",
+                "\n__CURL__%{http_code} %{time_starttransfer} %{time_total}")
     raw = out.stdout
     marker = raw.rfind("\n__CURL__")
     body_text = raw[:marker] if marker >= 0 else raw
@@ -115,31 +108,7 @@ def curl_json_with_body(url: str, body: dict, key: str | None, max_secs: int) ->
 
 def curl_stream(url: str, body: dict, key: str | None, max_secs: int) -> dict:
     """Streaming POST; curl's clock gives ttft (first byte) and total."""
-    args = [
-        "curl",
-        "-s",
-        "-N",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{http_code} %{time_starttransfer} %{time_total}",
-        "--max-time",
-        str(max_secs),
-        "-X",
-        "POST",
-        url,
-        "-H",
-        "content-type: application/json",
-    ]
-    if key:
-        args += ["-H", f"authorization: Bearer {key}"]
-    args += ["-d", json.dumps(body)]
-    out = subprocess.run(args, capture_output=True, text=True)
-    parts = out.stdout.split()
-    status = int(parts[0]) if parts else 0
-    ttft = float(parts[1]) if len(parts) > 1 else 0.0
-    total = float(parts[2]) if len(parts) > 2 else 0.0
-    return {"status": status, "ttft_s": ttft, "total_s": total}
+    return curl_json(url, body, key, max_secs)
 
 
 def chat_body(model: str, max_tokens: int, prompt: str, stream: bool = False) -> dict:
