@@ -6,11 +6,13 @@ on:
     branches: [master]
   workflow_dispatch:
 
-# A new push to a pull request makes the running check pointless, so cancel it.
-# Master pushes are never cancelled, so every commit on master gets its own
-# complete run.
+# A new push to a pull request makes the running check pointless, so cancel
+# it. Every other gate shares one queue: two simultaneous gates crossed the
+# TrueNAS runner's memory cgroup on 21 Oct 2026 and both failed with the
+# smoke tier dead, so a second gate waits for the first to finish instead of
+# racing it on the one memory-capped machine.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.ref) || 'llmrouter-gate-serial' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
