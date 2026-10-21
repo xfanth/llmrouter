@@ -1891,6 +1891,8 @@ struct FrameCounter {
     >,
     /// Content frames seen so far.
     frames: u32,
+    /// The stream has carried an in-band provider error frame.
+    failed: bool,
 }
 
 impl Default for FrameCounter {
@@ -1900,6 +1902,7 @@ impl Default for FrameCounter {
             wire,
             events: eventsource_stream::EventStream::new(rx),
             frames: 0,
+            failed: false,
         }
     }
 }
@@ -1914,9 +1917,14 @@ impl FrameCounter {
         while let Some(Some(event)) = self.events.next().now_or_never() {
             let Ok(event) = event else { continue };
             // The same reader the race uses to decide a stream is an answer,
-            // so keep-alives and error events are not tokens here either.
-            if crate::health::event_verdict(&event.data) == StreamVerdict::Content {
-                self.frames = self.frames.saturating_add(1);
+            // so keep-alives and error events are not tokens here either, and
+            // an error frame marks the whole stream as failed: a 200 carrying
+            // an error is a failure in disguise, not a fast answer. Issue 27,
+            // 21 Oct 2026.
+            match crate::health::event_verdict(&event.data) {
+                StreamVerdict::Failed => self.failed = true,
+                StreamVerdict::Content => self.frames = self.frames.saturating_add(1),
+                StreamVerdict::Pending => {}
             }
         }
     }
@@ -2037,6 +2045,20 @@ async fn pump_until(mut ready: ReadyStream, deadline: tokio::time::Instant) -> R
                 Some(Ok(chunk)) => {
                     ready.counter.feed(&chunk);
                     ready.buffered.push(chunk);
+                    // A provider can fail inside a 200 stream after real
+                    // content: the opening read cleared the trial, and the
+                    // error frame turns up later, still inside the window. The
+                    // counter's decoder already joined any frame the chunks
+                    // split, so the verdict here is over whole events, never
+                    // a half-read one. An error frame cannot win the window
+                    // for its channel, and the candidate dropping out lets
+                    // the window's held-failure path move the channel's
+                    // health, so the walk stops redrawing it. Issue 27, 21
+                    // Oct 2026.
+                    if ready.counter.failed {
+                        ready.broken = true;
+                        return ready;
+                    }
                 }
                 // A stream that finished inside the window is a fast stream,
                 // and what it produced still counts. It is timed to here, not
@@ -3610,6 +3632,76 @@ mod tests {
         let broken = pump_until(ready_with(1, 10, broken), deadline).await;
         assert!(broken.broken);
         assert!(pick_fastest(vec![broken], WINDOW).is_none());
+    }
+
+    /// A provider can fail inside a 200 stream after real content: the
+    /// opening read sees the content and calls the trial won, and the error
+    /// frame arrives later, still inside the decision window. The candidate
+    /// must lose the window for it, because the answer the client would
+    /// otherwise hold is an error wearing a 200. Issue 27, 21 Oct 2026.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_band_error_frame_inside_the_window_breaks_the_candidate() {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        let failing: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(token("x")),
+            Ok(b"data: {\"error\":{\"message\":\"1211 Unknown Model\"}}\n\n".to_vec()),
+        ]));
+        let failing = pump_until(ready_with(1, 10, failing), deadline).await;
+
+        assert!(failing.broken, "the error frame ends the candidacy");
+        assert!(
+            pick_fastest(vec![failing], WINDOW).is_none(),
+            "a broken candidate never wins the window"
+        );
+    }
+
+    /// An error frame split across two chunks must still end the candidacy.
+    /// The counter's SSE decoder holds a half-read event, so the verdict
+    /// cannot be taken from one chunk alone.
+    #[test]
+    fn an_error_frame_split_across_chunks_still_breaks_the_candidate() {
+        let frame = b"data: {\"error\":{\"message\":\"1211 Unknown Model\"}}\n\n".to_vec();
+        let (head, tail) = frame.split_at(10);
+        let mut counter = FrameCounter::default();
+
+        counter.feed(head);
+        assert!(!counter.failed, "a half-read error frame is not a failure yet");
+        counter.feed(tail);
+        assert!(counter.failed, "the completed error frame is a failure");
+    }
+
+    /// The channel behind an in-band error owes the same health move as a
+    /// transport error, so the walk stops redrawing it. Failing the trial is
+    /// not enough: only the held failure does that.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_band_error_frame_backs_its_channel_off_during_the_window() {
+        let deadline = tokio::time::Instant::now() + WINDOW;
+        let failing: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(token("x")),
+            Ok(b"data: {\"error\":{\"message\":\"1211 Unknown Model\"}}\n\n".to_vec()),
+        ]));
+        let channels = vec![row("zai", "key-0", "model-a")];
+        let channel_id = channels[0].id;
+        let mut held: Vec<PendingFailure<'_>> = Vec::new();
+        let mut inflight: Trials<'_> = FuturesUnordered::new();
+        let cancel = CancellationToken::new();
+
+        let mut candidate = ready_with(1, 10, failing);
+        candidate.channel_id = channel_id;
+        let outcome = watch_window(
+            Box::new(pump_until(candidate, deadline).await),
+            &channels,
+            &mut inflight,
+            &mut held,
+            &cancel,
+            |_| {},
+            WINDOW,
+        )
+        .await;
+
+        assert!(matches!(outcome, WindowOutcome::AllBroke));
+        assert_eq!(held.len(), 1, "the failing channel is held for its move");
+        assert_eq!(held[0].channel.id, channel_id);
     }
 
     /// Two streams at the same speed is a coin toss, so the first candidate
