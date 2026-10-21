@@ -293,7 +293,7 @@ def tier_invalid(base: str, key: str | None, model: str) -> dict:
 
 
 def tier_large(base: str, key: str | None, model: str, direct: bool) -> dict:
-    out = {"tier": "large"}
+    out = {"tier": "large", "pass": False}
     for name, chars in [("32k", 112_000), ("512k", 1_792_000)]:
         filler = random.choice("qwxzk")
         body = chat_body(model, 512, filler * chars)
@@ -327,6 +327,7 @@ def tier_large(base: str, key: str | None, model: str, direct: bool) -> dict:
             "pass": detail_ok,
             "expect": "413 too_large with prompt_tokens and largest_context",
         }
+    out["pass"] = all(out[name]["pass"] for name in ("32k", "512k", "1024k"))
     return out
 
 
