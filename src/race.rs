@@ -1875,7 +1875,8 @@ async fn read_error_body(rest: &mut ByteStream) -> Vec<u8> {
 }
 
 /// Counts the content-bearing `data:` frames a stream has produced, across
-/// chunk boundaries.
+/// chunk boundaries, and records whether the stream has carried an in-band
+/// provider error frame.
 ///
 /// One content frame is one token: every provider here sends a delta per
 /// token. Counting frames is therefore the tokens-per-second measure, with no
@@ -2030,7 +2031,9 @@ enum WindowOutcome {
     ClientGone,
 }
 
-/// Buffers everything `ready` produces until `deadline`, counting its tokens.
+/// Buffers everything `ready` produces until `deadline`, counting its tokens,
+/// and drops the candidacy at once if the stream carries an in-band error
+/// frame.
 ///
 /// Nothing goes to the client while this runs. That is the whole point of
 /// `tps`: forwarding the first token would commit the router to a channel it
@@ -3675,7 +3678,6 @@ mod tests {
     /// not enough: only the held failure does that.
     #[tokio::test(start_paused = true)]
     async fn an_in_band_error_frame_backs_its_channel_off_during_the_window() {
-        let deadline = tokio::time::Instant::now() + WINDOW;
         let failing: ByteStream = Box::pin(futures::stream::iter(vec![
             Ok(token("x")),
             Ok(b"data: {\"error\":{\"message\":\"1211 Unknown Model\"}}\n\n".to_vec()),
@@ -3689,7 +3691,7 @@ mod tests {
         let mut candidate = ready_with(1, 10, failing);
         candidate.channel_id = channel_id;
         let outcome = watch_window(
-            Box::new(pump_until(candidate, deadline).await),
+            Box::new(candidate),
             &channels,
             &mut inflight,
             &mut held,
