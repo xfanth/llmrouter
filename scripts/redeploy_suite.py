@@ -107,8 +107,12 @@ def curl_json_with_body(url: str, body: dict, key: str | None, max_secs: int) ->
 
 
 def curl_stream(url: str, body: dict, key: str | None, max_secs: int) -> dict:
-    """Streaming POST; curl's clock gives ttft (first byte) and total."""
-    return curl_json(url, body, key, max_secs)
+    """Streaming POST; curl's clock gives ttft (first byte) and total.
+
+    The response body is captured as well (issue #28): without it the
+    provider usage block is discarded and per-request tps cannot be computed
+    for direct-provider runs."""
+    return curl_json_with_body(url, body, key, max_secs)
 
 
 def chat_body(model: str, max_tokens: int, prompt: str, stream: bool = False) -> dict:
@@ -197,24 +201,78 @@ def stats(values: list[float]) -> dict:
     }
 
 
+# Largest raw-body or request-body prefix stored in the results JSON. Full
+# bodies stay out of the report because request payloads can reach megabytes.
+SNIPPET_CAP = 2048
+
+
+def _snippet(text: str | None) -> str | None:
+    """Prefix of text capped at SNIPPET_CAP characters. Slicing a Python
+    string never cuts a code point in half, unlike byte-based truncation."""
+    if text is None:
+        return None
+    return text[:SNIPPET_CAP]
+
+
+def _tokens_from_response(parsed, raw: str | None) -> tuple[int | None, int | None]:
+    """tokens_in/tokens_out from the usage block of a response. A plain JSON
+    body carries it at the top level; a streaming body carries it on the
+    final data frame. Returns (None, None) when the body has no usage."""
+    usage = parsed.get("usage") if isinstance(parsed, dict) else None
+    if not isinstance(usage, dict):
+        for line in reversed((raw or "").splitlines()):
+            if not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                frame = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(frame.get("usage"), dict):
+                usage = frame["usage"]
+                break
+    if not isinstance(usage, dict):
+        return None, None
+    return usage.get("prompt_tokens"), usage.get("completion_tokens")
+
+
 # ---------------------------------------------------------------- tiers
 
 
 def tier_concurrent(base: str, key: str | None, model: str, n: int, max_tokens: int) -> dict:
-    """n streaming requests with known answers, all fired at once."""
-    results: list[dict] = []
+    """n streaming requests with known answers, all fired at once.
+
+    Each per-request row records the request and response snippets and the
+    token counts from the provider usage block, so tps can be compared
+    between the router and direct providers (issues #28 and #29)."""
     start = now_ms()
 
     def one(i: int) -> dict:
         prompt = f"Reply with exactly the number {i} and nothing else."
+        body = chat_body(model, max_tokens, prompt, stream=True)
         r = curl_stream(
             f"{base}/chat/completions",
-            chat_body(model, max_tokens, prompt, stream=True),
+            body,
             key,
             300,
         )
-        r["index"] = i
-        return r
+        tokens_in, tokens_out = _tokens_from_response(r.get("parsed"), r.get("raw"))
+        tps = None
+        if tokens_out and r["total_s"] > 0:
+            tps = round(tokens_out / r["total_s"], 1)
+        return {
+            "index": i,
+            "status": r["status"],
+            "ttft_ms": round(r["ttft_s"] * 1000),
+            "total_ms": round(r["total_s"] * 1000),
+            "request_snippet": _snippet(json.dumps(body)),
+            "response_snippet": _snippet(r.get("raw")),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tps": tps,
+        }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
         futures = [pool.submit(one, i) for i in range(1, n + 1)]
@@ -223,8 +281,9 @@ def tier_concurrent(base: str, key: str | None, model: str, n: int, max_tokens: 
     wall_ms = now_ms() - start
     answered = [r for r in results if 200 <= r["status"] < 300]
     rate_limited = [r for r in results if r["status"] == 429]
-    ttfts = [round(r["ttft_s"] * 1000) for r in answered]
-    totals = [round(r["total_s"] * 1000) for r in answered]
+    ttfts = [r["ttft_ms"] for r in answered]
+    totals = [r["total_ms"] for r in answered]
+    tps_values = [r["tps"] for r in results if r["tps"] is not None]
     return {
         "tier": "concurrent",
         "pass": len(answered) == n,
@@ -234,15 +293,8 @@ def tier_concurrent(base: str, key: str | None, model: str, n: int, max_tokens: 
         "wall_ms": wall_ms,
         "ttft_ms": stats(ttfts),
         "total_ms": stats(totals),
-        "per_request": [
-            {
-                "index": r["index"],
-                "status": r["status"],
-                "ttft_ms": round(r["ttft_s"] * 1000),
-                "total_ms": round(r["total_s"] * 1000),
-            }
-            for r in results
-        ],
+        "tps": stats(tps_values),
+        "per_request": results,
     }
 
 
