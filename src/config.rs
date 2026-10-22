@@ -312,15 +312,16 @@ impl Default for HealthPollConfig {
 /// each backs off on its own schedule. Alex's spec, 22 Oct 2026.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureGroup {
-    /// The key is bad, has no access, or is out of credit: `401`, `403`, `402`
-    /// and the other 4xx. Rarely fixes itself inside minutes.
+    /// The key is bad, has no access, or is out of credit: `401`, `403` and
+    /// `402`. Rarely fixes itself inside minutes. The other 4xx are the
+    /// request's fault and bench nothing.
     Account,
     /// The provider does not serve this model: `404`.
     ModelMissing,
     /// The provider is overloaded for now: `429` and any 5xx.
     Busy,
-    /// The call never got as far as an answer: no connection, a timeout, or a
-    /// socket that broke before the first token.
+    /// The call never got as far as an answer: no connection, a timeout
+    /// (`408` included), or a socket that broke before the first token.
     Unreachable,
     /// The provider answered with something that is not an answer: no
     /// content, a body that will not parse, or an error frame in the stream.

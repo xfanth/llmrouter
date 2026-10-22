@@ -779,12 +779,15 @@ impl Racer {
             .rev()
             .filter(|f| !f.self_inflicted)
             .find_map(|f| f.class);
+        // A failure whose class benches nothing, such as a `400`, leaves the
+        // channel's health alone, like one the router caused itself.
+        let benches = class.map_or(true, |class| class.group().is_some());
         TrialOutcome::Failed {
             error: failures
                 .last()
                 .map(|f| f.error.clone())
                 .unwrap_or_else(|| "no copy ran".to_string()),
-            pending: (!self_inflicted).then_some(PendingFailure {
+            pending: (!self_inflicted && benches).then_some(PendingFailure {
                 channel,
                 retry_after_secs,
                 class,
@@ -1338,10 +1341,8 @@ fn record_failure(
     now: u64,
     mirror: impl FnOnce(&crate::health::HealthEntry),
 ) {
-    match class {
-        Some(class) => {
-            health.record_failure_as_then(key, class.group(), retry_after_secs, now, mirror)
-        }
+    match class.and_then(ErrorClass::group) {
+        Some(group) => health.record_failure_as_then(key, group, retry_after_secs, now, mirror),
         None => health.record_failure_then(key, retry_after_secs, now, mirror),
     };
 }
@@ -4947,8 +4948,26 @@ mod tests {
         );
         assert_eq!(
             ErrorClass::from_status(402, false),
+            ErrorClass::PaymentRequired
+        );
+        assert_eq!(
+            ErrorClass::from_status(408, false),
+            ErrorClass::RequestTimeout
+        );
+        assert_eq!(
+            ErrorClass::from_status(400, false),
             ErrorClass::OtherClientError
         );
+        use crate::config::FailureGroup;
+        assert_eq!(
+            ErrorClass::PaymentRequired.group(),
+            Some(FailureGroup::Account)
+        );
+        assert_eq!(
+            ErrorClass::RequestTimeout.group(),
+            Some(FailureGroup::Unreachable)
+        );
+        assert_eq!(ErrorClass::OtherClientError.group(), None);
         assert_eq!(ErrorClass::from_status(503, false), ErrorClass::ServerError);
         // A 2xx reaches a class only when its body was not an answer.
         assert_eq!(ErrorClass::from_status(200, false), ErrorClass::Other);

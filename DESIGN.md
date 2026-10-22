@@ -1239,14 +1239,20 @@ wait_seconds = min(max, start * multiplier.pow(retry_counter - 1))
 
 | Group | Failure classes | Start | Multiplier | Cap |
 |---|---|---|---|---|
-| `account` | `unauthorized`, `forbidden`, `other_client_error` | 1h | 2 | 30 days |
+| `account` | `unauthorized`, `forbidden`, `payment_required` | 1h | 2 | 30 days |
 | `model_missing` | `not_found` | 6h | 2 | 30 days |
 | `busy` | `rate_limited`, `server_error` | 30s | 2 | 1h |
-| `unreachable` | `connect`, `timeout`, `prefill_transport`, `other` | 10s | 2 | 1h |
+| `unreachable` | `connect`, `timeout`, `request_timeout`, `prefill_transport`, `other` | 10s | 2 | 1h |
 | `bad_answer` | `not_an_answer`, `body_unparseable`, `body_undecodable`, `stream_error` | 1m | 2 | 1 day |
 | `died_mid_answer` | `stream_stalled`, `stream_truncated`, `stream_transport` | 5m | 2 | 1 day |
 
-`Retry-After` still replaces `start` for that failure. `retry_counter` is
+`other_client_error` (`400`, `413`, `422` and the rest of the 4xx) benches
+nothing: it is nearly always the request's fault, and one bad request fails on
+every channel it reaches. Benching each of them would take whole keys and
+providers down with it.
+
+`Retry-After` still replaces `start` for that failure, and the cap never cuts it
+short. `retry_counter` is
 shared, so it counts consecutive failures of any kind, and the latest failure's
 schedule sets the wait. A success still resets everything.
 
