@@ -1157,10 +1157,10 @@ async fn handle_completion(
                     // on 22 Oct 2026 went unseen on the dashboard.
                     let outcome = match facts.as_ref() {
                         Some(facts) if facts.died.is_some() => "stream_died",
-                        Some(_) => "success",
-                        // The tap was dropped before the stream ended, which
+                        Some(facts) if facts.complete => "success",
+                        // Dropped before the answer's terminal chunk, which
                         // only the client hanging up does.
-                        None => "client_gone",
+                        _ => "client_gone",
                     };
                     let mut entry = crate::reqlog::Entry::finished(
                         endpoint_name(client_format),

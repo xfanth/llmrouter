@@ -343,9 +343,10 @@ async fn a_401_marks_the_channel_unhealthy_and_the_walk_carries_on() {
     assert_eq!(entry.retry_counter, 1);
     // A dead key is an account failure, which starts at an hour: retrying
     // it every second only spends requests on a key that is not coming back.
+    // The group's start is not stored as the base, which stays the default.
     assert_eq!(
-        entry.retry_base_secs, 3600,
-        "no Retry-After, so the account group's start"
+        entry.retry_base_secs, 1,
+        "no Retry-After, so the default base"
     );
     deadline_is(entry, before, after, 3600);
 

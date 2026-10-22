@@ -777,8 +777,8 @@ impl Racer {
         let class = failures
             .iter()
             .rev()
-            .find(|f| !f.self_inflicted)
-            .and_then(|f| f.class);
+            .filter(|f| !f.self_inflicted)
+            .find_map(|f| f.class);
         TrialOutcome::Failed {
             error: failures
                 .last()

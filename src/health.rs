@@ -228,22 +228,23 @@ impl HealthTable {
                 .entry(key.clone())
                 .or_insert_with(|| HealthEntry::new(self.retry_base_secs()));
             entry.retry_counter = entry.retry_counter.saturating_add(1);
+            // A date already past parses to 0. Floor every base at 1 second,
+            // or the thing would be eligible again at once and never back off.
+            let retry_after_secs = retry_after_secs.map(|secs| secs.max(1));
             if let Some(secs) = retry_after_secs {
-                // A date already past parses to 0. Floor the base at 1 second, or
-                // the thing would be eligible again at once and never back off.
-                entry.retry_base_secs = secs.max(1);
-            } else if let Some(schedule) = schedule {
-                // The group's own start, every time: a base an earlier failure
-                // of another kind left behind says nothing about this one.
-                entry.retry_base_secs = schedule.start.as_secs().max(1);
+                entry.retry_base_secs = secs;
             }
             let wait = match schedule {
-                Some(schedule) => scaled_wait_seconds(
-                    entry.retry_counter,
-                    entry.retry_base_secs,
-                    schedule.multiplier,
-                    schedule.max.as_secs(),
-                ),
+                // The group's start is held for this failure only: written
+                // into the entry it would become the base the poller's next
+                // failure doubles from. The cap never cuts a `Retry-After`
+                // short: a provider asking for a day is not asked again
+                // every hour.
+                Some(schedule) => {
+                    let base = retry_after_secs.unwrap_or(schedule.start.as_secs().max(1));
+                    let cap = schedule.max.as_secs().max(1).max(base);
+                    scaled_wait_seconds(entry.retry_counter, base, schedule.multiplier, cap)
+                }
                 None => wait_seconds(
                     entry.retry_counter,
                     entry.retry_base_secs,
@@ -888,6 +889,15 @@ mod tests {
         assert_eq!(fail(FailureGroup::Busy, None), HOUR);
         t.record_success(&k);
         assert_eq!(fail(FailureGroup::ModelMissing, None), 6 * HOUR);
+        // A group's start is not left behind as the default base, so the
+        // poller's next failure still doubles from the configured 1 second:
+        // the third failure in a row waits 4 seconds, not 24 hours.
+        assert_eq!(t.get(&k).expect("in backoff").retry_base_secs, 1);
+        assert_eq!(fail(FailureGroup::ModelMissing, None), 12 * HOUR);
+        assert_eq!(t.record_failure(&k, None, 0).eligible_at, 4);
+        // A `Retry-After` longer than the group's cap is honoured in full.
+        t.record_success(&k);
+        assert_eq!(fail(FailureGroup::Busy, Some(86_400)), 86_400);
     }
 
     #[test]
