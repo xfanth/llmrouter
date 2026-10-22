@@ -36,7 +36,13 @@ COPY --from=planner /src/recipe.json recipe.json
 # job_clippy in ci.sh and the matching step in .github/workflows/ci.yml.
 RUN cargo chef cook --release --bin llmrouter --recipe-path recipe.json
 COPY . .
-RUN cargo build --release --bin llmrouter
+# The publish action passes both as build args. Declared after the cook so a
+# new commit does not invalidate the cooked dependencies. `GET /version`
+# reports them.
+ARG GITHUB_SHA=unknown
+ARG BUILD_DATE=unknown
+RUN LLMROUTER_GIT_SHA="$GITHUB_SHA" LLMROUTER_BUILD_DATE="$BUILD_DATE" \
+    cargo build --release --bin llmrouter
 
 FROM debian:bookworm-slim
 RUN apt-get update \

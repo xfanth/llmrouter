@@ -175,7 +175,8 @@ pub struct AppState {
     pub started_at: Instant,
 }
 
-/// The four routes, the two probes, and the two browser pages.
+/// The four routes, the probes, the version and log pages, and the two
+/// browser pages.
 ///
 /// The body limit is off. axum's default is 2 MiB, and the `Bytes` extractor
 /// would refuse a 3.8MB prompt with a bare plain-text 413 before a handler
@@ -193,6 +194,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/models", get(crate::models_api::get_models))
         .route("/healthz", get(healthz))
+        .route("/version", get(version))
+        .route("/logs", get(logs))
         .route("/metrics", get(metrics_endpoint))
         .route("/metrics/history", get(crate::history::endpoint))
         .route("/metrics/requests", get(crate::reqlog::endpoint))
@@ -216,6 +219,53 @@ pub async fn post_chat_completions(
     body: axum::body::Bytes,
 ) -> Response {
     completion_response(state.0, Format::OpenAiChat, &headers, body).await
+}
+
+/// `GET /version`. Which build is running: the crate version, and the commit
+/// and build time the image was made from. Docker passes both into the build;
+/// a local `cargo build` has neither and says `unknown`.
+pub async fn version() -> Response {
+    axum::Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": option_env!("LLMROUTER_GIT_SHA").unwrap_or("unknown"),
+        "built_at": option_env!("LLMROUTER_BUILD_DATE").unwrap_or("unknown"),
+    }))
+    .into_response()
+}
+
+/// `GET /logs?lines=N`.
+#[derive(Debug, serde::Deserialize)]
+pub struct LogsQuery {
+    /// How many lines off the end, 200 by default and at most 5,000.
+    lines: Option<usize>,
+}
+
+/// `GET /logs`. The end of this run's log file as plain text, so the router
+/// can be read without a shell on the host.
+pub async fn logs(axum::extract::Query(query): axum::extract::Query<LogsQuery>) -> Response {
+    let lines = query.lines.unwrap_or(200).clamp(1, 5_000);
+    let Some(path) = crate::logging::current_log() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "this process is not logging to a file\n",
+        )
+            .into_response();
+    };
+    match tokio::task::spawn_blocking(move || crate::logging::tail(path, lines)).await {
+        Ok(Ok(text)) => {
+            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+        }
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the log file could not be read: {err}\n"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reading the log file failed: {err}\n"),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /healthz`. Returns 200 from the first second, with the live channel

@@ -9,8 +9,9 @@
 //! catalogue build. `indicatif` hides a bar on its own when stderr is not a
 //! terminal, so Docker logs stay free of control characters.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use comfy_table::{presets, Table};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -22,6 +23,14 @@ use tracing_subscriber::EnvFilter;
 
 /// Where the per-run log files go, relative to the working directory.
 const LOG_DIR: &str = "logs";
+
+/// This run's log file, once [`init`] has opened it, for `GET /logs`.
+static CURRENT: OnceLock<PathBuf> = OnceLock::new();
+
+/// The most `GET /logs` reads off the end of the file. The pretty format runs
+/// to several lines an event, so this covers the largest `lines` the endpoint
+/// allows without reading a long run's whole file into memory.
+const TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The default filter when `RUST_LOG` says nothing: the router at info and
 /// everything noisier at warn.
@@ -73,6 +82,7 @@ pub fn log_path(dir: &Path, at: OffsetDateTime) -> PathBuf {
 pub fn init() -> std::io::Result<(LogSetup, tracing_appender::non_blocking::WorkerGuard)> {
     let setup = LogSetup::new();
     let file = create_log_file(&setup.path)?;
+    let _ = CURRENT.set(setup.path.clone());
     let (writer, guard) = tracing_appender::non_blocking(file);
 
     let filter =
@@ -98,6 +108,32 @@ pub fn init() -> std::io::Result<(LogSetup, tracing_appender::non_blocking::Work
         .init();
 
     Ok((setup, guard))
+}
+
+/// This run's log file, or `None` before [`init`] has run.
+pub fn current_log() -> Option<&'static Path> {
+    CURRENT.get().map(PathBuf::as_path)
+}
+
+/// The last `lines` lines of the file at `path`. Only the final
+/// [`TAIL_BYTES`] are read, and a line cut in half by that window is dropped
+/// rather than shown half.
+pub fn tail(path: &Path, lines: usize) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut all: Vec<&str> = text.lines().collect();
+    if start > 0 && !all.is_empty() {
+        all.remove(0);
+    }
+    let keep = all.len().saturating_sub(lines);
+    let mut out = all[keep..].join("\n");
+    out.push('\n');
+    Ok(out)
 }
 
 /// Creates the parent directory and opens the file for this run.
@@ -174,6 +210,15 @@ mod tests {
             "colons are not portable in a filename: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn the_tail_is_the_last_lines_of_the_file() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let path = tmp.path().join("run.log");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").expect("the log is written");
+        assert_eq!(tail(&path, 2).expect("tail"), "three\nfour\n");
+        assert_eq!(tail(&path, 10).expect("tail"), "one\ntwo\nthree\nfour\n");
     }
 
     #[test]

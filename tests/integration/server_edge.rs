@@ -1228,6 +1228,30 @@ async fn healthz_answers_from_the_first_second_with_an_empty_catalogue() {
     );
 }
 
+/// `/version` says which build is running. A test build is not made by
+/// Docker, so the commit and build time read `unknown`, but the fields are
+/// there for the image to fill.
+#[tokio::test]
+async fn version_names_the_running_build() {
+    let edge = probes_only(Vec::new()).await;
+    let response = edge.get("/version").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert!(body["git_sha"].is_string());
+    assert!(body["built_at"].is_string());
+}
+
+/// A process that never opened a log file has nothing for `/logs` to show,
+/// and says so rather than answering an empty 200.
+#[tokio::test]
+async fn logs_without_a_log_file_is_a_404() {
+    let edge = probes_only(Vec::new()).await;
+    let response = edge.get("/logs").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(text_body(response).await.contains("not logging to a file"));
+}
+
 #[tokio::test]
 async fn healthz_reports_a_null_cache_count_when_the_cache_is_off() {
     let config = RouterConfig {

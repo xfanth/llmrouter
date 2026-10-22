@@ -122,6 +122,56 @@
         }
       }
     },
+    "/version": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "Running build",
+        "description": "Which build is running: the crate version, and the git commit and build time the image was built from. A build outside Docker reports both as unknown.",
+        "responses": {
+          "200": {
+            "description": "The build.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": { "type": "string" },
+                    "git_sha": { "type": "string" },
+                    "built_at": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/logs": {
+      "get": {
+        "tags": ["Router"],
+        "summary": "Recent log lines",
+        "description": "The last lines of this run's log file, as plain text.",
+        "parameters": [
+          {
+            "name": "lines",
+            "in": "query",
+            "required": false,
+            "description": "How many lines off the end. 200 by default, at most 5000.",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 5000 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The log lines.",
+            "content": { "text/plain": { "schema": { "type": "string" } } }
+          },
+          "404": {
+            "description": "The process is not logging to a file.",
+            "content": { "text/plain": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
     "/metrics": {
       "get": {
         "tags": ["Router"],
