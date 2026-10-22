@@ -304,7 +304,28 @@ async fn check_endpoints(client: &reqwest::Client, probes: &[Probe<'_>]) -> Resu
     // the router is up.
     let working = wait_for_healthz(client, probes).await?;
     check_metrics(client, working).await?;
-    check_models(client, working).await
+    check_models(client, working).await?;
+    check_version_and_logs(client, working).await
+}
+
+/// The image is built by Docker, so `/version` carries a real build time, and
+/// the binary in it logs to a file, so `/logs` has this run's startup in it.
+async fn check_version_and_logs(client: &reqwest::Client, probe: &Probe<'_>) -> Result<(), String> {
+    let version = probe.get_json(client, "/version").await?;
+    if !version["version"].is_string() {
+        return Err(format!("/version had no version: {version}"));
+    }
+    if let Probe::Http(base) = probe {
+        let logs = get(client, base, "/logs?lines=50")
+            .await?
+            .text()
+            .await
+            .map_err(|error| format!("GET /logs body failed: {error}"))?;
+        if logs.trim().is_empty() {
+            return Err("/logs was empty".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// The container is up when `/healthz` answers 200 with the status document
