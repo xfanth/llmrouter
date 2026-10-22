@@ -1248,6 +1248,10 @@ cloudflare-workers-ai,@cf/meta/llama,1,0,,128000,4096,\"[\"\"text\"\"]\",llama,1
             parsed.health_poll.probe_timeout,
             defaults.health_poll.probe_timeout
         );
+        assert_eq!(
+            parsed.health_poll.backoff.died_mid_answer.start,
+            defaults.health_poll.backoff.died_mid_answer.start
+        );
         assert_eq!(parsed.cache.max_bytes, defaults.cache.max_bytes);
         assert_eq!(parsed.cache.ttl, defaults.cache.ttl);
         assert_eq!(

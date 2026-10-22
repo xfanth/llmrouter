@@ -95,19 +95,36 @@ LLVM_COV_VERSION=0.9.1
 # throttled, single-threaded, opt-level 1 - was killed by the OOM killer at
 # one crate or another. A release download is instant, needs no compiler
 # memory, and pins to exactly the same version.
+#
+# The check asks `cargo <tool> --version`, which is how cargo finds the tool.
+# It used to ask `<tool> --version`, which is no command at all, so it never
+# matched and every run reinstalled both tools. The download matches the
+# machine: on a Mac the Linux build replaced a working local tool with one
+# that cannot run.
 ensure_tool() {
     local subcommand=$1 want=$2 bin_dir=${CARGO_HOME:-$HOME/.cargo}/bin
-    if ! "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
+    local nextest_os llvm_cov_target
+    case "$(uname -s)" in
+        Darwin)
+            nextest_os=mac
+            llvm_cov_target="$(uname -m | sed 's/arm64/aarch64/')-apple-darwin"
+            ;;
+        *)
+            nextest_os=linux
+            llvm_cov_target=x86_64-unknown-linux-gnu
+            ;;
+    esac
+    if ! cargo "$subcommand" --version 2>/dev/null | grep -qxE "cargo-$subcommand $want( .*)?"; then
         step "installing cargo-$subcommand $want"
         mkdir -p "$bin_dir"
         case "$subcommand" in
             nextest)
-                curl -LsSf "https://get.nexte.st/$want/linux" |
+                curl -LsSf "https://get.nexte.st/$want/$nextest_os" |
                     tar xzf - -C "$bin_dir" cargo-nextest
                 ;;
             llvm-cov)
                 curl -LsSf \
-                    "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$want/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" |
+                    "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$want/cargo-llvm-cov-$llvm_cov_target.tar.gz" |
                     tar xzf - -C "$bin_dir"
                 ;;
             *)
@@ -214,6 +231,12 @@ if [ "${CI_GATE_SERIAL:-0}" = "1" ]; then
         # file is written here, immediately, rather than through a trap: a
         # trap set in the main shell would overwrite itself every iteration
         # and fire once, after the log directory was already deleted.
+        #
+        # `set +e` around it, not `if` or `||`: either would switch `set -e`
+        # off inside the subshell too. Without it the main shell's own
+        # `set -e` killed the whole gate at the first failing job, before the
+        # failed job's log was printed, and CI showed only an exit code.
+        set +e
         (
             set -e
             SECONDS=0
@@ -221,6 +244,7 @@ if [ "${CI_GATE_SERIAL:-0}" = "1" ]; then
             "job_$name" > "$LOG_DIR/$name.log" 2>&1
         )
         job_status=$?
+        set -e
         if [ "$job_status" -eq 0 ]; then
             [ -f "$LOG_DIR/$name.result" ] || echo "pass" > "$LOG_DIR/$name.result"
             echo "    $name: pass"

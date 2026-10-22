@@ -281,7 +281,8 @@ pub struct HealthPollConfig {
     /// Per probe, in either wave and in the poller.
     #[serde(with = "humantime_serde")]
     pub probe_timeout: Duration,
-    /// Default base. A `Retry-After` header overrides it per failure.
+    /// Default base, for a failure the router cannot put in a group: the
+    /// poller's probes. A `Retry-After` header overrides it per failure.
     #[serde(with = "humantime_serde")]
     pub retry_base: Duration,
     /// The ceiling on `retry_base * 2^(counter - 1)`.
@@ -290,6 +291,8 @@ pub struct HealthPollConfig {
     /// Per network test call, both of which run beside every client request.
     #[serde(with = "humantime_serde")]
     pub network_test_timeout: Duration,
+    /// One schedule per kind of failure a live call can have.
+    pub backoff: BackoffGroups,
 }
 
 impl Default for HealthPollConfig {
@@ -299,8 +302,103 @@ impl Default for HealthPollConfig {
             retry_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(24 * 3600),
             network_test_timeout: Duration::from_secs(2),
+            backoff: BackoffGroups::default(),
         }
     }
+}
+
+/// The six kinds of failure a live channel call can have. Each one says
+/// something different about how soon the channel is worth trying again, so
+/// each backs off on its own schedule. Alex's spec, 22 Oct 2026.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureGroup {
+    /// The key is bad, has no access, or is out of credit: `401`, `403` and
+    /// `402`. Rarely fixes itself inside minutes. The other 4xx are the
+    /// request's fault and bench nothing.
+    Account,
+    /// The provider does not serve this model: `404`.
+    ModelMissing,
+    /// The provider is overloaded for now: `429` and any 5xx.
+    Busy,
+    /// The call never got as far as an answer: no connection, a timeout
+    /// (`408` included), or a socket that broke before the first token.
+    Unreachable,
+    /// The provider answered with something that is not an answer: no
+    /// content, a body that will not parse, or an error frame in the stream.
+    BadAnswer,
+    /// The provider started answering and then stopped: the stream went
+    /// quiet, closed early, or the socket broke part way through. The client
+    /// already holds half an answer, so this is the costliest failure there
+    /// is.
+    DiedMidAnswer,
+}
+
+/// `router.yml` -> `health_poll` -> `backoff`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackoffGroups {
+    /// See [`FailureGroup::Account`].
+    pub account: Backoff,
+    /// See [`FailureGroup::ModelMissing`].
+    pub model_missing: Backoff,
+    /// See [`FailureGroup::Busy`].
+    pub busy: Backoff,
+    /// See [`FailureGroup::Unreachable`].
+    pub unreachable: Backoff,
+    /// See [`FailureGroup::BadAnswer`].
+    pub bad_answer: Backoff,
+    /// See [`FailureGroup::DiedMidAnswer`].
+    pub died_mid_answer: Backoff,
+}
+
+impl BackoffGroups {
+    /// The schedule a failure in `group` backs off on.
+    pub fn get(&self, group: FailureGroup) -> &Backoff {
+        match group {
+            FailureGroup::Account => &self.account,
+            FailureGroup::ModelMissing => &self.model_missing,
+            FailureGroup::Busy => &self.busy,
+            FailureGroup::Unreachable => &self.unreachable,
+            FailureGroup::BadAnswer => &self.bad_answer,
+            FailureGroup::DiedMidAnswer => &self.died_mid_answer,
+        }
+    }
+}
+
+impl Default for BackoffGroups {
+    fn default() -> Self {
+        const MINUTE: u64 = 60;
+        const HOUR: u64 = 3600;
+        const DAY: u64 = 24 * HOUR;
+        let schedule = |start: u64, max: u64| Backoff {
+            start: Duration::from_secs(start),
+            multiplier: 2.0,
+            max: Duration::from_secs(max),
+        };
+        Self {
+            account: schedule(HOUR, 30 * DAY),
+            model_missing: schedule(6 * HOUR, 30 * DAY),
+            busy: schedule(30, HOUR),
+            unreachable: schedule(10, HOUR),
+            bad_answer: schedule(MINUTE, DAY),
+            died_mid_answer: schedule(5 * MINUTE, DAY),
+        }
+    }
+}
+
+/// One backoff schedule: `wait = min(max, start * multiplier^(counter - 1))`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backoff {
+    /// The first wait. A `Retry-After` header replaces it for that failure.
+    #[serde(with = "humantime_serde")]
+    pub start: Duration,
+    /// What each further failure multiplies the wait by. Below 1 would shrink
+    /// the wait as failures pile up, so it is floored at 1.
+    pub multiplier: f64,
+    /// The longest wait.
+    #[serde(with = "humantime_serde")]
+    pub max: Duration,
 }
 
 /// `router.yml` -> `cache`.
@@ -1118,6 +1216,38 @@ cache:
         assert!(wait(17) < cap);
         assert_eq!(wait(18), cap);
         assert_eq!(wait(12), 2048);
+    }
+
+    /// The six schedules Alex signed off on 22 Oct 2026, and one of them
+    /// changed from `router.yml` while the rest keep their defaults.
+    #[test]
+    fn each_failure_group_has_its_own_schedule() {
+        let d = BackoffGroups::default();
+        let secs = |b: &Backoff| (b.start.as_secs(), b.max.as_secs());
+        assert_eq!(secs(&d.account), (3600, 30 * 86_400));
+        assert_eq!(secs(&d.model_missing), (6 * 3600, 30 * 86_400));
+        assert_eq!(secs(&d.busy), (30, 3600));
+        assert_eq!(secs(&d.unreachable), (10, 3600));
+        assert_eq!(secs(&d.bad_answer), (60, 86_400));
+        assert_eq!(secs(&d.died_mid_answer), (300, 86_400));
+
+        let cfg: RouterConfig = serde_yaml::from_str(
+            "health_poll:\n  backoff:\n    busy: {start: 5s, multiplier: 3, max: 10m}\n",
+        )
+        .expect("a group set from router.yml");
+        let busy = cfg.health_poll.backoff.get(FailureGroup::Busy);
+        assert_eq!(busy.start, Duration::from_secs(5));
+        assert_eq!(busy.multiplier, 3.0);
+        assert_eq!(busy.max, Duration::from_secs(600));
+        assert_eq!(
+            cfg.health_poll.backoff.died_mid_answer.start,
+            Duration::from_secs(300)
+        );
+        // A schedule missing a field is a typo, not a default.
+        assert!(serde_yaml::from_str::<RouterConfig>(
+            "health_poll:\n  backoff:\n    busy: {start: 5s}\n"
+        )
+        .is_err());
     }
 
     #[test]

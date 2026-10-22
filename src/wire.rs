@@ -330,6 +330,34 @@ pub struct StreamFacts {
     /// The provider's usage block, on a stream that ran to its end. A broken
     /// stream sends no usage: a partial answer is not a whole one.
     pub usage: Option<NeutralUsage>,
+    /// Why the answer broke part way through, or `None` when nothing broke:
+    /// the stream failing, or the provider sending an error frame.
+    pub died: Option<String>,
+    /// The answer's terminal chunk went past. A stream dropped without one,
+    /// and without dying, was abandoned by the client.
+    pub complete: bool,
+}
+
+/// Hands the facts over once, whichever way the tapped stream ends. A client
+/// that stops reading at `message_stop` drops the stream before it reaches
+/// its own end, and the facts must still arrive.
+struct Tap {
+    sender: Option<tokio::sync::oneshot::Sender<StreamFacts>>,
+    facts: StreamFacts,
+}
+
+impl Tap {
+    fn send(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(std::mem::take(&mut self.facts));
+        }
+    }
+}
+
+impl Drop for Tap {
+    fn drop(&mut self) {
+        self.send();
+    }
 }
 
 /// How much answer text one tap keeps for the request log.
@@ -348,42 +376,52 @@ const TAP_TEXT_CHARS: usize = 2_000;
 /// twice, and memory is what killed omniroute, so this watches the stream go
 /// past and keeps five numbers.
 ///
-/// Nothing is sent when the provider reported no usage, so a receiver that
-/// resolves to an error means there was nothing to count.
+/// The facts are sent exactly once, when the stream ends, dies or is dropped.
 pub fn tap_stream(
     chunks: ChunkStream,
 ) -> (ChunkStream, tokio::sync::oneshot::Receiver<StreamFacts>) {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let mut inner = chunks.0;
     let forwarded = async_stream::stream! {
-        let mut facts = StreamFacts { usage: None, text: String::new() };
+        let mut tap = Tap { sender: Some(sender), facts: StreamFacts::default() };
         while let Some(item) = inner.next().await {
             if let Ok(event) = &item {
                 // The last usage block wins: a provider may report more than
                 // once over a stream, and the final figure is the whole
                 // answer's rather than a running part of it.
                 for chunk in event.normalized().iter() {
+                    use switchyard_protocol::stream::LlmResponseChunk;
                     match chunk {
-                        switchyard_protocol::stream::LlmResponseChunk::Usage(reported) => {
-                            facts.usage = Some(reported.clone());
+                        LlmResponseChunk::Usage(reported) => {
+                            tap.facts.usage = Some(reported.clone());
                         }
-                        switchyard_protocol::stream::LlmResponseChunk::TextDelta { text, .. } => {
-                            push_capped(&mut facts.text, text, TAP_TEXT_CHARS);
+                        LlmResponseChunk::TextDelta { text, .. } => {
+                            push_capped(&mut tap.facts.text, text, TAP_TEXT_CHARS);
+                        }
+                        LlmResponseChunk::MessageStop { .. } => tap.facts.complete = true,
+                        // The provider's own error frame, which the decoder
+                        // passes on as an ordinary item. The first one is the
+                        // reason the answer broke.
+                        LlmResponseChunk::StreamError { message }
+                        | LlmResponseChunk::DecodeError { message } => {
+                            tap.facts.died.get_or_insert_with(|| message.clone());
                         }
                         _ => {}
                     }
                 }
             }
-            let failed = item.is_err();
-            yield item;
-            if failed {
+            if let Err(error) = &item {
                 // A broken stream is a partial answer: the text so far goes
-                // to the request log's row, the usage block does not.
-                let _ = sender.send(facts);
+                // to the request log's row, with why it broke. Sent before
+                // the error is passed on, because the server stops reading
+                // at the error.
+                tap.facts.died.get_or_insert_with(|| error.to_string());
+                tap.send();
+                yield item;
                 return;
             }
+            yield item;
         }
-        let _ = sender.send(facts);
     };
     (ChunkStream(Box::pin(forwarded)), receiver)
 }
@@ -655,6 +693,80 @@ mod tests {
             stamps.windows(2).all(|pair| pair[0] == pair[1]),
             "one timestamp for the whole stream, got {stamps:?}"
         );
+    }
+
+    /// A stream that breaks part way says so, even though the server stops
+    /// reading at the error and never polls the tap again. Before this the
+    /// request log wrote every such stream down as a `success` with no
+    /// answer.
+    #[tokio::test]
+    async fn a_tapped_stream_that_breaks_reports_why() {
+        let bytes = futures::stream::iter(vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"half an\"}}]}\n\n".to_vec()),
+            Err(WireError::Stream("no token for 60s".to_owned())),
+        ]);
+        let chunks = decode_stream(bytes, Format::OpenAiChat).expect("the stream decodes");
+        let (mut forwarded, facts) = tap_stream(chunks);
+        // Read up to the error and stop there, as `sse_frames` does.
+        while let Some(item) = forwarded.0.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+        let facts = facts
+            .await
+            .expect("the tap reports before the error goes on");
+        assert_eq!(facts.text, "half an");
+        let died = facts.died.expect("the death is reported");
+        assert!(died.contains("no token for 60s"), "{died}");
+    }
+
+    /// An SDK client stops reading at the terminal event and hangs up, so the
+    /// tap is dropped before its stream reaches its own end. The answer was
+    /// whole, and the request log must say so rather than `client_gone`.
+    #[tokio::test]
+    async fn a_tap_dropped_after_the_terminal_chunk_reports_a_whole_answer() {
+        let bytes = futures::stream::iter(vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n".to_vec()),
+            Ok(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec()),
+        ])
+        .chain(futures::stream::pending());
+        let chunks = decode_stream(bytes, Format::OpenAiChat).expect("the stream decodes");
+        let (mut forwarded, facts) = tap_stream(chunks);
+        let mut seen_stop = false;
+        while !seen_stop {
+            let event = forwarded
+                .0
+                .next()
+                .await
+                .expect("an item")
+                .expect("a good item");
+            seen_stop = event.normalized().iter().any(|chunk| {
+                matches!(
+                    chunk,
+                    switchyard_protocol::stream::LlmResponseChunk::MessageStop { .. }
+                )
+            });
+        }
+        drop(forwarded);
+        let facts = facts.await.expect("the tap reports when dropped");
+        assert!(facts.complete);
+        assert_eq!(facts.died, None);
+    }
+
+    /// A provider's error frame part way through is the answer breaking, even
+    /// though the decoder passes it on as an ordinary item.
+    #[tokio::test]
+    async fn a_tapped_error_frame_reports_why() {
+        let bytes = futures::stream::iter(vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n".to_vec()),
+            Ok(b"data: {\"error\":{\"message\":\"upstream overloaded\"}}\n\n".to_vec()),
+        ]);
+        let chunks = decode_stream(bytes, Format::OpenAiChat).expect("the stream decodes");
+        let (mut forwarded, facts) = tap_stream(chunks);
+        while forwarded.0.next().await.is_some() {}
+        let died = facts.await.expect("the tap reports").died.expect("a death");
+        assert!(died.contains("upstream overloaded"), "{died}");
     }
 
     /// A stream the client abandons part way must leave nothing behind: a

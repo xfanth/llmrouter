@@ -656,20 +656,22 @@ async fn read_body(response: Response) -> Bytes {
 /// winning stream passes through and the only place that can back the channel
 /// off for it.
 ///
-/// The death is also deliberately not sent as an SSE `error` event. An error
-/// event is a *server* verdict, and agent clients such as Claude Code stop on
-/// it; an abruptly closing stream is a *transport* failure, and the same
-/// clients retry the whole request with backoff on one of those. The retry
-/// lands on fresh channels, because the dead channel is already in backoff, so
-/// the client sees its answer rather than an API error. The channel's health
-/// move, the error class and the request-log entry still name the failure.
+/// The death is also deliberately not sent as an SSE `error` event. Claude
+/// Code (checked against 2.1.308) re-sends the whole request after an abrupt
+/// close only while no content block has finished. Once one has, an error
+/// event and an abrupt close both keep the partial answer, and Claude Code
+/// asks the model to resume it, at most three times per turn, before it stops
+/// with `Connection lost mid-response`. Each resume is a fresh request, so the
+/// dead channel's `died_mid_answer` backoff is what sends it to another model.
+/// The channel's health move, the error class and the request-log entry name
+/// the failure.
 fn sse_frames(mut events: EventStream, format: Format) -> SseFrames {
     Box::pin(async_stream::stream! {
         while let Some(item) = events.next().await {
             match item {
                 Ok(value) => yield Ok(sse_event(format, &value)),
                 Err(err) => {
-                    tracing::error!(error = %err, "the winning stream died mid-answer;                         the abrupt close is a transport failure the client will retry");
+                    tracing::error!(error = %err, "the winning stream died mid-answer");
                     return;
                 }
             }
@@ -1148,14 +1150,27 @@ async fn handle_completion(
                             record_usage(&usage_metrics, &usage_provider, usage, rate);
                         }
                     }
+                    // The status line went out as `200` at the first token,
+                    // so the row's outcome is the only place that says how
+                    // the answer really ended. Every one of these used to read
+                    // `success`, which is how seven streams cut off mid-answer
+                    // on 22 Oct 2026 went unseen on the dashboard.
+                    let outcome = match facts.as_ref() {
+                        Some(facts) if facts.died.is_some() => "stream_died",
+                        Some(facts) if facts.complete => "success",
+                        // Dropped before the answer's terminal chunk, which
+                        // only the client hanging up does.
+                        _ => "client_gone",
+                    };
                     let mut entry = crate::reqlog::Entry::finished(
                         endpoint_name(client_format),
                         entry_model,
                         true,
                         200,
-                        "success",
+                        outcome,
                     );
                     if let Some(facts) = facts {
+                        entry.error = facts.died;
                         entry.tokens_out =
                             entry
                                 .tokens_out

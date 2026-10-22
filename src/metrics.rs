@@ -226,7 +226,12 @@ pub enum ErrorClass {
     RateLimited,
     /// `429` this router's own sibling copy caused.
     SelfInflicted429,
-    /// `402`, `413`, or any other 4xx.
+    /// `402`. The account is out of credit.
+    PaymentRequired,
+    /// `408`. The provider gave up waiting for the request.
+    RequestTimeout,
+    /// `400`, `413`, `422`, or any other 4xx. Usually the request's fault,
+    /// not the channel's.
     OtherClientError,
     /// Any 5xx.
     ServerError,
@@ -281,6 +286,8 @@ impl ErrorClass {
             ErrorClass::NotFound => "not_found",
             ErrorClass::RateLimited => "rate_limited",
             ErrorClass::SelfInflicted429 => "self_inflicted_429",
+            ErrorClass::PaymentRequired => "payment_required",
+            ErrorClass::RequestTimeout => "request_timeout",
             ErrorClass::OtherClientError => "other_client_error",
             ErrorClass::ServerError => "server_error",
             ErrorClass::Timeout => "timeout",
@@ -304,13 +311,50 @@ impl ErrorClass {
         match status {
             401 => ErrorClass::Unauthorized,
             403 => ErrorClass::Forbidden,
+            402 => ErrorClass::PaymentRequired,
             404 => ErrorClass::NotFound,
+            408 => ErrorClass::RequestTimeout,
             429 if self_inflicted => ErrorClass::SelfInflicted429,
             429 => ErrorClass::RateLimited,
             400..=499 => ErrorClass::OtherClientError,
             500..=599 => ErrorClass::ServerError,
             _ => ErrorClass::Other,
         }
+    }
+
+    /// The backoff schedule a failure of this class puts the channel on.
+    /// `other` is a call that went wrong in a way nothing names, which looks
+    /// most like one that never reached an answer.
+    ///
+    /// `None` is a failure that does not bench the channel at all: a 4xx such
+    /// as `400`, `413` or `422` is nearly always the request's fault. One bad
+    /// request fails on every channel it reaches, and benching each of them
+    /// would take whole keys and providers down with it. Alex's call, 22 Oct
+    /// 2026.
+    pub fn group(self) -> Option<crate::config::FailureGroup> {
+        use crate::config::FailureGroup;
+        Some(match self {
+            ErrorClass::OtherClientError => return None,
+            ErrorClass::Unauthorized | ErrorClass::Forbidden | ErrorClass::PaymentRequired => {
+                FailureGroup::Account
+            }
+            ErrorClass::NotFound => FailureGroup::ModelMissing,
+            ErrorClass::RateLimited | ErrorClass::SelfInflicted429 | ErrorClass::ServerError => {
+                FailureGroup::Busy
+            }
+            ErrorClass::Connect
+            | ErrorClass::Timeout
+            | ErrorClass::RequestTimeout
+            | ErrorClass::PrefillTransport
+            | ErrorClass::Other => FailureGroup::Unreachable,
+            ErrorClass::NotAnAnswer
+            | ErrorClass::BodyUnparseable
+            | ErrorClass::BodyUndecodable
+            | ErrorClass::StreamError => FailureGroup::BadAnswer,
+            ErrorClass::StreamStalled
+            | ErrorClass::StreamTruncated
+            | ErrorClass::StreamTransport => FailureGroup::DiedMidAnswer,
+        })
     }
 }
 

@@ -341,11 +341,14 @@ async fn a_401_marks_the_channel_unhealthy_and_the_walk_carries_on() {
         .channel_entry(expired_id)
         .expect("the 401 put the channel into backoff");
     assert_eq!(entry.retry_counter, 1);
+    // A dead key is an account failure, which starts at an hour: retrying
+    // it every second only spends requests on a key that is not coming back.
+    // The group's start is not stored as the base, which stays the default.
     assert_eq!(
         entry.retry_base_secs, 1,
-        "no Retry-After, so the configured base"
+        "no Retry-After, so the default base"
     );
-    deadline_is(entry, before, after, 1);
+    deadline_is(entry, before, after, 3600);
 
     // The row the next query reads carries the same deadline, so the channel
     // is out of the list without waiting for anything to be rebuilt.
@@ -357,8 +360,27 @@ async fn a_401_marks_the_channel_unhealthy_and_the_walk_carries_on() {
     assert_eq!(h.channel_entry(alive_id), None);
 }
 
+/// A `400` is nearly always the request's fault: the same bad request fails on
+/// every channel it reaches. Benching each one would empty the catalogue, so
+/// the channel's health is left alone.
 #[tokio::test]
-async fn consecutive_failures_double_the_wait_from_one_second() {
+async fn a_400_benches_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let refused = upstream_serving(rejected(400, "context length exceeded")).await;
+    let good = upstream_serving(good_reply()).await;
+
+    let picky = channel("zai", "key-a", "glm-5", &refused.uri(), 0);
+    let alive = channel("groq", "key-g", "llama-4", &good.uri(), 1);
+    let (picky_id, alive_id) = (picky.id, alive.id);
+
+    let h = Harness::open(dir.path(), vec![picky, alive]).await;
+    assert_eq!(won(&h.race().await), alive_id);
+    assert_eq!(h.channel_entry(picky_id), None, "a 400 benches nothing");
+    assert_eq!(h.row_counters(picky_id), (0, 0));
+}
+
+#[tokio::test]
+async fn consecutive_failures_double_the_wait_from_the_group_start() {
     let dir = TempDir::new().expect("tempdir");
     let dead = upstream_serving(rejected(500, "upstream exploded")).await;
     let good = upstream_serving(good_reply()).await;
@@ -385,7 +407,8 @@ async fn consecutive_failures_double_the_wait_from_one_second() {
     for (index, (entry, before, after)) in waits.into_iter().enumerate() {
         let counter = index as u32 + 1;
         assert_eq!(entry.retry_counter, counter);
-        deadline_is(entry, before, after, 1 << index);
+        // A 500 is the busy group: 30 seconds, then 60, then 120.
+        deadline_is(entry, before, after, 30 << index);
     }
 }
 

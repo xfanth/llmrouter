@@ -1227,6 +1227,41 @@ That handles your Z.ai flat plan without any quota accounting. An exhausted
 monthly allowance returns `429` with a long `Retry-After`, and the channel goes
 quiet for exactly that long instead of wasting a slot in N on every request.
 
+**A failure on a live call backs off by its kind.** The schedule above is the
+default, and the poller's probes still use it. A failed channel call knows why
+it failed, and each kind says something different about how soon the channel is
+worth trying again, so each has its own start, multiplier and cap under
+`health_poll.backoff`:
+
+```
+wait_seconds = min(max, start * multiplier.pow(retry_counter - 1))
+```
+
+| Group | Failure classes | Start | Multiplier | Cap |
+|---|---|---|---|---|
+| `account` | `unauthorized`, `forbidden`, `payment_required` | 1h | 2 | 30 days |
+| `model_missing` | `not_found` | 6h | 2 | 30 days |
+| `busy` | `rate_limited`, `server_error` | 30s | 2 | 1h |
+| `unreachable` | `connect`, `timeout`, `request_timeout`, `prefill_transport`, `other` | 10s | 2 | 1h |
+| `bad_answer` | `not_an_answer`, `body_unparseable`, `body_undecodable`, `stream_error` | 1m | 2 | 1 day |
+| `died_mid_answer` | `stream_stalled`, `stream_truncated`, `stream_transport` | 5m | 2 | 1 day |
+
+`other_client_error` (`400`, `413`, `422` and the rest of the 4xx) benches
+nothing: it is nearly always the request's fault, and one bad request fails on
+every channel it reaches. Benching each of them would take whole keys and
+providers down with it.
+
+`Retry-After` still replaces `start` for that failure, and the cap never cuts it
+short. `retry_counter` is
+shared, so it counts consecutive failures of any kind, and the latest failure's
+schedule sets the wait. A success still resets everything.
+
+`died_mid_answer` is the costliest: the client already holds half an answer.
+Claude Code resumes a cut answer at most three times per turn and then stops
+with `Connection lost mid-response`. With a 1 second wait each resume drew the
+same model again and was cut again; 5 minutes sends the resumes elsewhere.
+Alex's spec, 22 Oct 2026.
+
 ### When the network itself is down
 
 A dropped link would otherwise mark every channel unhealthy in one second, for a
@@ -2036,6 +2071,13 @@ health_poll:
   retry_base: 1s         # default base; Retry-After overrides it per failure
   backoff_max: 24h       # wait = min(backoff_max, retry_base * 2^(counter-1))
   network_test_timeout: 2s  # runs beside every request's upstream calls
+  backoff:               # per kind of failure on a live call; see Backoff
+    account:         {start: 1h,  multiplier: 2, max: 30d}
+    model_missing:   {start: 6h,  multiplier: 2, max: 30d}
+    busy:            {start: 30s, multiplier: 2, max: 1h}
+    unreachable:     {start: 10s, multiplier: 2, max: 1h}
+    bad_answer:      {start: 1m,  multiplier: 2, max: 1d}
+    died_mid_answer: {start: 5m,  multiplier: 2, max: 1d}
 cache:
   enabled: true
   path: /data/cache.redb

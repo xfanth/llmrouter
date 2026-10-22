@@ -63,6 +63,9 @@ pub struct Entry {
     pub request: String,
     /// The first part of the answer text.
     pub response: String,
+    /// Why the answer stopped part way through, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl Entry {
@@ -95,6 +98,7 @@ impl Entry {
             tokens_out: None,
             request: String::new(),
             response: String::new(),
+            error: None,
         }
     }
 
