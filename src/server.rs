@@ -761,7 +761,7 @@ async fn handle_completion(
     };
     drop(body);
 
-    let named_model = crate::wire::named_model(&request);
+    let named_model = route_claude_to_auto(&state.catalogue, crate::wire::named_model(&request));
     // The request's size in tokens, on the same estimate the channel filter
     // runs, so a row can show a size even when no provider reported usage.
     let request_tokens = crate::reqlog::Entry::estimate_tokens(raw_len);
@@ -1658,6 +1658,26 @@ async fn write_cache(
     }
 }
 
+/// A Claude model name that no channel serves becomes `auto`. Claude Code left
+/// on its own model names then works, and it knows the real context window of
+/// a Claude model, which it does not for `auto`. A channel that does serve the
+/// name keeps it.
+fn route_claude_to_auto(catalogue: &Catalogue, named: Option<String>) -> Option<String> {
+    let name = named?;
+    let claude = name
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude-"));
+    if claude
+        && !catalogue
+            .snapshot()
+            .iter()
+            .any(|c| c.model_id.eq_ignore_ascii_case(&name))
+    {
+        return None;
+    }
+    Some(name)
+}
+
 /// Prompt plus requested output, with headroom.
 fn min_context(prompt_tokens: u32, output_tokens: u32) -> u32 {
     let total = u64::from(prompt_tokens) + u64::from(output_tokens);
@@ -2026,14 +2046,12 @@ mod tests {
             .expect("the scratch directory is created")
     }
 
-    /// The 404 gate must use the same comparison as `Channel::matches`, which
-    /// ignores ASCII case. A stricter gate turns away a model the race serves.
-    #[test]
-    fn a_named_model_in_another_case_is_not_rejected_before_the_race() {
+    /// One live `claude-fable-5-1` row with tools and a 128k window.
+    fn fable_channel() -> crate::catalogue::Channel {
         use crate::catalogue::{Channel, ChannelHealth, ChannelId, ChannelTelemetry};
         use crate::WireName;
 
-        let channel = Channel {
+        Channel {
             id: ChannelId::new("openrouter", "sk-1", "claude-fable-5-1"),
             provider: "openrouter".into(),
             model_id: "claude-fable-5-1".into(),
@@ -2052,10 +2070,36 @@ mod tests {
             created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
-        };
+        }
+    }
 
+    #[test]
+    fn an_unserved_claude_name_routes_to_auto_and_a_served_one_is_kept() {
         let catalogue = Catalogue::new();
-        catalogue.replace(vec![channel]);
+        catalogue.replace(vec![fable_channel()]);
+        let route = |name: &str| route_claude_to_auto(&catalogue, Some(name.to_string()));
+
+        assert_eq!(route("claude-opus-5-5"), None, "nothing serves it, so auto");
+        assert_eq!(route("Claude-Haiku-5-5"), None, "the prefix ignores case");
+        assert_eq!(
+            route("Claude-Fable-5-1").as_deref(),
+            Some("Claude-Fable-5-1"),
+            "a channel serves it, so the name is kept"
+        );
+        assert_eq!(
+            route("no-such-model").as_deref(),
+            Some("no-such-model"),
+            "only Claude names fall back; others still get their 404"
+        );
+        assert_eq!(route_claude_to_auto(&catalogue, None), None);
+    }
+
+    /// The 404 gate must use the same comparison as `Channel::matches`, which
+    /// ignores ASCII case. A stricter gate turns away a model the race serves.
+    #[test]
+    fn a_named_model_in_another_case_is_not_rejected_before_the_race() {
+        let catalogue = Catalogue::new();
+        catalogue.replace(vec![fable_channel()]);
 
         let filter = ChannelFilter {
             min_context: 1_000,
