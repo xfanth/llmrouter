@@ -312,6 +312,33 @@ impl ErrorClass {
             _ => ErrorClass::Other,
         }
     }
+
+    /// The backoff schedule a failure of this class puts the channel on.
+    /// `other` is a call that went wrong in a way nothing names, which looks
+    /// most like one that never reached an answer.
+    pub fn group(self) -> crate::config::FailureGroup {
+        use crate::config::FailureGroup;
+        match self {
+            ErrorClass::Unauthorized | ErrorClass::Forbidden | ErrorClass::OtherClientError => {
+                FailureGroup::Account
+            }
+            ErrorClass::NotFound => FailureGroup::ModelMissing,
+            ErrorClass::RateLimited | ErrorClass::SelfInflicted429 | ErrorClass::ServerError => {
+                FailureGroup::Busy
+            }
+            ErrorClass::Connect
+            | ErrorClass::Timeout
+            | ErrorClass::PrefillTransport
+            | ErrorClass::Other => FailureGroup::Unreachable,
+            ErrorClass::NotAnAnswer
+            | ErrorClass::BodyUnparseable
+            | ErrorClass::BodyUndecodable
+            | ErrorClass::StreamError => FailureGroup::BadAnswer,
+            ErrorClass::StreamStalled
+            | ErrorClass::StreamTruncated
+            | ErrorClass::StreamTransport => FailureGroup::DiedMidAnswer,
+        }
+    }
 }
 
 /// Which health table a backoff entry belongs to, as the `kind` label on

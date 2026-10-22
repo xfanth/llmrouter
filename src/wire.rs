@@ -330,6 +330,9 @@ pub struct StreamFacts {
     /// The provider's usage block, on a stream that ran to its end. A broken
     /// stream sends no usage: a partial answer is not a whole one.
     pub usage: Option<NeutralUsage>,
+    /// Why the stream broke part way through, or `None` when it ran to its
+    /// end.
+    pub died: Option<String>,
 }
 
 /// How much answer text one tap keeps for the request log.
@@ -356,7 +359,7 @@ pub fn tap_stream(
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let mut inner = chunks.0;
     let forwarded = async_stream::stream! {
-        let mut facts = StreamFacts { usage: None, text: String::new() };
+        let mut facts = StreamFacts::default();
         while let Some(item) = inner.next().await {
             if let Ok(event) = &item {
                 // The last usage block wins: a provider may report more than
@@ -374,14 +377,17 @@ pub fn tap_stream(
                     }
                 }
             }
-            let failed = item.is_err();
-            yield item;
-            if failed {
+            if let Err(error) = &item {
                 // A broken stream is a partial answer: the text so far goes
-                // to the request log's row, the usage block does not.
+                // to the request log's row, with why it broke. Sent before
+                // the error is passed on, because the server stops reading
+                // at the error, and anything after the yield would never run.
+                facts.died = Some(error.to_string());
                 let _ = sender.send(facts);
+                yield item;
                 return;
             }
+            yield item;
         }
         let _ = sender.send(facts);
     };
@@ -655,6 +661,32 @@ mod tests {
             stamps.windows(2).all(|pair| pair[0] == pair[1]),
             "one timestamp for the whole stream, got {stamps:?}"
         );
+    }
+
+    /// A stream that breaks part way says so, even though the server stops
+    /// reading at the error and never polls the tap again. Before this the
+    /// request log wrote every such stream down as a `success` with no
+    /// answer.
+    #[tokio::test]
+    async fn a_tapped_stream_that_breaks_reports_why() {
+        let bytes = futures::stream::iter(vec![
+            Ok(b"data: {\"choices\":[{\"delta\":{\"content\":\"half an\"}}]}\n\n".to_vec()),
+            Err(WireError::Stream("no token for 60s".to_owned())),
+        ]);
+        let chunks = decode_stream(bytes, Format::OpenAiChat).expect("the stream decodes");
+        let (mut forwarded, facts) = tap_stream(chunks);
+        // Read up to the error and stop there, as `sse_frames` does.
+        while let Some(item) = forwarded.0.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+        let facts = facts
+            .await
+            .expect("the tap reports before the error goes on");
+        assert_eq!(facts.text, "half an");
+        let died = facts.died.expect("the death is reported");
+        assert!(died.contains("no token for 60s"), "{died}");
     }
 
     /// A stream the client abandons part way must leave nothing behind: a

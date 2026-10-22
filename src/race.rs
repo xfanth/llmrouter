@@ -555,7 +555,11 @@ impl Racer {
                     failed_before_win += 1;
                     if let Some(pending) = pending {
                         if link_up {
-                            self.apply_failure(pending.channel, pending.retry_after_secs);
+                            self.apply_failure(
+                                pending.channel,
+                                pending.retry_after_secs,
+                                pending.class,
+                            );
                         } else {
                             // The test has not answered yet. This may be a
                             // local fault, so the counter stays where it is
@@ -768,6 +772,13 @@ impl Racer {
         // channel's or the local link's.
         let self_inflicted = !failures.is_empty() && failures.iter().all(|f| f.self_inflicted);
         let retry_after_secs = longest_retry_after(&failures);
+        // The same copy the `504` quotes, skipping any the router caused
+        // itself: those say nothing about the channel.
+        let class = failures
+            .iter()
+            .rev()
+            .find(|f| !f.self_inflicted)
+            .and_then(|f| f.class);
         TrialOutcome::Failed {
             error: failures
                 .last()
@@ -776,6 +787,7 @@ impl Racer {
             pending: (!self_inflicted).then_some(PendingFailure {
                 channel,
                 retry_after_secs,
+                class,
             }),
         }
     }
@@ -1133,8 +1145,19 @@ impl Racer {
 
     /// Records one failed trial and mirrors the result onto the channel row, so
     /// the next query sees the backoff without waiting for anything else.
-    fn apply_failure(&self, channel: &Channel, retry_after_secs: Option<u64>) {
-        write_failure(&self.health, &self.catalogue, channel, retry_after_secs);
+    fn apply_failure(
+        &self,
+        channel: &Channel,
+        retry_after_secs: Option<u64>,
+        class: Option<ErrorClass>,
+    ) {
+        write_failure(
+            &self.health,
+            &self.catalogue,
+            channel,
+            retry_after_secs,
+            class,
+        );
     }
 
     /// Records a successful trial and clears the channel row's backoff.
@@ -1217,7 +1240,13 @@ fn settle_held(
 ) {
     for pending in held.drain(..) {
         if !link_down {
-            write_failure(health, catalogue, pending.channel, pending.retry_after_secs);
+            write_failure(
+                health,
+                catalogue,
+                pending.channel,
+                pending.retry_after_secs,
+                pending.class,
+            );
         }
     }
 }
@@ -1263,6 +1292,7 @@ fn write_failure(
     catalogue: &Catalogue,
     channel: &Channel,
     retry_after_secs: Option<u64>,
+    class: Option<ErrorClass>,
 ) {
     let now = now_unix();
     // The snapshot is loaded under the rebuild lock: loaded before it, a
@@ -1277,8 +1307,10 @@ fn write_failure(
     // The copy runs under the table entry's lock, so a success on the same
     // channel cannot land between the table write and the row write.
     let row = current_row(channels, channel);
-    health.record_failure_then(
+    record_failure(
+        health,
         &HealthKey::Channel(channel.id),
+        class,
         retry_after_secs,
         now,
         |entry| {
@@ -1293,7 +1325,25 @@ fn write_failure(
                 .store(entry.eligible_at, Ordering::Relaxed);
         },
     );
-    escalate_failure(health, channels, channel, retry_after_secs, now);
+    escalate_failure(health, channels, channel, retry_after_secs, class, now);
+}
+
+/// One failure against `key`, on the schedule its class belongs to, or the
+/// default schedule when nothing says what kind of failure it was.
+fn record_failure(
+    health: &HealthTable,
+    key: &HealthKey,
+    class: Option<ErrorClass>,
+    retry_after_secs: Option<u64>,
+    now: u64,
+    mirror: impl FnOnce(&crate::health::HealthEntry),
+) {
+    match class {
+        Some(class) => {
+            health.record_failure_as_then(key, class.group(), retry_after_secs, now, mirror)
+        }
+        None => health.record_failure_then(key, retry_after_secs, now, mirror),
+    };
 }
 
 /// Walks a channel failure up the two levels above it: the provider/key pair
@@ -1310,6 +1360,7 @@ fn escalate_failure(
     channels: &[Channel],
     failed: &Channel,
     retry_after_secs: Option<u64>,
+    class: Option<ErrorClass>,
     now: u64,
 ) {
     let pair = pair_key(failed);
@@ -1328,7 +1379,7 @@ fn escalate_failure(
     if pair_alive {
         return;
     }
-    health.record_failure_then(&pair, retry_after_secs, now, |entry| {
+    record_failure(health, &pair, class, retry_after_secs, now, |entry| {
         set_hold(channels, pair_level, entry.eligible_at, |c| {
             c.provider == failed.provider && c.key_id == failed.key_id
         });
@@ -1353,7 +1404,7 @@ fn escalate_failure(
         )
     });
     if every_key_down {
-        health.record_failure_then(&provider, retry_after_secs, now, |entry| {
+        record_failure(health, &provider, class, retry_after_secs, now, |entry| {
             set_hold(channels, provider_level, entry.eligible_at, |c| {
                 c.provider == failed.provider
             });
@@ -1432,6 +1483,9 @@ fn clear_hold(
 pub struct PendingFailure<'a> {
     channel: &'a Channel,
     retry_after_secs: Option<u64>,
+    /// Why the trial failed, which picks the backoff schedule. `None` falls
+    /// back to the default one.
+    class: Option<ErrorClass>,
 }
 
 /// What one channel's trial produced, after the M copies have been reduced to
@@ -1892,6 +1946,9 @@ struct FrameCounter {
     >,
     /// Content frames seen so far.
     frames: u32,
+    /// Reasoning frames seen so far. Not tokens, so `tps` never reads them,
+    /// but they prove the model is still working.
+    reasoning: u32,
     /// The stream has carried an in-band provider error frame.
     failed: bool,
 }
@@ -1903,6 +1960,7 @@ impl Default for FrameCounter {
             wire,
             events: eventsource_stream::EventStream::new(rx),
             frames: 0,
+            reasoning: 0,
             failed: false,
         }
     }
@@ -1925,6 +1983,9 @@ impl FrameCounter {
             match crate::health::event_verdict(&event.data) {
                 StreamVerdict::Failed => self.failed = true,
                 StreamVerdict::Content => self.frames = self.frames.saturating_add(1),
+                StreamVerdict::Pending if crate::health::event_is_reasoning(&event.data) => {
+                    self.reasoning = self.reasoning.saturating_add(1);
+                }
                 StreamVerdict::Pending => {}
             }
         }
@@ -2010,6 +2071,13 @@ async fn watch_window<'a>(
             held.push(PendingFailure {
                 channel,
                 retry_after_secs: None,
+                // An error frame is the provider saying so; anything else that
+                // breaks a stream already under way is the stream dying.
+                class: Some(if ready.counter.failed {
+                    ErrorClass::StreamError
+                } else {
+                    ErrorClass::StreamTransport
+                }),
             });
         }
     }
@@ -2129,6 +2197,13 @@ const TAIL_GRACE: Duration = Duration::from_secs(1);
 /// socket open without holding a dead channel open. The content verdict is the
 /// one the race already uses before a winner is picked: `FrameCounter` over
 /// `health::stream_verdict`.
+///
+/// A reasoning frame resets it too. A reasoning model can write a sentence and
+/// then think for minutes before its tool call, sending a reasoning delta
+/// every moment of it. Counting only content cut those streams off at the
+/// stall timeout while they were plainly alive: on 22 Oct 2026 every one of
+/// the live router's seven stalls was Nemotron 3 Ultra, cut 60 seconds after
+/// its last visible word.
 fn watch_for_stalls<S>(
     bytes: S,
     stall: Duration,
@@ -2162,12 +2237,11 @@ where
                 // written, no error sent to the client.
                 Err(_) if complete => return,
                 Err(_) => {
-                    on_death.fire();
+                    on_death.fire(death.record(ErrorClass::StreamStalled));
                     // The one failure the client sees half an answer of. It
                     // is counted here rather than on the copy counters
                     // because the copy won its trial minutes ago: by now this
                     // is the winning stream dying mid-answer.
-                    death.record(ErrorClass::StreamStalled);
                     yield Err(wire::WireError::Stream(format!(
                         "no token for {}s",
                         stall.as_secs()
@@ -2187,19 +2261,18 @@ where
                     return;
                 }
                 Ok(Some(Err(error))) => {
-                    on_death.fire();
+                    on_death.fire(death.record(ErrorClass::StreamTransport));
                     // The socket itself went part way through an answer.
                     // Nobody said anything and the bytes stopped: not a
                     // connection that never opened, and not the clean close
                     // that `stream_truncated` is.
-                    death.record(ErrorClass::StreamTransport);
                     yield Err(wire::WireError::Stream(error.to_string()));
                     return;
                 }
                 Ok(Some(Ok(chunk))) => {
-                    let before = counter.frames;
+                    let before = (counter.frames, counter.reasoning);
                     counter.feed(&chunk);
-                    if counter.frames != before {
+                    if (counter.frames, counter.reasoning) != before {
                         deadline = tokio::time::Instant::now() + stall;
                     }
                     yield Ok(chunk);
@@ -2221,20 +2294,20 @@ struct DeathHook(Arc<Death>);
 
 struct Death {
     fired: AtomicBool,
-    act: Box<dyn Fn() + Send + Sync>,
+    act: Box<dyn Fn(ErrorClass) + Send + Sync>,
 }
 
 impl DeathHook {
-    fn new(act: impl Fn() + Send + Sync + 'static) -> Self {
+    fn new(act: impl Fn(ErrorClass) + Send + Sync + 'static) -> Self {
         Self(Arc::new(Death {
             fired: AtomicBool::new(false),
             act: Box::new(act),
         }))
     }
 
-    fn fire(&self) {
+    fn fire(&self, class: ErrorClass) {
         if !self.0.fired.swap(true, Ordering::Relaxed) {
-            (self.0.act)();
+            (self.0.act)(class);
         }
     }
 }
@@ -2251,7 +2324,9 @@ impl DeathHook {
 struct StreamDeath {
     metrics: Arc<Metrics>,
     provider: Arc<str>,
-    told: Arc<AtomicBool>,
+    /// The class the death was recorded as, set by whichever watcher got
+    /// there first.
+    told: Arc<std::sync::OnceLock<ErrorClass>>,
 }
 
 impl StreamDeath {
@@ -2259,14 +2334,17 @@ impl StreamDeath {
         Self {
             metrics,
             provider: Arc::from(provider),
-            told: Arc::new(AtomicBool::new(false)),
+            told: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
-    fn record(&self, class: ErrorClass) {
-        if !self.told.swap(true, Ordering::Relaxed) {
+    /// Records the death once and returns the class it was recorded as,
+    /// which is `class` only for the first watcher to get here.
+    fn record(&self, class: ErrorClass) -> ErrorClass {
+        *self.told.get_or_init(|| {
             self.metrics.record_error(&self.provider, class);
-        }
+            class
+        })
     }
 }
 
@@ -2277,10 +2355,10 @@ impl StreamDeath {
 /// the stream: the stream outlives the walk that started it, and the catalogue
 /// may have been rebuilt underneath in the meantime. A channel that is gone
 /// from the list has nothing left to back off.
-fn fail_mid_stream(health: &HealthTable, catalogue: &Catalogue, id: ChannelId) {
+fn fail_mid_stream(health: &HealthTable, catalogue: &Catalogue, id: ChannelId, class: ErrorClass) {
     let snapshot = catalogue.snapshot();
     if let Some(channel) = snapshot.iter().find(|channel| channel.id == id) {
-        write_failure(health, catalogue, channel, None);
+        write_failure(health, catalogue, channel, None, Some(class));
     }
 }
 
@@ -2353,7 +2431,8 @@ impl ReadyStream {
         let death = StreamDeath::new(metrics, &self.provider);
         let classified = death.clone();
         let replayed = futures::stream::iter(self.buffered.into_iter().map(Ok)).chain(self.rest);
-        let hook = DeathHook::new(move || fail_mid_stream(&health, &catalogue, channel_id));
+        let hook =
+            DeathHook::new(move |class| fail_mid_stream(&health, &catalogue, channel_id, class));
         let decoded = hook.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let complete = Arc::clone(&finished);
@@ -2373,12 +2452,12 @@ impl ReadyStream {
             // timer from here.
             .on_terminal(move || complete.store(true, Ordering::Relaxed))
             .on_error(move || {
-                decoded.fire();
                 // Whatever the byte stream saw, it saw first and has already
-                // said so. Reaching here unclassified means the bytes were
-                // fine and the answer was not: an error frame part way
-                // through, or a frame the decoder could not read at all.
-                classified.record(ErrorClass::StreamError);
+                // said so, and the health move takes that class. Reaching
+                // here unclassified means the bytes were fine and the answer
+                // was not: an error frame part way through, or a frame the
+                // decoder could not read at all.
+                decoded.fire(classified.record(ErrorClass::StreamError));
             });
         Ok(StreamWinner {
             channel_id: self.channel_id,
@@ -2791,6 +2870,7 @@ mod tests {
                 pending: Some(PendingFailure {
                     channel: &failed,
                     retry_after_secs: None,
+                    class: None,
                 }),
             }
         }));
@@ -2882,19 +2962,19 @@ mod tests {
         // One of the two channels on key-0 dies. The other still answers, so
         // nothing above the channel moves.
         fail_channel(&health, &channels[0], now);
-        escalate_failure(&health, &channels, &channels[0], None, now);
+        escalate_failure(&health, &channels, &channels[0], None, None, now);
         assert!(!is_unhealthy(&health, &pair_zero));
 
         // Now the last one on key-0 dies: the pair goes to the poller. key-1
         // is still healthy, so the provider does not.
         fail_channel(&health, &channels[1], now);
-        escalate_failure(&health, &channels, &channels[1], None, now);
+        escalate_failure(&health, &channels, &channels[1], None, None, now);
         assert!(is_unhealthy(&health, &pair_zero));
         assert!(!is_unhealthy(&health, &provider));
 
         // The last key on the provider dies too.
         fail_channel(&health, &channels[2], now);
-        escalate_failure(&health, &channels, &channels[2], None, now);
+        escalate_failure(&health, &channels, &channels[2], None, None, now);
         assert!(is_unhealthy(&health, &pair_one));
         assert!(is_unhealthy(&health, &provider));
     }
@@ -2922,7 +3002,7 @@ mod tests {
         }
         // The upstream asked for ten minutes on the last one, which is what
         // the pair and the provider back off for.
-        escalate_failure(&health, &channels, &channels[1], Some(600), now);
+        escalate_failure(&health, &channels, &channels[1], Some(600), None, now);
 
         let pair = health
             .get(&pair_key(&channels[0]))
@@ -2974,7 +3054,7 @@ mod tests {
         // key-0 dies and takes its own pair down for five minutes. key-1 is
         // still live, so the provider does not move.
         fail_channel(&health, &channels[0], now);
-        escalate_failure(&health, &channels, &channels[0], Some(300), now);
+        escalate_failure(&health, &channels, &channels[0], Some(300), None, now);
         assert!(!is_unhealthy(&health, &provider));
         assert!(
             !channels[0].eligible(later),
@@ -2989,7 +3069,7 @@ mod tests {
         // provider follows it down, for ten minutes.
         fail_channel(&health, &channels[1], now);
         fail_channel(&health, &channels[2], now);
-        escalate_failure(&health, &channels, &channels[2], Some(600), now);
+        escalate_failure(&health, &channels, &channels[2], Some(600), None, now);
         assert_eq!(
             health
                 .get(&provider)
@@ -3040,7 +3120,7 @@ mod tests {
         for channel in &channels {
             fail_channel(&health, channel, now);
         }
-        escalate_failure(&health, &channels, &channels[2], Some(600), now);
+        escalate_failure(&health, &channels, &channels[2], Some(600), None, now);
         let later = now + 10;
         assert!(
             channels.iter().all(|c| !c.eligible(later)),
@@ -3099,8 +3179,8 @@ mod tests {
         for channel in snapshot.iter() {
             fail_channel(&health, channel, now);
         }
-        escalate_failure(&health, &snapshot, on_key_zero, Some(600), now);
-        escalate_failure(&health, &snapshot, on_key_one, Some(600), now);
+        escalate_failure(&health, &snapshot, on_key_zero, Some(600), None, now);
+        escalate_failure(&health, &snapshot, on_key_one, Some(600), None, now);
         assert_eq!(
             health
                 .get(&HealthKey::Provider("nvidia".to_string()))
@@ -3113,7 +3193,7 @@ mod tests {
 
         // A trial still in flight on key-0 now fails with no `Retry-After`,
         // so its own entry gives it the one second base.
-        write_failure(&health, &catalogue, on_key_zero, None);
+        write_failure(&health, &catalogue, on_key_zero, None, None);
 
         assert!(
             on_key_zero.health.eligible_at.load(Ordering::Relaxed) < later,
@@ -3144,11 +3224,11 @@ mod tests {
         let pair = pair_key(&channels[0]);
 
         fail_channel(&health, &channels[0], now);
-        escalate_failure(&health, &channels, &channels[0], None, now);
+        escalate_failure(&health, &channels, &channels[0], None, None, now);
         let first = health.get(&pair).expect("pair marked");
 
         fail_channel(&health, &channels[0], now);
-        escalate_failure(&health, &channels, &channels[0], None, now);
+        escalate_failure(&health, &channels, &channels[0], None, None, now);
         assert_eq!(health.get(&pair).expect("pair still marked"), first);
     }
 
@@ -3167,6 +3247,7 @@ mod tests {
             .map(|channel| PendingFailure {
                 channel,
                 retry_after_secs: None,
+                class: None,
             })
             .collect();
 
@@ -3192,6 +3273,7 @@ mod tests {
         let mut held = vec![PendingFailure {
             channel: &channels[0],
             retry_after_secs: None,
+            class: None,
         }];
 
         settle_held(&health, &Catalogue::new(), &mut held, false);
@@ -3215,7 +3297,7 @@ mod tests {
         let live = catalogue.snapshot();
         assert_eq!(stale.id, live[0].id);
 
-        write_failure(&health, &catalogue, &stale, Some(3_600));
+        write_failure(&health, &catalogue, &stale, Some(3_600), None);
 
         assert!(
             live[0].health.eligible_at.load(Ordering::Relaxed) > 0,
@@ -3244,7 +3326,7 @@ mod tests {
                 // The rebuild has read a healthy entry. A race now fails the
                 // channel while the new rows are still being built.
                 let fresh = row("chutes", "key-0", "model-a");
-                scope.spawn(|| write_failure(&health, &catalogue, &walk[0], None));
+                scope.spawn(|| write_failure(&health, &catalogue, &walk[0], None, None));
                 std::thread::sleep(Duration::from_millis(100));
                 vec![fresh]
             });
@@ -3854,7 +3936,7 @@ mod tests {
         let watched = watch_for_stalls(
             live,
             STALL,
-            DeathHook::new(move || {
+            DeathHook::new(move |_| {
                 counted.fetch_add(1, Ordering::Relaxed);
             }),
             Arc::new(AtomicBool::new(false)),
@@ -4152,7 +4234,7 @@ mod tests {
         let watched = watch_for_stalls(
             live,
             STALL,
-            DeathHook::new(move || {
+            DeathHook::new(move |_| {
                 counted.fetch_add(1, Ordering::Relaxed);
             }),
             Arc::new(AtomicBool::new(false)),
@@ -4194,11 +4276,98 @@ mod tests {
         let id = channel.id;
         catalogue.replace(vec![channel]);
 
-        fail_mid_stream(&health, &catalogue, id);
+        let before = now_unix();
+        fail_mid_stream(&health, &catalogue, id, ErrorClass::StreamStalled);
 
         let entry = health.get(&HealthKey::Channel(id)).expect("marked");
         assert_eq!(entry.retry_counter, 1);
-        assert!(entry.eligible_at > 0);
+        // The died-mid-answer schedule, not the 1 second default: long enough
+        // that a client resuming the cut answer is served by another model.
+        let wait = entry.eligible_at - before;
+        assert!((300..=301).contains(&wait), "waited {wait}s, not 5 minutes");
+    }
+
+    /// A trial whose copies failed for different reasons backs off on the
+    /// class of the copy the `504` quotes, skipping any the router caused.
+    #[test]
+    fn a_failed_trial_backs_off_on_its_own_class() {
+        let (health, _dir) = health_table();
+        let channels = [row("nvidia", "key-0", "model-a")];
+        let mut held = vec![PendingFailure {
+            channel: &channels[0],
+            retry_after_secs: None,
+            class: Some(ErrorClass::NotFound),
+        }];
+        let before = now_unix();
+
+        settle_held(&health, &Catalogue::new(), &mut held, false);
+
+        let wait = channels[0].health.eligible_at.load(Ordering::Relaxed) - before;
+        assert!(
+            (6 * 3600..=6 * 3600 + 1).contains(&wait),
+            "waited {wait}s, not 6 hours"
+        );
+    }
+
+    /// A reasoning delta is not a token, so it never wins the `tps` window,
+    /// but it is counted as the model working.
+    #[test]
+    fn a_reasoning_frame_is_not_a_token_but_is_counted() {
+        let mut counter = FrameCounter::default();
+        counter.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n");
+        counter.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"hmm\"}}]}\n\n");
+        assert_eq!((counter.frames, counter.reasoning), (0, 2));
+        // An empty one is a keep-alive in disguise, not work.
+        counter.feed(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}\n\n");
+        assert_eq!(counter.reasoning, 2);
+    }
+
+    /// A reasoning model that writes a sentence and then thinks for longer
+    /// than the stall timeout is alive the whole time, and its stream must
+    /// not be cut. Only when the reasoning stops too does the timer fire.
+    /// The live router cut seven Nemotron 3 Ultra streams this way on 22 Oct
+    /// 2026, each 60 seconds after its last visible word.
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_keeps_a_winning_stream_alive() {
+        let deaths = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&deaths);
+        let live: ByteStream = Box::pin(async_stream::stream! {
+            yield Ok(token("x"));
+            for _ in 0..36 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                yield Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n".to_vec());
+            }
+            futures::future::pending::<()>().await;
+        });
+        let watched = watch_for_stalls(
+            live,
+            STALL,
+            DeathHook::new(move |_| {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(AtomicBool::new(false)),
+            StreamDeath::new(
+                Arc::new(Metrics::new().expect("the prometheus recorder builds")),
+                "nvidia",
+            ),
+        );
+        futures::pin_mut!(watched);
+
+        assert!(watched.next().await.expect("the first token").is_ok());
+        let started = tokio::time::Instant::now();
+        // Three minutes of reasoning: three times the stall timeout.
+        for _ in 0..36 {
+            assert!(watched.next().await.expect("a reasoning frame").is_ok());
+        }
+        assert_eq!(
+            deaths.load(Ordering::Relaxed),
+            0,
+            "cut while still reasoning"
+        );
+        let stalled = watched.next().await.expect("the stall once it goes quiet");
+        assert!(stalled.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(180) + STALL);
+        assert_eq!(deaths.load(Ordering::Relaxed), 1);
     }
 
     #[test]

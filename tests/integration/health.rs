@@ -341,11 +341,13 @@ async fn a_401_marks_the_channel_unhealthy_and_the_walk_carries_on() {
         .channel_entry(expired_id)
         .expect("the 401 put the channel into backoff");
     assert_eq!(entry.retry_counter, 1);
+    // A dead key is an account failure, which starts at an hour: retrying
+    // it every second only spends requests on a key that is not coming back.
     assert_eq!(
-        entry.retry_base_secs, 1,
-        "no Retry-After, so the configured base"
+        entry.retry_base_secs, 3600,
+        "no Retry-After, so the account group's start"
     );
-    deadline_is(entry, before, after, 1);
+    deadline_is(entry, before, after, 3600);
 
     // The row the next query reads carries the same deadline, so the channel
     // is out of the list without waiting for anything to be rebuilt.
@@ -358,7 +360,7 @@ async fn a_401_marks_the_channel_unhealthy_and_the_walk_carries_on() {
 }
 
 #[tokio::test]
-async fn consecutive_failures_double_the_wait_from_one_second() {
+async fn consecutive_failures_double_the_wait_from_the_group_start() {
     let dir = TempDir::new().expect("tempdir");
     let dead = upstream_serving(rejected(500, "upstream exploded")).await;
     let good = upstream_serving(good_reply()).await;
@@ -385,7 +387,8 @@ async fn consecutive_failures_double_the_wait_from_one_second() {
     for (index, (entry, before, after)) in waits.into_iter().enumerate() {
         let counter = index as u32 + 1;
         assert_eq!(entry.retry_counter, counter);
-        deadline_is(entry, before, after, 1 << index);
+        // A 500 is the busy group: 30 seconds, then 60, then 120.
+        deadline_is(entry, before, after, 30 << index);
     }
 }
 

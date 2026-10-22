@@ -6,9 +6,15 @@
 //! top. A success resets the counter to 0 and the base to the configured
 //! `health_poll.retry_base`.
 //!
+//! A failure on a live channel call knows what kind it was, and backs off on
+//! that kind's own schedule from `health_poll.backoff` instead:
+//! `wait = min(max, start * multiplier^(counter - 1))`, with `Retry-After`
+//! still replacing `start`. The counter is shared, so it counts consecutive
+//! failures of any kind, and the latest failure's schedule sets the wait.
+//! The poller's probes have no kind and keep the default schedule.
+//!
 //! Health is binary and uses the same test the race uses to pick a winner: a
-//! 2xx carrying non-empty content is healthy, everything else is not. No
-//! classifying failures into kinds.
+//! 2xx carrying non-empty content is healthy, everything else is not.
 //!
 //! The table lives in memory while running, flushes to redb every 5 minutes
 //! and on shutdown, and loads back at startup. Deadlines are stored absolute,
@@ -22,6 +28,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::catalogue::ChannelId;
+use crate::config::{Backoff, BackoffGroups, FailureGroup};
 use crate::metrics::{BackoffKind, Metrics};
 use crate::RouterError;
 
@@ -93,6 +100,7 @@ pub struct HealthTable {
     db: Arc<Database>,
     retry_base: Duration,
     backoff_max: Duration,
+    groups: BackoffGroups,
     metrics: Metrics,
 }
 
@@ -134,8 +142,16 @@ impl HealthTable {
             db,
             retry_base,
             backoff_max,
+            groups: BackoffGroups::default(),
             metrics,
         })
+    }
+
+    /// Replaces the per-group schedules, which otherwise start at their
+    /// defaults.
+    pub fn with_groups(mut self, groups: BackoffGroups) -> Self {
+        self.groups = groups;
+        self
     }
 
     /// The configured default base, for callers mirroring health elsewhere.
@@ -181,6 +197,31 @@ impl HealthTable {
         now_unix: u64,
         mirror: impl FnOnce(&HealthEntry),
     ) -> HealthEntry {
+        self.record(key, None, retry_after_secs, now_unix, mirror)
+    }
+
+    /// `record_failure_then` for a failure whose kind is known, which backs
+    /// off on that kind's schedule rather than the default one.
+    pub fn record_failure_as_then(
+        &self,
+        key: &HealthKey,
+        group: FailureGroup,
+        retry_after_secs: Option<u64>,
+        now_unix: u64,
+        mirror: impl FnOnce(&HealthEntry),
+    ) -> HealthEntry {
+        let schedule = self.groups.get(group);
+        self.record(key, Some(schedule), retry_after_secs, now_unix, mirror)
+    }
+
+    fn record(
+        &self,
+        key: &HealthKey,
+        schedule: Option<&Backoff>,
+        retry_after_secs: Option<u64>,
+        now_unix: u64,
+        mirror: impl FnOnce(&HealthEntry),
+    ) -> HealthEntry {
         let (applied, wait) = {
             let mut entry = self
                 .entries
@@ -191,12 +232,24 @@ impl HealthTable {
                 // A date already past parses to 0. Floor the base at 1 second, or
                 // the thing would be eligible again at once and never back off.
                 entry.retry_base_secs = secs.max(1);
+            } else if let Some(schedule) = schedule {
+                // The group's own start, every time: a base an earlier failure
+                // of another kind left behind says nothing about this one.
+                entry.retry_base_secs = schedule.start.as_secs().max(1);
             }
-            let wait = wait_seconds(
-                entry.retry_counter,
-                entry.retry_base_secs,
-                self.backoff_max.as_secs(),
-            );
+            let wait = match schedule {
+                Some(schedule) => scaled_wait_seconds(
+                    entry.retry_counter,
+                    entry.retry_base_secs,
+                    schedule.multiplier,
+                    schedule.max.as_secs(),
+                ),
+                None => wait_seconds(
+                    entry.retry_counter,
+                    entry.retry_base_secs,
+                    self.backoff_max.as_secs(),
+                ),
+            };
             entry.eligible_at = now_unix.saturating_add(wait);
             mirror(&entry);
             (*entry, wait)
@@ -349,6 +402,29 @@ pub fn wait_seconds(retry_counter: u32, retry_base_secs: u64, backoff_max_secs: 
     wait.min(backoff_max_secs)
 }
 
+/// `wait = min(max, base * multiplier^(counter - 1))`, for the per-group
+/// schedules. A multiplier below 1 is read as 1, so the wait never shrinks as
+/// failures pile up. A counter of 0 means healthy and waits nothing.
+pub fn scaled_wait_seconds(
+    retry_counter: u32,
+    base_secs: u64,
+    multiplier: f64,
+    max_secs: u64,
+) -> u64 {
+    if retry_counter == 0 {
+        return 0;
+    }
+    let shift = i32::try_from(retry_counter - 1).unwrap_or(i32::MAX);
+    let wait = base_secs as f64 * multiplier.max(1.0).powi(shift);
+    // A wait too large for f64, or an infinite multiplier, lands on the cap.
+    // A NaN multiplier never gets here: `max(1.0)` above turns it into 1.
+    if wait.is_finite() && wait < max_secs as f64 {
+        wait as u64
+    } else {
+        max_secs
+    }
+}
+
 /// Parses a `Retry-After` header. Handles both forms: a count of seconds, and
 /// an HTTP date, which becomes the seconds between `now` and that date. A date
 /// already past gives 0. `httpdate` covers all three date forms RFC 9110
@@ -435,6 +511,33 @@ pub fn event_verdict(data: &str) -> StreamVerdict {
     } else {
         StreamVerdict::Pending
     }
+}
+
+/// One decoded event carries reasoning: an OpenAI chat chunk whose delta holds
+/// `reasoning_content` (z.ai, DeepSeek, NVIDIA), `reasoning` (OpenRouter) or
+/// `reasoning_details`. Not an answer, so it never wins a race, but it is the
+/// model working. Anthropic's `thinking_delta` already counts as content.
+pub fn event_is_reasoning(data: &str) -> bool {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
+        return false;
+    };
+    let Some(choices) = json.get("choices").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    choices
+        .iter()
+        .filter_map(|choice| choice.get("delta"))
+        .any(|delta| {
+            ["reasoning_content", "reasoning"].iter().any(|key| {
+                delta
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+            }) || delta
+                .get("reasoning_details")
+                .and_then(|v| v.as_array())
+                .is_some_and(|v| !v.is_empty())
+        })
 }
 
 /// One decoded event carries something the client would call an answer.
@@ -757,6 +860,45 @@ mod tests {
         // And a success puts the base back to the configured default.
         t.record_success(&k);
         assert_eq!(t.record_failure(&k, None, 0).eligible_at, 30);
+    }
+
+    /// A failure of a known kind waits on that kind's schedule, not the
+    /// default one. A model that died mid-answer sits out 5 minutes, then 10,
+    /// where the default would have given it 1 second, then 2: short enough
+    /// that a client resuming the cut answer drew the same model again.
+    #[test]
+    fn a_grouped_failure_waits_on_its_own_schedule() {
+        let (t, _d) = table_with_base(1, HOUR);
+        let k = provider("nvidia");
+        let fail = |group, retry_after| {
+            t.record_failure_as_then(&k, group, retry_after, 0, |_| {})
+                .eligible_at
+        };
+        assert_eq!(fail(FailureGroup::DiedMidAnswer, None), 300);
+        assert_eq!(fail(FailureGroup::DiedMidAnswer, None), 600);
+        // The counter is shared, and the latest failure's schedule applies:
+        // the third failure in a row, as busy, is 30 * 2^2.
+        assert_eq!(fail(FailureGroup::Busy, None), 120);
+        // `Retry-After` still replaces the start.
+        assert_eq!(fail(FailureGroup::Busy, Some(7)), 56);
+        // The group's own cap, not `backoff_max`: busy stops at an hour.
+        for _ in 0..20 {
+            fail(FailureGroup::Busy, None);
+        }
+        assert_eq!(fail(FailureGroup::Busy, None), HOUR);
+        t.record_success(&k);
+        assert_eq!(fail(FailureGroup::ModelMissing, None), 6 * HOUR);
+    }
+
+    #[test]
+    fn a_scaled_wait_never_shrinks_and_stops_at_its_cap() {
+        assert_eq!(scaled_wait_seconds(0, 10, 2.0, HOUR), 0);
+        assert_eq!(scaled_wait_seconds(3, 10, 1.5, HOUR), 22);
+        // Below 1 is read as 1, so the wait stays put rather than shrinking.
+        assert_eq!(scaled_wait_seconds(5, 10, 0.5, HOUR), 10);
+        assert_eq!(scaled_wait_seconds(5, 10, f64::NAN, HOUR), 10);
+        assert_eq!(scaled_wait_seconds(u32::MAX, u64::MAX, 2.0, HOUR), HOUR);
+        assert_eq!(scaled_wait_seconds(2, 10, f64::INFINITY, HOUR), HOUR);
     }
 
     /// The mirror is what keeps a channel row in step with the table, so it

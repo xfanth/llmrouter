@@ -143,12 +143,15 @@ fn build_state(config: Arc<Config>) -> anyhow::Result<Arc<llmrouter::AppState>> 
     // set of counters and a test can hold its own.
     let metrics = Arc::new(Metrics::new()?);
 
-    let health = Arc::new(HealthTable::open(
-        Arc::clone(&db),
-        router.health_poll.retry_base,
-        router.health_poll.backoff_max,
-        (*metrics).clone(),
-    )?);
+    let health = Arc::new(
+        HealthTable::open(
+            Arc::clone(&db),
+            router.health_poll.retry_base,
+            router.health_poll.backoff_max,
+            (*metrics).clone(),
+        )?
+        .with_groups(router.health_poll.backoff.clone()),
+    );
     let cache = if router.cache.enabled {
         Some(Arc::new(Cache::open(
             db,
