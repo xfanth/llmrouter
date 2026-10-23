@@ -818,6 +818,84 @@ async fn the_keepalive_sends_spaces_until_the_answer_and_nothing_after_it() {
     );
 }
 
+/// A channel that can serve the request exists, so the `200` goes out at
+/// once, and every channel then failing reaches Claude Code inside the body
+/// as an Anthropic `overloaded_error`, the shape it retries. Before, the
+/// router waited one keepalive interval to commit and then sent its own
+/// error body, which Claude Code read as "not a Message" and gave up on.
+#[tokio::test]
+async fn every_channel_failing_after_the_200_is_an_overloaded_error_event() {
+    let server = upstream_serving(
+        ResponseTemplate::new(503)
+            .set_body_json(json!({"error": {"message": "upstream busy"}}))
+            .set_delay(Duration::from_millis(200)),
+    )
+    .await;
+    let config = RouterConfig {
+        // Far longer than the test: only the channel check can commit.
+        keepalive_interval: Duration::from_secs(60),
+        ..plain_config()
+    };
+    let edge = Edge::new(
+        config,
+        vec![channel(&base_url(&server), "fake-model", FAKE_KEY, 200_000)],
+        Link::Up,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let response = edge
+        .post_messages(&json!({
+            "model": "auto",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "ping" }],
+        }))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "the 200 went out before the provider answered, not after an interval"
+    );
+    let body = text_body(response).await;
+    let data = body
+        .split("event: error\ndata: ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .unwrap_or_else(|| panic!("no error event in {body}"));
+    let error: Value = serde_json::from_str(data).expect("the event data is JSON");
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "overloaded_error");
+}
+
+/// No channel can serve the request right now, so nothing is committed and
+/// the failure keeps its own status line, keepalive or not.
+#[tokio::test]
+async fn no_callable_channel_keeps_its_own_status_with_the_keepalive_on() {
+    let benched = channel(
+        "https://example.invalid/v1",
+        "fake-model",
+        FAKE_KEY,
+        200_000,
+    );
+    benched
+        .health
+        .eligible_at
+        .store(u64::MAX, Ordering::Relaxed);
+    let config = RouterConfig {
+        keepalive_interval: Duration::from_millis(20),
+        ..plain_config()
+    };
+    let edge = Edge::new(config, vec![benched], Link::Up).await;
+
+    let response = edge.post_chat(&chat_request("ping", true)).await;
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "nothing could serve it, so no 200 was committed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Client disconnect.
 // ---------------------------------------------------------------------------

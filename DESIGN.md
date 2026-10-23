@@ -940,6 +940,31 @@ Stop the keepalive the moment the first real byte goes out. For a streaming
 client that is the winner's first token. For a non-streaming client it is the
 opening brace of the body.
 
+**When the `200` goes out.** The status line goes out once, before the first
+keepalive byte, so a failure decided after it can only travel inside the body.
+
+* A streaming client is committed the moment the router knows a channel that
+  can serve this request exists right now: it fits the context, supports tools
+  if the request has them, matches a named model, and is out of backoff. That
+  is the check the race itself starts from, a millisecond or so into the
+  request. Everything with a status code of its own is decided before it: the
+  `400` of a bad body, the `404` of an unknown model, the `413` of a prompt
+  nothing can hold, the `503` of the memory gate, and the `504` of a catalogue
+  with nothing callable. Only the race is left after it.
+* A non-streaming client is committed only once a whole `keepalive_interval`
+  has passed with no answer. Its SDK reads a `200` body as the answer, so an
+  error inside one is "not a Message" whatever its shape. Claude Code's
+  non-streaming fallback stopped on exactly that in testing, where it retries
+  a real `504`.
+
+**A failure after the `200` goes out in the client's own error shape.** An
+Anthropic stream gets an `error` event carrying
+`{"type": "error", "error": {"type": "overloaded_error", "message": ...}}`,
+which Claude Code retries with backoff. An OpenAI client gets
+`{"error": {"message": ..., "type": "server_error", "code": ...}}`. The
+router's own `{"error": "no_channel", ...}` body read as a malformed reply and
+was not retried. Alex's spec, 23 Oct 2026.
+
 ### Commitment
 
 Once a token reaches the client, the router is committed to that channel. There

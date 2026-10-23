@@ -389,12 +389,16 @@ pub async fn metrics_endpoint(state: axum::extract::State<Arc<AppState>>) -> Res
 /// The keepalive is what DESIGN.md "Keepalive" asks for, and it costs
 /// something: the status line goes out before the first body byte, so once a
 /// keepalive byte has been sent the response is committed to `200` and a later
-/// `502` or `504` can only be delivered inside that body. Nothing is sent for
-/// the first `keepalive_interval`, so every outcome decided inside it keeps its
-/// own status line, which is every outcome except a slow race. Past that the
-/// choice is between a committed `200` and a client that hangs up at 10
-/// minutes with nothing at all, and DESIGN.md settles it: "A router that only
-/// works after the client is reconfigured is a broken router."
+/// `502` or `504` can only be delivered inside that body, in the client's own
+/// error shape. For a streaming client the commit waits for exactly one thing:
+/// the router knowing that a channel able to serve this request exists right
+/// now (a non-streaming client keeps the interval: see [`with_keepalive`]).
+/// Every outcome
+/// with a status code of its own (`400`, `404`, `413`, `503`, and the `504`
+/// of a catalogue with nothing callable) is decided before that, so each
+/// keeps its own status line. What is left after it is the race itself, and
+/// a race can take minutes. Alex's spec, 23 Oct 2026, replacing a wait of
+/// one `keepalive_interval` before committing.
 async fn completion_response(
     state: Arc<AppState>,
     client_format: Format,
@@ -514,6 +518,7 @@ async fn respond(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let interval = state.config.router.keepalive_interval;
+    let (ready, can_serve) = tokio::sync::oneshot::channel();
 
     with_keepalive(
         Box::pin(
@@ -526,11 +531,14 @@ async fn respond(
                 started,
                 client,
                 request_snippet,
+                ready,
             )
             .in_current_span(),
         ),
         wants_stream,
         interval,
+        client_format,
+        can_serve,
     )
     .await
 }
@@ -575,22 +583,79 @@ type SseFrames = Pin<Box<dyn Stream<Item = std::result::Result<Event, Infallible
 /// The completion path, with a keepalive byte every `interval` until the first
 /// real byte of the answer.
 ///
-/// Nothing goes out while the first interval runs, so an outcome decided in
-/// that window keeps its own status code. After it the response is committed
-/// to `200`: see [`completion_response`].
+/// A streaming client: nothing goes out until the work says, through
+/// `can_serve`, that a channel able to serve the request exists, so every
+/// outcome decided before that keeps its own status code. The moment it does,
+/// the response is committed to `200`: see [`completion_response`]. Work that
+/// ends without saying so, which is every early rejection, is answered as it
+/// stands.
+///
+/// A non-streaming client commits only once a whole `interval` has passed
+/// with no answer. Its SDK reads a `200` body as the answer itself, so an
+/// error inside one can only ever be "not a Message": Claude Code's
+/// non-streaming fallback stopped on exactly that in testing, 23 Oct 2026,
+/// where a real `504` is one it retries. Committing such a client early would
+/// turn every quick failure into that.
 async fn with_keepalive(
     mut work: Pin<Box<dyn Future<Output = Served> + Send>>,
     wants_stream: bool,
     interval: Duration,
+    format: Format,
+    can_serve: tokio::sync::oneshot::Receiver<()>,
 ) -> Response {
     // Zero turns the keepalive off, which is the behaviour without it: every
     // outcome keeps its own status line and a slow client hangs up.
     if interval.is_zero() {
         return work.await.into_response();
     }
-    match tokio::time::timeout(interval, &mut work).await {
-        Ok(served) => served.into_response(),
-        Err(_) => committed(work, wants_stream, interval),
+    if !wants_stream {
+        return match tokio::time::timeout(interval, &mut work).await {
+            Ok(served) => served.into_response(),
+            Err(_) => committed(work, wants_stream, interval, format),
+        };
+    }
+    // Biased towards the work: an answer that is already in hand goes out
+    // with its own status line rather than inside a committed `200`. A
+    // dropped sender is an error, which this pattern does not match, so that
+    // branch is simply disabled and the work is awaited.
+    tokio::select! {
+        biased;
+        served = &mut work => served.into_response(),
+        Ok(()) = can_serve => committed(work, wants_stream, interval, format),
+    }
+}
+
+/// An error decided after the `200` went out, in the shape the client's own
+/// SDK reads, so it is retried rather than reported as a malformed reply.
+/// Claude Code reads the router's own `{"error": "no_channel", ...}` body as
+/// "not a Message" and stops; an Anthropic `overloaded_error` it retries.
+fn in_band_error(format: Format, status: StatusCode, body: &[u8]) -> Value {
+    let router: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let message = router
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    let tag = router
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    let busy = status.is_server_error();
+    match format {
+        Format::AnthropicMessages => json!({
+            "type": "error",
+            "error": {
+                "type": if busy { "overloaded_error" } else { "invalid_request_error" },
+                "message": message,
+            },
+        }),
+        Format::OpenAiChat | Format::OpenAiResponses => json!({
+            "error": {
+                "message": message,
+                "type": if busy { "server_error" } else { "invalid_request_error" },
+                "code": tag,
+            },
+        }),
     }
 }
 
@@ -600,6 +665,7 @@ fn committed(
     work: Pin<Box<dyn Future<Output = Served> + Send>>,
     wants_stream: bool,
     interval: Duration,
+    format: Format,
 ) -> Response {
     if wants_stream {
         // `: ping`, which the server-sent-events spec says a client must
@@ -633,9 +699,13 @@ fn committed(
                         "the keepalive had already committed the status line, so the outcome goes out as an sse error event"
                     );
                     let body = read_body(response).await;
-                    yield Ok(Event::default()
-                        .event("error")
-                        .data(String::from_utf8_lossy(&body)));
+                    let error = in_band_error(format, status, &body).to_string();
+                    // Anthropic names its events; OpenAI carries an error
+                    // chunk as plain data.
+                    yield Ok(match format {
+                        Format::AnthropicMessages => Event::default().event("error").data(error),
+                        Format::OpenAiChat | Format::OpenAiResponses => Event::default().data(error),
+                    });
                 }
             }
         };
@@ -658,13 +728,16 @@ fn committed(
             match served {
                 Served::Whole(response) => {
                     let status = response.status();
-                    if !status.is_success() {
+                    let body = read_body(response).await;
+                    if status.is_success() {
+                        yield Ok(body);
+                    } else {
                         tracing::warn!(
                             status = status.as_u16(),
                             "the keepalive had already committed the status line, so the outcome goes out inside a 200 body"
                         );
+                        yield Ok(Bytes::from(in_band_error(format, status, &body).to_string()));
                     }
-                    yield Ok(read_body(response).await);
                 }
                 // A client that did not ask for a stream is never handed one:
                 // `handle_completion` folds it into one piece first.
@@ -776,6 +849,10 @@ fn sse_event(format: Format, value: &Value) -> Event {
 ///
 /// `started` is when the request reached the router. The caller takes it
 /// before the admission gate so that the gate counts as router overhead too.
+///
+/// `can_serve` is fired once a channel able to serve the request is known to
+/// exist, which is the moment the keepalive commits the response to `200`:
+/// see [`completion_response`].
 #[allow(clippy::too_many_arguments)] // the request-log row rides the same list
 async fn handle_completion(
     state: Arc<AppState>,
@@ -786,6 +863,7 @@ async fn handle_completion(
     started: Instant,
     client: String,
     request_snippet: String,
+    can_serve: tokio::sync::oneshot::Sender<()>,
 ) -> Served {
     let (_concurrency, concurrent) = Concurrency::open();
 
@@ -925,6 +1003,16 @@ async fn handle_completion(
         }
     };
     drop(request);
+
+    // Every outcome with a status code of its own is behind us. If a channel
+    // can serve this request right now, the race is all that is left, so the
+    // keepalive may commit the `200` and start pinging. If none can, the
+    // race fails fast and that failure keeps its own status line.
+    let channels = state.catalogue.snapshot();
+    if !crate::catalogue::query(&channels, &filter, &HashSet::new(), 1, now_unix()).is_empty() {
+        let _ = can_serve.send(());
+    }
+    drop(channels);
 
     // Dropping this future, which is what axum does when the client goes
     // away, fires the token and tears down every channel call. The walk runs
@@ -2402,7 +2490,14 @@ mod tests {
             .expect("the whole answer chunks out")
         });
 
-        let response = with_keepalive(work, true, Duration::from_secs(15)).await;
+        let response = with_keepalive(
+            work,
+            true,
+            Duration::from_secs(15),
+            Format::OpenAiChat,
+            can_serve_now(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
@@ -2433,7 +2528,14 @@ mod tests {
             Served::Whole(axum::Json(json!({"id": "1", "content": "the answer"})).into_response())
         });
 
-        let response = with_keepalive(work, false, Duration::from_secs(15)).await;
+        let response = with_keepalive(
+            work,
+            false,
+            Duration::from_secs(15),
+            Format::OpenAiChat,
+            can_serve_now(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
 
@@ -2452,13 +2554,24 @@ mod tests {
         assert_eq!(parsed["content"], "the answer");
     }
 
-    /// An outcome decided inside the first interval has sent nothing yet, so it
-    /// keeps its own status line. That is every outcome except a slow race.
+    /// A fired `can_serve`: a channel able to serve the request is known.
+    fn can_serve_now() -> tokio::sync::oneshot::Receiver<()> {
+        let (ready, can_serve) = tokio::sync::oneshot::channel();
+        ready.send(()).expect("the receiver is still here");
+        can_serve
+    }
+
+    /// An outcome decided before any channel is known to be able to serve the
+    /// request has sent nothing yet, so it keeps its own status line, however
+    /// long it took. No timer commits the response.
     #[tokio::test(start_paused = true)]
-    async fn an_outcome_decided_before_the_first_keepalive_keeps_its_status_line() {
-        for wants_stream in [false, true] {
-            let work = Box::pin(async {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+    async fn an_outcome_decided_before_a_channel_is_known_keeps_its_status_line() {
+        // A streaming client past several intervals, which the old timer would
+        // have committed; a non-streaming client inside its one interval.
+        for (wants_stream, after) in [(true, 50), (false, 5)] {
+            let (_ready, can_serve) = tokio::sync::oneshot::channel();
+            let work = Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(after)).await;
                 Served::Whole(
                     ApiError::NoChannel {
                         attempts: 3,
@@ -2468,7 +2581,14 @@ mod tests {
                 )
             });
 
-            let response = with_keepalive(work, wants_stream, Duration::from_secs(15)).await;
+            let response = with_keepalive(
+                work,
+                wants_stream,
+                Duration::from_secs(15),
+                Format::AnthropicMessages,
+                can_serve,
+            )
+            .await;
             assert_eq!(
                 response.status(),
                 StatusCode::GATEWAY_TIMEOUT,
@@ -2494,8 +2614,125 @@ mod tests {
             )
         });
 
-        let response = with_keepalive(work, false, Duration::ZERO).await;
+        let response = with_keepalive(
+            work,
+            false,
+            Duration::ZERO,
+            Format::OpenAiChat,
+            can_serve_now(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    /// The moment a channel is known to be able to serve a streaming
+    /// client's request, the `200` goes out, without waiting for the interval.
+    #[tokio::test(start_paused = true)]
+    async fn the_200_goes_out_the_moment_a_channel_can_serve() {
+        // A non-streaming client is not committed early, channel or not: the
+        // padding only starts once a whole interval has passed.
+        let quick = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Served::Whole(
+                ApiError::NoChannel {
+                    attempts: 1,
+                    last_error: None,
+                }
+                .into_response(),
+            )
+        });
+        let plain = with_keepalive(
+            quick,
+            false,
+            Duration::from_secs(15),
+            Format::AnthropicMessages,
+            can_serve_now(),
+        )
+        .await;
+        assert_eq!(plain.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let started = tokio::time::Instant::now();
+        let work = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Served::Whole(StatusCode::OK.into_response())
+        });
+        let response = with_keepalive(
+            work,
+            true,
+            Duration::from_secs(15),
+            Format::AnthropicMessages,
+            can_serve_now(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(started.elapsed(), Duration::ZERO, "no interval was waited");
+    }
+
+    /// Every channel failing after the `200` went out reaches a streaming
+    /// Anthropic client as an `overloaded_error` event, which Claude Code
+    /// retries. The router's own error body it read as not a Message and
+    /// stopped.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_after_the_200_reaches_an_anthropic_stream_as_overloaded() {
+        let work = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Served::Whole(
+                ApiError::NoChannel {
+                    attempts: 4,
+                    last_error: Some("status 503".to_string()),
+                }
+                .into_response(),
+            )
+        });
+        let response = with_keepalive(
+            work,
+            true,
+            Duration::from_secs(15),
+            Format::AnthropicMessages,
+            can_serve_now(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        let data = body
+            .split("event: error\ndata: ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or_else(|| panic!("no error event: {body}"));
+        let error: Value = serde_json::from_str(data).expect("the event data is JSON");
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "overloaded_error");
+        assert!(error["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()));
+    }
+
+    /// The same failure for a non-streaming OpenAI client is an OpenAI error
+    /// object after the padding, so its SDK reads an error, not an answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_after_the_200_reaches_an_openai_client_as_its_own_error() {
+        let work = Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Served::Whole(
+                ApiError::NoNetwork {
+                    failed: vec!["1.1.1.1".to_string()],
+                }
+                .into_response(),
+            )
+        });
+        let response = with_keepalive(
+            work,
+            false,
+            Duration::from_secs(15),
+            Format::OpenAiChat,
+            can_serve_now(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let error: Value = serde_json::from_slice(&read_body(response).await)
+            .expect("padding and all, the body is JSON");
+        assert_eq!(error["error"]["type"], "server_error");
+        assert_eq!(error["error"]["code"], "no_network");
     }
 
     /// A reply that arrived in one piece still serves a client that asked for a
