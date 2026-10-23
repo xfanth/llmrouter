@@ -828,7 +828,10 @@ async fn every_channel_failing_after_the_200_is_an_overloaded_error_event() {
     let server = upstream_serving(
         ResponseTemplate::new(503)
             .set_body_json(json!({"error": {"message": "upstream busy"}}))
-            .set_delay(Duration::from_millis(200)),
+            // Long enough that the commit and the provider's answer cannot
+            // be confused under a loaded test run: a 200ms provider against a
+            // 150ms bound failed under the coverage job's instrumentation.
+            .set_delay(Duration::from_secs(3)),
     )
     .await;
     let config = RouterConfig {
@@ -854,7 +857,7 @@ async fn every_channel_failing_after_the_200_is_an_overloaded_error_event() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        started.elapsed() < Duration::from_millis(150),
+        started.elapsed() < Duration::from_millis(1_500),
         "the 200 went out before the provider answered, not after an interval"
     );
     let body = text_body(response).await;
