@@ -196,10 +196,12 @@ pub struct RouterConfig {
     /// client: `stream` in the client's request is a separate thing and a
     /// mismatch is fine. Off gives the buffered path in **Core loop**.
     pub streaming: bool,
-    /// How the race picks a winner once streams are running.
+    /// Read so an older `router.yml` still loads, and otherwise ignored: the
+    /// first stream to finish its whole answer wins. See DESIGN.md "Commit on
+    /// completion".
     pub hedge_strategy: HedgeStrategy,
-    /// `tps` only: how long to watch the streams before choosing, measured
-    /// from the first token any channel emits.
+    /// Read so an older `router.yml` still loads, and otherwise ignored, for
+    /// the same reason as `hedge_strategy`.
     pub hedge_window_ms: u64,
     /// No token for this long means the channel failed.
     #[serde(with = "humantime_serde")]
@@ -261,7 +263,9 @@ impl Default for RouterConfig {
     }
 }
 
-/// How the race decides which streaming channel call wins.
+/// The values `hedge_strategy` accepts. Kept so an older `router.yml` loads;
+/// neither changes the race any more, because the first stream to finish its
+/// whole answer wins.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HedgeStrategy {

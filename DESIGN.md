@@ -56,11 +56,11 @@ Three things follow for the new router:
 
 - **Clients: coding tools.** Claude Code, Cline and Cursor. They need tool
   calling and the Anthropic `/v1/messages` format.
-- **Streaming, with a hedge strategy.** `streaming: true` by default.
-  `hedge_strategy: tps` buffers every stream for 1 second, then keeps the
-  fastest and cancels the rest. Not a nicety: a channel call takes 34.5 minutes
-  and Claude Code's `API_TIMEOUT_MS` defaults to 10, so without streaming the
-  client hangs up every time. See **Streaming**.
+- **Streaming, committed on completion.** `streaming: true` by default. Every
+  channel streams, every stream is a candidate until one has finished its
+  whole answer, and only then are the others cancelled. Any stream can die
+  part way, so killing the others earlier leaves nothing to fall back on. See
+  **Commit on completion**.
 - **Deployment: home network, no password.** Runs on TrueNAS, reachable only
   from inside the LAN. No shared secret, no rate limiting, no TLS.
 - **Key handling: fall through, no quota tracking.** Per spec item 8: a failed
@@ -878,8 +878,8 @@ request is about the client.** They are independent, and a mismatch is fine.
 
 | Client asks for | Router does |
 |---|---|
-| `stream: true` | Forwards the winning stream as it arrives. |
-| `stream: false`, or no field | Buffers the winning stream, sends one piece. |
+| `stream: true` | Streams the winning answer once it is complete. |
+| `stream: false`, or no field | Sends the winning answer in one piece. |
 
 **Always stream from the providers.** The hedge strategy needs a stream to
 measure, and giving that up because the client did not ask for streaming would
@@ -891,32 +891,43 @@ and the router already holds that response to write it to the cache.
 **Never reject a mismatch.** Returning `400` because the client's mode differs
 from the router's breaks every tool for no gain.
 
-### `hedge_strategy: ttft`
+### Commit on completion
 
-Time to first token. The first channel to emit a token wins. Cancel the other 31
-immediately.
+**Keep every stream running until one has finished its whole answer. Only then
+cancel the others.** Alex's spec, 24 Oct 2026.
 
-Simple and fastest to a first token. It picks whichever channel got through
-prefill first, which is not the channel that will finish first.
+Any stream can die part way through: a socket drops, a provider stalls, an
+error frame arrives, or the body closes before its terminal event. If the
+router has already killed the other streams when that happens, there is
+nothing left to fall back on and the request fails. So:
 
-### `hedge_strategy: tps`
+1. The race starts at `race_width` channels and adds one every
+   `race_escalation_ms`, up to `race_width_max`.
+2. A channel that produces its first token is not a winner. Its stream is read
+   on to the end and buffered, and it keeps counting against the width.
+3. The race keeps widening until the cap is reached or a stream finishes.
+4. The first stream to reach its terminal event with an answer that decodes
+   whole wins. Every other call is cancelled then, and not before.
+5. A stream that dies part way is an ordinary failed trial: it is replaced at
+   once and backs off on the `died_mid_answer` schedule. The request fails only
+   when every channel has failed.
 
-Tokens per second. The default.
+Nothing reaches the client until step 4, so the client never holds half an
+answer from a stream that later dies.
 
-1. `t0` is the moment the first channel emits its first token.
-2. Buffer every stream. Send nothing to the client yet.
-3. Wait `hedge_window_ms`, default 1000.
-4. At `t0 + 1s`: one channel streaming means it wins. Several streaming means
-   measure each one's tokens per second across that window, and the highest
-   wins.
-5. Cancel every other channel call. Flush the winner's buffer to the client,
-   then forward the rest of its stream.
+**Cost.** A streaming client sees no tokens until the winning answer is
+complete, then receives it in one burst. The keepalive holds the connection
+open meanwhile. **Gain.** No answer is ever cut off part way while another
+channel could still have finished it. That is what Claude Code reported as
+`Connection lost mid-response`.
 
-**Cost: 1 second.** **Gain: up to 17 minutes**, when it picks a 1,000 tok/s
-channel over a 30 tok/s one.
+**Buffering is cheap.** 32 streams of a typical coding answer is a few hundred
+KB per client request, and the winner's answer is held for the cache write
+anyway.
 
-**Buffering is cheap.** 32 streams for 1 second holds 125KB per client request
-at 1,000 tokens/second each, 12KB at 100.
+`hedge_strategy` and `hedge_window_ms` are still read from `router.yml`, so an
+older file loads, but they no longer change anything: the first complete answer
+wins.
 
 ### Keepalive
 
@@ -937,8 +948,8 @@ The space trick is ugly. It is also the only thing that keeps a non-streaming
 client alive through 16.7 minutes of prefill, and every JSON parser accepts it.
 
 Stop the keepalive the moment the first real byte goes out. For a streaming
-client that is the winner's first token. For a non-streaming client it is the
-opening brace of the body.
+client that is the first event of the finished answer. For a non-streaming
+client it is the opening brace of the body.
 
 **When the `200` goes out.** The status line goes out once, before the first
 keepalive byte, so a failure decided after it can only travel inside the body.
@@ -967,34 +978,25 @@ was not retried. Alex's spec, 23 Oct 2026.
 
 ### Commitment
 
-Once a token reaches the client, the router is committed to that channel. There
-is no taking it back.
+The router commits to a channel only when its stream has finished. Until then
+every stream is a candidate and nothing has reached the client, so there is
+nothing to take back.
 
-That is why `tps` buffers rather than forwarding the first token it sees. `ttft`
-commits at the first token and accepts the consequence.
+### When a stream dies
 
-### When the winning stream dies
+`stream_stall_timeout: 60s`. No sign of life for 60 seconds means the channel
+failed: a token or a reasoning frame counts, a keepalive comment does not. So
+does a dropped connection, an in-band error frame, or a body that ends without
+its terminal event.
 
-`stream_stall_timeout: 60s`. No token for 60 seconds means the channel failed.
-So does a dropped connection or a mid-stream error.
-
-**Before the winner is picked**, a dead channel drops out and the race carries
-on. Nothing reached the client, so there is nothing to undo.
-
-**After the winner is picked, end the client request.** The stream stops. The
-channel is marked unhealthy and backs off as usual.
-
-Carrying on from another channel was considered and rejected. The client already
-has half an answer on screen from one model. Splicing a second model's output
-onto it produces a reply that changes voice and loses the thread mid-sentence,
-and no client can tell that happened.
-
-Ending it is honest. Claude Code retries from the start, and the retry skips the
-dead channel because it is now in backoff.
+A dead stream drops out and the race carries on: the walk replaces it at once,
+and the channel backs off on the `died_mid_answer` schedule. Nothing reached
+the client, so there is nothing to undo, and no other model's output is ever
+spliced onto it.
 
 ### Cancellation and the cache
 
-Cancel every losing channel call the moment the winner is picked, same as the
+Cancel every other channel call the moment a stream finishes, same as the
 non-streamed path.
 
 **Only a complete stream goes in the cache.** A cancelled stream is a partial
@@ -1019,9 +1021,9 @@ a send error.
 
 ```yaml
 streaming: true
-hedge_strategy: tps        # tps | ttft
-hedge_window_ms: 1000      # tps only: how long to watch before choosing
-stream_stall_timeout: 60s  # no token for this long means the channel failed
+hedge_strategy: tps        # ignored: the first complete answer wins
+hedge_window_ms: 1000      # ignored: the first complete answer wins
+stream_stall_timeout: 60s  # no token or reasoning for this long means the channel failed
 keepalive_interval: 15s    # until the first real byte reaches the client
 ```
 
@@ -2080,8 +2082,8 @@ race_escalation_ms: 1    # every 1ms in progress, one more channel joins
 max_per_channel: 2       # M: hedged copies of one channel call
 hedge_delay_ms: 1        # 1 = the M copies start 1ms after the first one
 streaming: true
-hedge_strategy: tps           # tps | ttft
-hedge_window_ms: 1000         # tps only: how long to watch before choosing
+hedge_strategy: tps           # ignored: the first complete answer wins
+hedge_window_ms: 1000         # ignored: the first complete answer wins
 stream_stall_timeout: 60s     # no token for this long means the channel failed
 keepalive_interval: 15s       # until the first real byte reaches the client
 request_timeout: 3600s        # one channel call; the client request has no cap
@@ -2735,9 +2737,9 @@ size difference is noise next to a 100GB cache pool.
 **Do not omit `mem_limit` from the compose file.** Without it the 4GB budget is
 a comment, and the process grows into memory Frigate and Plex need.
 
-**Do not forward the first token you see when `hedge_strategy` is `tps`.**
-Sending a token commits the router to that channel. Buffer for
-`hedge_window_ms`, pick the fastest stream, then flush.
+**Do not commit to a stream before it has finished.** Any stream can die part
+way. Keep every one running, and cancel the rest only when one has a complete
+answer. Killing them at the first token leaves nothing to fall back on.
 
 **Do not expect the client to raise its timeout.** Claude Code's
 `API_TIMEOUT_MS` defaults to 10 minutes and prefill on a 1M token prompt takes
@@ -2752,10 +2754,10 @@ governs the client. Buffer the stream for a client that wants one piece: it
 costs 42.7MB at 350 concurrent, and that response is already held for the cache
 write.
 
-**Do not splice a second channel onto a broken stream.** Once the client has
-part of an answer, the router is committed. A stream that dies after that ends
-the client request. Joining another model's output mid-sentence produces a reply
-nobody can trust and no client can detect.
+**Do not splice a second channel onto a broken stream.** Joining another
+model's output mid-sentence produces a reply nobody can trust and no client can
+detect. Commit on completion means it never comes up: nothing reaches the
+client until a stream has finished.
 
 **Do not cache a cancelled stream.** It is a partial answer, and a partial
 answer is wrong.
