@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use llmrouter::catalogue::ChannelTelemetry;
-use llmrouter::config::{Config, HedgeStrategy, RouterConfig, WireName};
+use llmrouter::config::{Config, RouterConfig, WireName};
 use llmrouter::server::PromptBody;
 use llmrouter::{
     Catalogue, Channel, ChannelFilter, ChannelHealth, ChannelId, HealthKey, HealthTable,
@@ -384,7 +384,6 @@ async fn calls_settling_at(server: &MockServer, want: usize) -> usize {
 fn name_of(outcome: &RaceOutcome) -> &'static str {
     match outcome {
         RaceOutcome::Buffered { .. } => "a buffered win",
-        RaceOutcome::Streamed { .. } => "a streamed win",
         RaceOutcome::NoNetwork { .. } => "a dead local link",
         RaceOutcome::Exhausted { .. } => "an exhausted walk",
         RaceOutcome::ClientGone => "the client gone",
@@ -599,96 +598,6 @@ async fn three_hedged_copies_failing_count_as_one_failure_against_the_channel() 
         1,
         "the channel row mirrors the one failure"
     );
-}
-
-/// `tps` buffers every live stream and then picks on tokens per second, not on
-/// who got there first. Both streams open together, so time to first token
-/// cannot separate them: the one that produced more tokens wins.
-#[tokio::test]
-async fn the_tps_window_picks_the_stream_that_produced_the_most_tokens() {
-    let wordy = upstream(stream_body("f", 12)).await;
-    let terse = upstream(stream_body("s", 2)).await;
-
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    // The terse one is scanned first, so winning on tokens means winning
-    // against the catalogue order rather than with it.
-    let wordy_channel = channel("wordy", &wordy.uri(), 1);
-    let wordy_id = wordy_channel.id;
-
-    let harness = Harness::new(
-        RouterConfig {
-            hedge_strategy: HedgeStrategy::Tps,
-            ..router_config(2, 1, dir.path())
-        },
-        vec![wordy_channel, channel("terse", &terse.uri(), 0)],
-        Link::Up,
-    )
-    .await;
-
-    let (outcome, _) = harness.run(input(true)).await;
-
-    let winner = match outcome {
-        RaceOutcome::Streamed {
-            winner, attempts, ..
-        } => {
-            assert_eq!(attempts, 2, "both streams were opened and judged");
-            winner
-        }
-        other => panic!("expected a streamed win, got {}", name_of(&other)),
-    };
-    assert_eq!(
-        winner.channel_id, wordy_id,
-        "the faster stream wins the window"
-    );
-
-    let aggregated = llmrouter::wire::aggregate_stream(winner.chunks)
-        .await
-        .expect("the winning stream folds into one answer");
-    assert_eq!(
-        text_of(&aggregated),
-        "f".repeat(12),
-        "the client gets the winner's buffered opening and the rest of its stream"
-    );
-}
-
-/// `ttft` commits to the first channel to emit a token and never reopens the
-/// question. The second channel would out-token it comfortably, and under
-/// `tps` would join the window and win it; under `ttft` it is cancelled
-/// unheard.
-#[tokio::test]
-async fn ttft_commits_to_the_first_token_even_when_a_wordier_stream_follows() {
-    let first = upstream(stream_body("a", 2)).await;
-    let wordier = upstream(stream_body("b", 40).set_delay(Duration::from_millis(400))).await;
-
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let first_channel = channel("first", &first.uri(), 0);
-    let first_id = first_channel.id;
-
-    let harness = Harness::new(
-        RouterConfig {
-            hedge_strategy: HedgeStrategy::Ttft,
-            ..router_config(2, 1, dir.path())
-        },
-        vec![first_channel, channel("wordier", &wordier.uri(), 1)],
-        Link::Up,
-    )
-    .await;
-
-    let (outcome, _) = harness.run(input(true)).await;
-
-    let winner = match outcome {
-        RaceOutcome::Streamed { winner, .. } => winner,
-        other => panic!("expected a streamed win, got {}", name_of(&other)),
-    };
-    assert_eq!(
-        winner.channel_id, first_id,
-        "the first token takes it, whatever arrives afterwards"
-    );
-
-    let aggregated = llmrouter::wire::aggregate_stream(winner.chunks)
-        .await
-        .expect("the winning stream folds into one answer");
-    assert_eq!(text_of(&aggregated), "aa");
 }
 
 /// The query comes back empty before a single call is made, which is the
@@ -919,13 +828,13 @@ async fn a_client_hanging_up_still_settles_failures_already_held() {
     assert_eq!(entry.retry_counter, 1);
 }
 
-/// A stream that breaks inside the `tps` window is an ordinary failed trial:
-/// nothing reached the client, so the walk replaces the dead channel and
-/// carries on. Width is 1, so the broken channel is the whole in-flight set
-/// when it dies, and the only way the client sees an answer is the walk
-/// pulling in the untried channel behind it.
+/// A stream that breaks part way is an ordinary failed trial: nothing reached
+/// the client, so the walk replaces the dead channel and carries on. Width is
+/// 1, so the broken channel is the whole in-flight set when it dies, and the
+/// only way the client sees an answer is the walk pulling in the untried
+/// channel behind it.
 #[tokio::test]
-async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_ending_the_walk() {
+async fn a_stream_breaking_part_way_is_replaced_rather_than_ending_the_walk() {
     let (broken_url, broken_task) = stream_that_dies_mid_answer().await;
     let sound = upstream(stream_body("ok", 4)).await;
 
@@ -934,11 +843,8 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
     let sound_id = sound_channel.id;
 
     let harness = Harness::new(
-        RouterConfig {
-            hedge_strategy: HedgeStrategy::Tps,
-            ..router_config(1, 1, dir.path())
-        },
-        // The broken one is scanned first, so it opens the window alone.
+        router_config(1, 1, dir.path()),
+        // The broken one is scanned first, so it streams alone at first.
         vec![channel("broken", &broken_url, 0), sound_channel],
         Link::Up,
     )
@@ -963,13 +869,13 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
     let (outcome, elapsed) = harness.run(input(true)).await;
 
     let winner = match outcome {
-        RaceOutcome::Streamed {
+        RaceOutcome::Buffered {
             winner, attempts, ..
         } => {
             assert_eq!(attempts, 2, "the broken channel and its replacement");
             winner
         }
-        other => panic!("expected a streamed win, got {}", name_of(&other)),
+        other => panic!("expected the finished answer, got {}", name_of(&other)),
     };
     assert_eq!(
         winner.channel_id, sound_id,
@@ -980,12 +886,8 @@ async fn every_stream_breaking_in_the_window_replaces_the_channels_rather_than_e
         1,
         "the replacement channel was actually called"
     );
-    assert!(elapsed < PROMPT, "the walk did not sit out a second window");
-
-    let aggregated = llmrouter::wire::aggregate_stream(winner.chunks)
-        .await
-        .expect("the winning stream folds into one answer");
-    assert_eq!(text_of(&aggregated), "ok".repeat(4));
+    assert!(elapsed < PROMPT, "the walk replaced the channel at once");
+    assert_eq!(text_of(&winner.response), "ok".repeat(4));
 
     // Getting a first token out is not an answer. The broken channel owes a
     // failure, and the first token must not have wiped the key's backoff.
@@ -1117,7 +1019,10 @@ async fn a_stream_that_dies_mid_answer_is_outlived_by_one_that_finishes() {
     let (outcome, _) = harness.run(input(true)).await;
     match &outcome {
         RaceOutcome::Buffered { winner, .. } => {
-            assert_eq!(winner.model_id, "finishes-model", "the finished answer wins");
+            assert_eq!(
+                winner.model_id, "finishes-model",
+                "the finished answer wins"
+            );
             assert_eq!(
                 text_of(&winner.response),
                 "word ".repeat(40),
@@ -1333,58 +1238,4 @@ async fn an_in_progress_walk_escalates_its_width_over_time() {
     }
     walk.abort();
     hang_task.abort();
-}
-
-/// A channel that fails inside the decision window is replaced at once, not
-/// when the window closes. Alex's spec: creating requests to channels never
-/// pauses while the race is being judged. The observable: the replacement
-/// channel is called, joins the comparison, and the walk ends with three
-/// attempts - the failure would leave it at two for the whole second.
-#[tokio::test]
-async fn a_failure_inside_the_decision_window_is_replaced_at_once() {
-    // The winner: three fast frames, judged fastest at the window close.
-    let winner_server = upstream(stream_body("win words here ", 3)).await;
-    // The instant failure: a 500, but 200ms late, so it lands inside the
-    // window that the winner's first token opened.
-    let late_failure =
-        upstream(ResponseTemplate::new(500).set_delay(Duration::from_millis(200))).await;
-    // The replacement: one frame, slow enough to lose the comparison.
-    let replacement = upstream(stream_body("slow ", 1)).await;
-
-    let mut channels = Vec::new();
-    let mut first = channel("winner", &winner_server.uri(), 1);
-    first.intelligence_rank = 1;
-    channels.push(first);
-    let mut failing = channel("fails-late", &late_failure.uri(), 2);
-    failing.intelligence_rank = 2;
-    channels.push(failing);
-    let mut spare = channel("replacement", &replacement.uri(), 3);
-    spare.intelligence_rank = 3;
-    channels.push(spare);
-
-    let config = RouterConfig {
-        race_width: 2,
-        race_escalation_ms: 0,
-        max_per_channel: 1,
-        spill_path: std::env::temp_dir().join("llmrouter-window-refill"),
-        ..RouterConfig::default()
-    };
-    let harness = Harness::new(config, channels, Link::Up).await;
-    let (outcome, _) = harness.run(input(true)).await;
-
-    match &outcome {
-        RaceOutcome::Streamed {
-            winner, attempts, ..
-        } => {
-            assert_eq!(winner.model_id, "winner-model", "the fastest stream wins");
-            assert_eq!(*attempts, 3, "the replacement fired inside the window");
-        }
-        other => panic!("expected a streamed win, got {}", name_of(other)),
-    }
-    // The replacement channel was actually called during the window.
-    let calls_on_replacement = calls(&replacement).await;
-    assert!(
-        calls_on_replacement >= 1,
-        "the spare channel fired during the window, not after it"
-    );
 }

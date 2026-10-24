@@ -2048,16 +2048,11 @@ async fn a_stream_that_dies_before_anything_reaches_a_plain_client_retries_invis
             .contains("retry me"),
         "the retried request's row carries the request payload: {row}"
     );
-    // The ttft is the winning channel's first token, and the generation
-    // window is the stretch from that token to the answer's end; the tps
-    // decision window alone guarantees a wide gap between the two.
+    // Nothing reaches the client until a stream has finished its answer, so
+    // the client's first byte of content is the whole answer: ttft is total.
     let ttft = row["ttft_ms"].as_u64().expect("ttft present");
     let total = row["total_ms"].as_u64().expect("total present");
-    let gen = row["gen_ms"].as_u64().expect("gen present");
-    assert!(
-        ttft < total && gen > 100,
-        "ttft and total must part ways once a stream ran: ttft {ttft}, total {total}, gen {gen}"
-    );
+    assert_eq!(ttft, total, "the answer arrives whole: {row}");
     assert!(
         row["tokens_in"].as_u64().expect("request tokens present") > 0,
         "the row carries the request's token size: {row}"
