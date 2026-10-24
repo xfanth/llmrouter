@@ -26,20 +26,17 @@
 //! until the link state is known: applied once the link is proven up, dropped
 //! when it is down.
 //!
-//! When the providers are streamed, the winner is picked by `hedge_strategy`:
+//! When the providers are streamed, nothing is committed at the first token.
+//! Every stream that gets through prefill is read on to its end and buffered,
+//! and keeps counting against N, which goes on widening to `race_width_max`.
+//! The first stream to finish with an answer that decodes whole wins, and only
+//! then are the other calls cancelled: any stream can die part way, and one
+//! killed early is one less to fall back on. Alex's spec, 24 Oct 2026.
 //!
-//! * `ttft`: the first channel to emit a token wins, and the router is
-//!   committed to it from that moment.
-//! * `tps`: the default. From `t0`, the first token anywhere, every stream is
-//!   buffered for `hedge_window_ms` and nothing reaches the client. At the end
-//!   of the window the live streams are compared on tokens per second, the
-//!   fastest wins, the rest are cancelled, and the winner's buffer is flushed
-//!   ahead of the rest of its stream.
-//!
-//! No token for `stream_stall_timeout` means the channel failed. Before a
-//! winner is picked that is an ordinary failed trial and the walk carries on.
-//! After it, the client already holds part of the answer, so the stream ends
-//! and the channel backs off. Another channel is never spliced onto it.
+//! No sign of life for `stream_stall_timeout` means the channel failed; a token
+//! or a reasoning frame counts, a keepalive comment does not. A stream that
+//! dies part way is an ordinary failed trial, replaced at once and backed off.
+//! Nothing reached the client, so another channel is never spliced onto it.
 
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -245,8 +242,8 @@ impl Racer {
         // without touching the client's token.
         let race_cancel = cancel.child_token();
 
-        // Behind a lock so the decision window can refill without holding
-        // a mutable borrow across its await.
+        // Behind a lock so a top-up can run from any branch of the walk
+        // without holding a mutable borrow across an await.
         let excluded = std::sync::RwLock::new(input.exclude.clone());
         let mut last_error: Option<String> = None;
         // Failed trials so far, which is what the N-race outcome reads at the
@@ -922,8 +919,8 @@ impl Racer {
     }
 
     /// Turns a winning copy into a trial outcome. A whole reply makes the
-    /// channel healthy at once; a stream only once the walk picks it, because
-    /// it can still break inside the decision window.
+    /// channel healthy at once; a stream only once it has finished its answer,
+    /// because until then it can still break part way.
     fn trial_won<'a>(&self, channel: &'a Channel, win: CopyWin) -> TrialOutcome<'a> {
         match win {
             CopyWin::Buffered(winner) => {
@@ -989,7 +986,7 @@ impl Racer {
                 }
                 return TrialOutcome::Won(winner);
             }
-            Err(dead) => dead,
+            Err(dead) => *dead,
         };
         self.metrics.record_error(&ready.provider, class);
         TrialOutcome::Failed {
@@ -1791,8 +1788,8 @@ struct FrameCounter {
     >,
     /// Content frames seen so far.
     frames: u32,
-    /// Reasoning frames seen so far. Not tokens, so `tps` never reads them,
-    /// but they prove the model is still working.
+    /// Reasoning frames seen so far. Not tokens, but they prove the model is
+    /// still working, so they hold the stall timer off.
     reasoning: u32,
     /// The stream has carried an in-band provider error frame.
     failed: bool,
@@ -1902,13 +1899,12 @@ pub struct ReadyStream {
     model_id: String,
     intelligence: u16,
     wire: crate::config::WireName,
-    /// Everything read before the decision, replayed ahead of the rest.
+    /// Everything read so far. Decoded into the whole answer once it ends.
     buffered: Vec<Vec<u8>>,
-    /// Tokens seen so far, which is how `tps` compares streams.
+    /// Tokens and reasoning seen so far, and whether the answer has ended.
     counter: FrameCounter,
-    /// When this stream produced its first token. Streams enter the window at
-    /// different moments, so each one's speed is measured over its own time
-    /// alive, not over the whole window.
+    /// When this stream produced its first token. With the time to it, this
+    /// gives the winning call's wall clock.
     content_at: tokio::time::Instant,
 
     /// This trial's slot in the walk's fire order, which the N-race
@@ -2137,10 +2133,10 @@ async fn read_to_end(mut ready: ReadyStream, stall: Duration) -> Finished {
 /// The verdict on a stream that has stopped: the whole answer as a winner, or
 /// the stream back with the class of the way it broke. No side effects: the
 /// caller moves health and counts the error.
-async fn judge(done: Finished) -> Result<Box<Winner>, (ReadyStream, ErrorClass)> {
+async fn judge(done: Finished) -> Result<Box<Winner>, Box<(ReadyStream, ErrorClass)>> {
     let Finished { mut ready, end } = done;
     if let Err(class) = end {
-        return Err((ready, class));
+        return Err(Box::new((ready, class)));
     }
     // Taken by value: the stream itself is not `Sync`, so it cannot be
     // borrowed across the await.
@@ -2155,7 +2151,7 @@ async fn judge(done: Finished) -> Result<Box<Winner>, (ReadyStream, ErrorClass)>
             latency: ready.elapsed + ready.content_at.elapsed(),
             slot: ready.slot,
         })),
-        Err(_) => Err((ready, ErrorClass::StreamTruncated)),
+        Err(_) => Err(Box::new((ready, ErrorClass::StreamTruncated))),
     }
 }
 
@@ -2837,7 +2833,7 @@ mod tests {
             panic!("a content frame should win");
         };
         assert_eq!(buffered.len(), 2);
-        // The comment is not a token; the delta is. The tps comparison starts
+        // The comment is not a token; the delta is. The stall timer starts
         // from what the opening already carried.
         assert_eq!(counter.frames, 1);
     }
@@ -3072,6 +3068,78 @@ mod tests {
         assert_eq!(counter.frames, 1);
     }
 
+    /// A reasoning model can write a sentence and then think for longer than
+    /// the stall timeout, sending reasoning the whole time. It is alive, so
+    /// the read goes on; only when the reasoning stops too does the timer
+    /// fire. The live router cut seven Nemotron 3 Ultra streams this way on
+    /// 22 Oct 2026, each 60 seconds after its last visible word.
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_keeps_a_stream_alive_past_the_stall_timeout() {
+        let live: ByteStream = Box::pin(async_stream::stream! {
+            yield Ok(token("x"));
+            for _ in 0..36 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                yield Ok(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n".to_vec());
+            }
+            futures::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        let done = read_to_end(ready_with(0, 1, live), STALL).await;
+        assert_eq!(done.end, Err(ErrorClass::StreamStalled));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(180) + STALL,
+            "three minutes of reasoning, then a whole stall timeout of silence"
+        );
+    }
+
+    /// Keep-alive comments are not signs of life: a provider whose upstream
+    /// hangs keeps its socket busy with them, and the stall must still fire.
+    #[tokio::test(start_paused = true)]
+    async fn keepalives_do_not_hold_a_stream_open() {
+        let live: ByteStream = Box::pin(async_stream::stream! {
+            yield Ok(token("x"));
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                yield Ok(b": OPENROUTER PROCESSING\n\n".to_vec());
+            }
+        });
+        let started = tokio::time::Instant::now();
+        let done = read_to_end(ready_with(0, 1, live), STALL).await;
+        assert_eq!(done.end, Err(ErrorClass::StreamStalled));
+        assert_eq!(started.elapsed(), STALL);
+    }
+
+    /// A finished answer on a socket the provider keeps open ends after the
+    /// tail grace, not at the stall timeout: only a trailing usage frame was
+    /// still owed, and a winner must not be held back a minute for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_answer_on_a_lingering_socket_ends_after_the_tail_grace() {
+        let live: ByteStream = Box::pin(async_stream::stream! {
+            yield Ok(token("done"));
+            yield Ok(b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec());
+            futures::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        let done = read_to_end(ready_with(0, 1, live), STALL).await;
+        assert_eq!(done.end, Ok(()));
+        assert_eq!(started.elapsed(), TAIL_GRACE);
+    }
+
+    /// The terminal event ends the read at once, whatever the socket does.
+    #[tokio::test(start_paused = true)]
+    async fn the_terminal_event_ends_the_read_at_once() {
+        let live: ByteStream = Box::pin(async_stream::stream! {
+            yield Ok(token("done"));
+            yield Ok(b"data: [DONE]\n\n".to_vec());
+            futures::future::pending::<()>().await;
+        });
+        let started = tokio::time::Instant::now();
+        let done = read_to_end(ready_with(0, 1, live), STALL).await;
+        assert_eq!(done.end, Ok(()));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
     /// Reads `rest` to its end as the walk does, judges it, and applies what
     /// the walk would: the error class and the backoff for a stream that broke.
     /// Returns whether it broke, the channel's health entry, and the scrape.
@@ -3088,7 +3156,8 @@ mod tests {
         ready.channel_id = id;
         let failed = match judge(read_to_end(ready, STALL).await).await {
             Ok(_) => false,
-            Err((ready, class)) => {
+            Err(dead) => {
+                let (ready, class) = *dead;
                 metrics.record_error(&ready.provider, class);
                 let snapshot = catalogue.snapshot();
                 write_failure(&health, &catalogue, &snapshot[0], None, Some(class));
@@ -3260,8 +3329,8 @@ mod tests {
         );
     }
 
-    /// A reasoning delta is not a token, so it never wins the `tps` window,
-    /// but it is counted as the model working.
+    /// A reasoning delta is not a token, but it is counted as the model
+    /// working.
     #[test]
     fn a_reasoning_frame_is_not_a_token_but_is_counted() {
         let mut counter = FrameCounter::default();
