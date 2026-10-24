@@ -323,6 +323,12 @@ impl Racer {
         escalator.tick().await;
 
         let mut inflight: Trials = Trials::new();
+        // Streams that have produced a first token and are being read to the
+        // end. None is committed to: the first to finish its whole answer
+        // wins, and every other call stays live until then, because any of
+        // them may yet die part way. Alex's spec, 24 Oct 2026. They count
+        // against the width like the trials still in prefill.
+        let mut streams: Streams = FuturesUnordered::new();
         self.top_up(
             &mut inflight,
             &snapshot,
@@ -382,9 +388,15 @@ impl Racer {
                         &race_cancel,
                         fired,
                         walk_started,
-                        width,
+                        width.saturating_sub(streams.len()),
                     );
                     continue;
+                }
+
+                // A stream reached its end. A whole answer is the win; one
+                // that broke on the way is a failed trial like any other.
+                Some(done) = streams.next(), if !streams.is_empty() => {
+                    self.stream_outcome(done, &snapshot).await
                 }
 
                 Some(outcome) = inflight.next(), if !inflight.is_empty() => outcome,
@@ -441,113 +453,13 @@ impl Racer {
                     };
                 }
                 TrialOutcome::WonStreaming(ready) => {
-                    let picked = match self.config.router.hedge_strategy {
-                        // The first token wins outright, and the router is
-                        // committed to that channel from here.
-                        HedgeStrategy::Ttft => Some(ready),
-                        // Nothing goes to the client until the window closes.
-                        HedgeStrategy::Tps => {
-                            match self
-                                .stream_window(
-                                    ready,
-                                    &snapshot,
-                                    &mut inflight,
-                                    &mut held,
-                                    &input,
-                                    &excluded,
-                                    &cancel,
-                                    fired,
-                                    walk_started,
-                                    width,
-                                )
-                                .await
-                            {
-                                WindowOutcome::Winner(winner) => Some(winner),
-                                WindowOutcome::AllBroke => None,
-                                WindowOutcome::ClientGone => {
-                                    race_cancel.cancel();
-                                    return self
-                                        .client_gone(net_check.as_mut(), net_done, &mut held)
-                                        .await;
-                                }
-                            }
-                        }
-                    };
-                    let Some(picked) = picked else {
-                        // Every stream in the window broke before it closed.
-                        // Nothing reached the client, so this is no different
-                        // from a wave of failed trials: whatever is still in
-                        // flight carries the walk on, and an empty set falls
-                        // through to the exhausted check below.
-                        last_error =
-                            Some("every stream broke inside the decision window".to_string());
-                        // The broken streams are held as failures like any
-                        // other, so once the link is known to be up they land.
-                        if link_up {
-                            self.apply_held(&mut held);
-                        }
-                        // The dead channels are replaced here, which also
-                        // covers the trials that died inside the window: the
-                        // set goes back to the walk's current width whatever
-                        // the window cost it.
-                        self.top_up(
-                            &mut inflight,
-                            &snapshot,
-                            &input,
-                            &excluded,
-                            &race_cancel,
-                            fired,
-                            walk_started,
-                            width,
-                        );
-                        if inflight.is_empty() {
-                            let outcome =
-                                exhausted(net_check.as_mut(), net_done, fired.queued(), last_error)
-                                    .await;
-                            self.settle_held(&mut held, &outcome);
-                            return outcome;
-                        }
-                        continue;
-                    };
-                    // What the N-race bought, judged on the winner's own slot
-                    // rather than the trial that opened the window: a later
-                    // channel that out-streamed the first is exactly what the
-                    // race is for.
-                    let stat = race_stat(picked.slot, failed_before_win);
-                    self.metrics.record_race_outcome(stat);
-                    // The success is written only now the stream has been
-                    // judged. Writing it at the first token would clear the
-                    // backoff of a channel that then broke inside the window.
-                    if let Some(channel) = snapshot.iter().find(|c| c.id == picked.channel_id) {
-                        self.apply_success(channel);
-                    }
-                    concede_to_stream(
-                        &race_cancel,
-                        &mut inflight,
-                        &mut held,
-                        &self.health,
-                        &self.catalogue,
-                    );
-                    match self.winner_from(*picked) {
-                        Ok(winner) => {
-                            return RaceOutcome::Streamed {
-                                // Stamped by `run`. See the note above.
-                                race_elapsed: Duration::ZERO,
-                                winner: Box::new(winner),
-                                attempts: fired.queued(),
-                            };
-                        }
-                        // The decoder refused the stream. Everything else is
-                        // already cancelled, so the walk is over.
-                        Err(error) => {
-                            last_error = Some(error);
-                            let outcome =
-                                exhausted(net_check.as_mut(), net_done, fired.queued(), last_error)
-                                    .await;
-                            self.settle_held(&mut held, &outcome);
-                            return outcome;
-                        }
-                    }
+                    // Read on to the end beside everything else. The trial
+                    // only moved from one set to the other, so the width is
+                    // still full and nothing needs topping up.
+                    streams.push(Box::pin(read_to_end(
+                        *ready,
+                        self.config.router.stream_stall_timeout,
+                    )));
                 }
                 TrialOutcome::Cancelled => {}
                 TrialOutcome::Failed { error, pending } => {
@@ -578,12 +490,12 @@ impl Racer {
                         &race_cancel,
                         fired,
                         walk_started,
-                        width,
+                        width.saturating_sub(streams.len()),
                     );
                 }
             }
 
-            if inflight.is_empty() {
+            if inflight.is_empty() && streams.is_empty() {
                 let outcome =
                     exhausted(net_check.as_mut(), net_done, fired.queued(), last_error).await;
                 self.settle_held(&mut held, &outcome);
@@ -1161,6 +1073,55 @@ impl Racer {
             retry_after_secs,
             class,
         );
+    }
+
+    /// Turns a stream that has stopped into a trial outcome. A whole answer is
+    /// the win, and its channel is healthy. Anything else is a failed trial,
+    /// backed off on the class of the way it broke.
+    async fn stream_outcome<'a>(&self, done: Finished, channels: &'a [Channel]) -> TrialOutcome<'a> {
+        let Finished { mut ready, end } = done;
+        let channel = channels.iter().find(|c| c.id == ready.channel_id);
+        let class = match end {
+            // Taken by value: the stream itself is not `Sync`, so it cannot be
+            // borrowed across the await.
+            Ok(()) => match whole_answer(
+                std::mem::take(&mut ready.buffered),
+                wire::format_for_provider(ready.wire),
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Some(channel) = channel {
+                        self.apply_success(channel);
+                    }
+                    return TrialOutcome::Won(Box::new(Winner {
+                        channel_id: ready.channel_id,
+                        provider: ready.provider.clone(),
+                        model_id: ready.model_id.clone(),
+                        intelligence: ready.intelligence,
+                        response,
+                        latency: ready.elapsed + ready.content_at.elapsed(),
+                        slot: ready.slot,
+                    }));
+                }
+                Err(_) => ErrorClass::StreamTruncated,
+            },
+            Err(class) => class,
+        };
+        self.metrics.record_error(&ready.provider, class);
+        TrialOutcome::Failed {
+            error: format!(
+                "{} {} stopped part way through its answer: {}",
+                ready.provider,
+                ready.model_id,
+                class.label()
+            ),
+            pending: channel.map(|channel| PendingFailure {
+                channel,
+                retry_after_secs: None,
+                class: Some(class),
+            }),
+        }
     }
 
     /// Records a successful trial and clears the channel row's backoff.
@@ -1952,6 +1913,12 @@ struct FrameCounter {
     reasoning: u32,
     /// The stream has carried an in-band provider error frame.
     failed: bool,
+    /// The stream has carried its terminal event: OpenAI's `[DONE]` or
+    /// Anthropic's `message_stop`. Nothing more is owed.
+    terminal: bool,
+    /// The answer is complete and only a trailing frame, such as OpenAI's
+    /// usage chunk, may still follow: a `finish_reason` or a `stop_reason`.
+    finishing: bool,
 }
 
 impl Default for FrameCounter {
@@ -1963,11 +1930,51 @@ impl Default for FrameCounter {
             frames: 0,
             reasoning: 0,
             failed: false,
+            terminal: false,
+            finishing: false,
         }
     }
 }
 
 impl FrameCounter {
+    /// Notes whether this event ends the answer, or says it is complete.
+    fn note_ending(&mut self, data: &str) {
+        let data = data.trim();
+        if data == "[DONE]" {
+            self.terminal = true;
+            return;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+            return;
+        };
+        match json.get("type").and_then(serde_json::Value::as_str) {
+            Some("message_stop") => self.terminal = true,
+            Some("message_delta") => {
+                if json
+                    .pointer("/delta/stop_reason")
+                    .is_some_and(|reason| !reason.is_null())
+                {
+                    self.finishing = true;
+                }
+            }
+            _ => {
+                let finished = json
+                    .get("choices")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.iter().any(|choice| {
+                            choice
+                                .get("finish_reason")
+                                .is_some_and(|reason| !reason.is_null())
+                        })
+                    });
+                if finished {
+                    self.finishing = true;
+                }
+            }
+        }
+    }
+
     /// Takes the next raw chunk off the wire.
     fn feed(&mut self, chunk: &[u8]) {
         // The receiver lives in `self`, so the send cannot fail.
@@ -1976,6 +1983,7 @@ impl FrameCounter {
         // wants more bytes; the sender is never closed, so it never ends.
         while let Some(Some(event)) = self.events.next().now_or_never() {
             let Ok(event) = event else { continue };
+            self.note_ending(&event.data);
             // The same reader the race uses to decide a stream is an answer,
             // so keep-alives and error events are not tokens here either, and
             // an error frame marks the whole stream as failed: a 200 carrying
@@ -2664,6 +2672,67 @@ fn race_stat(slot: u32, failed_before_win: u32) -> crate::metrics::RaceStat {
     } else {
         crate::metrics::RaceStat::LaterWon
     }
+}
+
+/// The streams being read to their end, beside the trials in flight.
+type Streams = FuturesUnordered<Pin<Box<dyn std::future::Future<Output = Finished> + Send>>>;
+
+/// A stream read as far as it went, and how it ended.
+struct Finished {
+    ready: ReadyStream,
+    /// `Ok` when the stream reached its end, `Err` with the reason it broke.
+    /// An end is not yet a whole answer: the decode decides that.
+    end: Result<(), ErrorClass>,
+}
+
+/// Reads one stream to its end, buffering everything, with the stall timer
+/// running between signs of life.
+///
+/// A token or a reasoning frame resets the timer; a keepalive comment does not.
+/// The provider's terminal event ends the read at once. After a
+/// `finish_reason` only a trailing frame such as OpenAI's usage chunk is still
+/// owed, so the wait shortens to [`TAIL_GRACE`] rather than holding a winner
+/// back on a provider that keeps its socket open.
+async fn read_to_end(mut ready: ReadyStream, stall: Duration) -> Finished {
+    let mut deadline = tokio::time::Instant::now() + stall;
+    let end = loop {
+        match tokio::time::timeout_at(deadline, ready.rest.next()).await {
+            Err(_) if ready.counter.finishing => break Ok(()),
+            Err(_) => break Err(ErrorClass::StreamStalled),
+            Ok(None) => break Ok(()),
+            Ok(Some(Err(_))) => break Err(ErrorClass::StreamTransport),
+            Ok(Some(Ok(chunk))) => {
+                let before = (ready.counter.frames, ready.counter.reasoning);
+                ready.counter.feed(&chunk);
+                ready.buffered.push(chunk);
+                if ready.counter.failed {
+                    break Err(ErrorClass::StreamError);
+                }
+                if ready.counter.terminal {
+                    break Ok(());
+                }
+                if (ready.counter.frames, ready.counter.reasoning) != before {
+                    deadline = tokio::time::Instant::now() + stall;
+                }
+                if ready.counter.finishing {
+                    deadline = deadline.min(tokio::time::Instant::now() + TAIL_GRACE);
+                }
+            }
+        }
+    };
+    Finished { ready, end }
+}
+
+/// Decodes a stream that reached its end into one whole answer. A body that
+/// stopped without its terminal event fails here, which is the only place a
+/// clean close part way through an answer shows.
+async fn whole_answer(
+    buffered: Vec<Vec<u8>>,
+    format: wire::Format,
+) -> Result<NeutralResponse, wire::WireError> {
+    let bytes = futures::stream::iter(buffered.into_iter().map(Ok));
+    let chunks = wire::decode_stream(bytes, format)?;
+    wire::aggregate_stream(chunks).await
 }
 
 /// The trials in flight. The futures are boxed so the top-up is one helper
