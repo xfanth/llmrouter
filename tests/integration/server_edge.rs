@@ -1742,6 +1742,8 @@ async fn time_spent_on_failed_channels_is_upstream_time_not_router_overhead() {
     let response = edge.post_chat(&chat_request("split", false)).await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    // The failure messages carry the two figures only: the whole scrape is
+    // long enough to push them out of the tail CI keeps of a failed run.
     let text = text_body(edge.get("/metrics").await).await;
     let upstream = series_value(&text, "router_latency_seconds_sum{stage=\"upstream\"}");
     let router = series_value(&text, "router_latency_seconds_sum{stage=\"router\"}");
@@ -1749,7 +1751,7 @@ async fn time_spent_on_failed_channels_is_upstream_time_not_router_overhead() {
     assert!(
         upstream >= 0.4,
         "the walk waited 400ms on the slow channel, so the upstream half \
-         carries it: upstream {upstream}s, router {router}s:\n{text}"
+         carries it: upstream {upstream}s, router {router}s"
     );
     // 0.2 rather than something tighter: the router's own work here is
     // sub-millisecond, and the only way this fails is a loaded runner
@@ -1759,12 +1761,12 @@ async fn time_spent_on_failed_channels_is_upstream_time_not_router_overhead() {
         router < 0.2,
         "the router did milliseconds of work, so its half stays small. \
          Before the fix this held the slow channel's 400ms: upstream \
-         {upstream}s, router {router}s:\n{text}"
+         {upstream}s, router {router}s"
     );
     assert!(
         router < upstream,
         "the router half cannot exceed the walk it sits beside: upstream \
-         {upstream}s, router {router}s:\n{text}"
+         {upstream}s, router {router}s"
     );
 }
 

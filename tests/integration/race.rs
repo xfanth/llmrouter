@@ -843,7 +843,15 @@ async fn a_stream_breaking_part_way_is_replaced_rather_than_ending_the_walk() {
     let sound_id = sound_channel.id;
 
     let harness = Harness::new(
-        router_config(1, 1, dir.path()),
+        RouterConfig {
+            // Held at one channel at a time, as the comment above says. With
+            // the escalation on, the sound channel starts alongside the broken
+            // one and can finish first, and then the broken stream is
+            // cancelled before it ever fails: right for the router, but not
+            // the walk this test is about. Raced on a loaded CI runner.
+            race_escalation_ms: 0,
+            ..router_config(1, 1, dir.path())
+        },
         // The broken one is scanned first, so it streams alone at first.
         vec![channel("broken", &broken_url, 0), sound_channel],
         Link::Up,
