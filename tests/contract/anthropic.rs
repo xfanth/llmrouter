@@ -665,3 +665,42 @@ async fn a_stream_of_a_tool_call_answer_re_encodes_for_an_anthropic_client() {
     eprintln!("TOOL EVENTS: {:#?}", event_list);
 }
 
+#[tokio::test]
+async fn a_reasoning_model_reply_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-reason1",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "nemotron",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Let me think about this carefully..."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let encoded = wire::encode_response(&neutral, Format::AnthropicMessages, None).expect("encodes");
+    eprintln!("ENCODED REASONING BUFFERED: {:#?}", encoded);
+
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("ENCODED REASONING STREAMED: {:#?}", event_list);
+}
+
+
