@@ -622,3 +622,46 @@ async fn a_stream_re_encoded_for_an_anthropic_client_opens_and_closes_the_messag
         "the text block is opened, got {kinds:?}"
     );
 }
+
+#[tokio::test]
+async fn a_stream_of_a_tool_call_answer_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-tool1",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_9kQx",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"/etc/hosts\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 42, "completion_tokens": 17, "total_tokens": 59 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("TOOL EVENTS: {:#?}", event_list);
+}
+
