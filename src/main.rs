@@ -355,45 +355,36 @@ mod tests {
         assert_eq!(check["start_period"].as_str(), Some("10s"));
     }
 
-    /// ci.yml is a thin caller of the organisation's shared Rust gate: one
-    /// job, no runners chosen here, no tooling installed here, no caching of
-    /// its own. Anything the caller adds beyond the call is a second opinion
-    /// that drifts from the platform.
+    /// ci.yml runs on GitHub-hosted ubuntu-latest runners and parallelizes
+    /// checks (formatting, linting, tracking, pre-commit, coverage, smoke)
+    /// to minimize wall clock duration. It cancels in-progress runs on new pushes.
     #[test]
-    fn the_ci_workflow_is_a_thin_caller_of_the_shared_gate() {
+    fn the_ci_workflow_uses_github_hosted_runners_and_parallelizes() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
             .expect(".github/workflows/ci.yml is missing");
         let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
         let jobs = ci["jobs"].as_mapping().expect("jobs");
-        assert_eq!(
-            jobs.len(),
-            1,
-            "the caller carries exactly one job: the shared gate"
+        assert!(
+            jobs.len() >= 6,
+            "ci.yml splits checks into parallel jobs (got {})",
+            jobs.len()
         );
-        for (_, job) in jobs {
-            let uses = job["uses"]
-                .as_str()
-                .expect("the job is a call of the shared workflow");
-            assert!(
-                uses.starts_with("xfanth/.github/.github/workflows/rust-quality.yml@"),
-                "the caller calls the organisation's Rust gate: {uses}"
-            );
-            assert!(
-                job.get("steps").is_none() && job.get("runs-on").is_none(),
-                "the caller adds no steps and picks no runner"
+        for (name, job) in jobs {
+            assert_eq!(
+                job["runs-on"].as_str(),
+                Some("ubuntu-latest"),
+                "job {name:?} must run on GitHub-hosted ubuntu-latest"
             );
         }
-        for leftover in [
-            "taiki-e/install-action",
-            "Swatinem/rust-cache",
-            "runs-on: ubuntu-latest",
-        ] {
-            assert!(
-                !text.contains(leftover),
-                "the caller still carries a piece of the old workflow: {leftover}"
-            );
-        }
+        assert!(
+            text.contains("cancel-in-progress: true"),
+            "ci.yml must cancel in-progress runs on new push"
+        );
+        assert!(
+            ci["concurrency"]["group"].as_str() == Some("${{ github.workflow }}-${{ github.ref }}"),
+            "concurrency group must be scoped per workflow and branch ref"
+        );
     }
 
     /// Every test reads files from all over the repo, so nothing may gate
@@ -417,12 +408,11 @@ mod tests {
         );
     }
 
-    /// ci.sh pins and installs the test runner and the coverage instrumenter
-    /// itself, from their projects' prebuilt releases. ci.yml is a caller of
-    /// the organisation's shared gate and installs nothing: a second
-    /// installer there would drift from ci.sh's pins.
+    /// ci.sh and ci.yml install the test runner and the coverage
+    /// instrumenter separately, so a bump in one file quietly changes what a
+    /// local pass proves about CI. The two lists must stay identical.
     #[test]
-    fn the_test_tools_are_pinned_in_ci_sh_and_ci_yml_installs_nothing() {
+    fn the_test_tools_are_pinned_to_the_same_versions_in_ci_sh_and_ci_yml() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let sh = std::fs::read_to_string(root.join("ci.sh")).expect("ci.sh is missing");
         let version = |name: &str| {
@@ -432,24 +422,42 @@ mod tests {
                 .trim()
                 .to_string()
         };
-        let nextest = version("NEXTEST_VERSION");
-        let llvm_cov = version("LLVM_COV_VERSION");
-        // The pins are real version numbers, not placeholders.
-        for version in [&nextest, &llvm_cov] {
-            let digits = version.chars().filter(|c| c.is_ascii_digit()).count();
-            assert!(digits >= 3, "a plausible pinned version, got {version}");
-        }
+        let mut want = vec![
+            format!("cargo-nextest@{}", version("NEXTEST_VERSION")),
+            format!("cargo-llvm-cov@{}", version("LLVM_COV_VERSION")),
+        ];
+        want.sort();
 
         let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
             .expect(".github/workflows/ci.yml is missing");
-        assert!(
-            !text.contains("taiki-e/install-action"),
-            "ci.yml must not install the test tools; ci.sh alone does"
-        );
-        assert!(
-            text.contains("xfanth/.github/.github/workflows/rust-quality.yml@"),
-            "ci.yml calls the organisation's shared Rust gate"
-        );
+        let ci: serde_yaml::Value = serde_yaml::from_str(&text).expect("ci.yml parses");
+        let mut seen = 0;
+        for (name, job) in ci["jobs"].as_mapping().expect("jobs") {
+            let Some(steps) = job["steps"].as_sequence() else {
+                continue;
+            };
+            for step in steps {
+                if !step["uses"]
+                    .as_str()
+                    .is_some_and(|u| u.starts_with("taiki-e/install-action@"))
+                {
+                    continue;
+                }
+                let mut tools: Vec<String> = step["with"]["tool"]
+                    .as_str()
+                    .expect("the install step must name its tools")
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .collect();
+                tools.sort();
+                assert_eq!(
+                    tools, want,
+                    "job {name:?} installs tool versions that ci.sh does not pin"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "ci.yml must install the pinned test tools once");
     }
 
     /// Scratch directories named after the process id collide between runs: a
