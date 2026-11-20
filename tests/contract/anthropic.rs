@@ -805,6 +805,59 @@ fn an_anthropic_request_with_multiple_tool_uses_translates_to_openai() {
     eprintln!("OPENAI MULTI TOOL BODY: {:#?}", openai_body);
 }
 
+#[tokio::test]
+async fn a_stream_of_multiple_tool_calls_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-tool2",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"a.txt\"}"
+                        }
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"b.txt\"}"
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 42, "completion_tokens": 30, "total_tokens": 72 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("MULTI TOOL STREAMED EVENTS: {:#?}", event_list);
+}
+
+
 
 
 
