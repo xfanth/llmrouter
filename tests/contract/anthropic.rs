@@ -952,6 +952,41 @@ fn an_assistant_message_with_empty_text_block_translates() {
     eprintln!("OPENAI BODY WITH EMPTY TEXT: {:#?}", openai_body);
 }
 
+#[test]
+fn an_assistant_message_with_only_thinking_translates_to_openai() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "thinking only",
+                        "signature": ""
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
+        .expect("encodes for OpenAI");
+    eprintln!("OPENAI BODY THINKING ONLY: {:#?}", openai_body);
+}
+
+
 
 
 
