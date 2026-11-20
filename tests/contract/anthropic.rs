@@ -902,6 +902,57 @@ async fn a_stream_of_reasoning_and_tool_call_re_encodes_for_an_anthropic_client(
     eprintln!("REASONING + TOOL STREAMED EVENTS: {:#?}", event_list);
 }
 
+#[test]
+fn an_assistant_message_with_empty_text_block_translates() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "thinking",
+                        "signature": ""
+                    },
+                    {
+                        "type": "text",
+                        "text": ""
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "c1",
+                        "name": "f",
+                        "input": {}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "c1",
+                        "content": "ok"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
+        .expect("encodes for OpenAI");
+    eprintln!("OPENAI BODY WITH EMPTY TEXT: {:#?}", openai_body);
+}
+
+
 
 
 
