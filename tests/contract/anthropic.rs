@@ -703,4 +703,55 @@ async fn a_reasoning_model_reply_re_encodes_for_an_anthropic_client() {
     eprintln!("ENCODED REASONING STREAMED: {:#?}", event_list);
 }
 
+#[test]
+fn an_anthropic_request_with_thinking_and_tool_use_translates_to_openai() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "find the bug"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should run git status",
+                        "signature": ""
+                    },
+                    {
+                        "type": "text",
+                        "text": "Running git status now"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_123",
+                        "name": "Bash",
+                        "input": {"command": "git status"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_123",
+                        "content": "On branch master\nnothing to commit"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
+        .expect("encodes for OpenAI");
+    eprintln!("OPENAI BODY: {:#?}", openai_body);
+}
+
+
 
