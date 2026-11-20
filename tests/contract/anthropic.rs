@@ -753,5 +753,58 @@ fn an_anthropic_request_with_thinking_and_tool_use_translates_to_openai() {
     eprintln!("OPENAI BODY: {:#?}", openai_body);
 }
 
+#[test]
+fn an_anthropic_request_with_multiple_tool_uses_translates_to_openai() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "read two files"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {"path": "a.txt"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_2",
+                        "name": "Read",
+                        "input": {"path": "b.txt"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "content of a"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_2",
+                        "content": "content of b"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
+        .expect("encodes for OpenAI");
+    eprintln!("OPENAI MULTI TOOL BODY: {:#?}", openai_body);
+}
+
+
 
 
