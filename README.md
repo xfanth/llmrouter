@@ -145,7 +145,24 @@ claude
 
 ---
 
-## Verification & CI
+## Verification, Git Hooks & CI
+
+### Git Hooks (Pre-commit & Pre-push)
+
+The repository includes a [`.pre-commit-config.yaml`](.pre-commit-config.yaml) enforcing code formatting, source file tracking, hygiene checks, and secret detection before commits, plus running the full verification suite before pushes.
+
+Install hooks using [`prek`](https://github.com/j178/prek) (Rust) or [`pre-commit`](https://pre-commit.com/) (accelerated with `uv`):
+
+```bash
+# Using prek (fast Rust-native hook runner)
+prek install --hook-type pre-commit --hook-type pre-push
+
+# Or using pre-commit with uv
+uv tool install --with pre-commit-uv pre-commit
+pre-commit install --hook-type pre-commit --hook-type pre-push
+```
+
+### Local CI Suite
 
 The repository maintains an 80% line and region test coverage gate with formatting, clippy, unit, integration, contract, and end-to-end smoke tests:
 
