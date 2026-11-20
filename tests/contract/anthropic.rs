@@ -1071,6 +1071,15 @@ async fn a_stream_of_tool_call_with_empty_string_content_re_encodes() {
     eprintln!("TOOL WITH EMPTY STRING CONTENT EVENTS: {:#?}", event_list);
 }
 
+#[test]
+fn a_multi_turn_claude_request_translates() {
+    let text = std::fs::read_to_string("/tmp/reconstructed_req.json").expect("file exists");
+    let req: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    let neutral = wire::decode_request(Format::AnthropicMessages, &req).expect("decodes Anthropic request");
+    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+    std::fs::write("/tmp/openai_body.json", serde_json::to_string_pretty(&openai_body).unwrap()).unwrap();
+}
+
 
 
 
