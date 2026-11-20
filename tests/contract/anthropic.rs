@@ -1029,6 +1029,49 @@ async fn a_stream_of_reasoning_and_tool_call_with_null_content_re_encodes() {
     eprintln!("REASONING + TOOL NULL CONTENT EVENTS: {:#?}", event_list);
 }
 
+#[tokio::test]
+async fn a_stream_of_tool_call_with_empty_string_content_re_encodes() {
+    let openai_reply = json!({
+        "id": "chatcmpl-tool-empty-str",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_empty_str_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"hello.txt\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 25, "total_tokens": 35 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("TOOL WITH EMPTY STRING CONTENT EVENTS: {:#?}", event_list);
+}
+
+
 
 
 
