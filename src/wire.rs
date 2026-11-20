@@ -597,6 +597,13 @@ pub fn canonical_bytes(request: &NeutralRequest) -> std::result::Result<Vec<u8>,
         });
     }
 
+    // Normalise tool use and tool result IDs to positional indices, so a
+    // replayed conversation with different random IDs lands on the same
+    // cache key. Walk through messages, assign each tool_use `id` an index
+    // (`call_0`, `call_1`, ...) and rewrite every `tool_use_id` or
+    // `tool_call_id` reference to match.
+    normalise_tool_ids(object);
+
     // serde_json has preserve_order on in this build, so sort every nested
     // object explicitly before writing.
     value.sort_all_objects();
@@ -607,6 +614,100 @@ pub fn canonical_bytes(request: &NeutralRequest) -> std::result::Result<Vec<u8>,
 /// the filter drops any model without tool support.
 pub fn has_tools(request: &NeutralRequest) -> bool {
     !request.tools.is_empty()
+}
+
+/// Rewrites tool use and result IDs to positional indices for cache key
+/// stability. A `tool_use` block's `id` becomes `call_0`, `call_1`, etc.,
+/// and every `tool_use_id` or `tool_call_id` reference to it becomes the
+/// same index. Without this, a replayed conversation whose client assigned
+/// new random IDs would miss the cache for an otherwise identical request.
+fn normalise_tool_ids(object: &mut serde_json::Map<String, Value>) {
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    // First pass: collect the mapping from original ID to positional index.
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut counter = 0_u32;
+    for message in messages.iter() {
+        // OpenAI neutral: tool_calls array on assistant messages.
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in tool_calls {
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    id_map.entry(id.to_owned()).or_insert_with(|| {
+                        let idx = format!("call_{counter}");
+                        counter += 1;
+                        idx
+                    });
+                }
+            }
+        }
+        // Anthropic style: content blocks with type "tool_use".
+        // Neutral style: content blocks with type "tool_call".
+        if let Some(content) = message.get("content").and_then(Value::as_array) {
+            for block in content {
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if block_type == "tool_use" || block_type == "tool_call" {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        id_map.entry(id.to_owned()).or_insert_with(|| {
+                            let idx = format!("call_{counter}");
+                            counter += 1;
+                            idx
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if id_map.is_empty() {
+        return;
+    }
+
+    // Second pass: rewrite all IDs to their positional replacements.
+    for message in messages.iter_mut() {
+        // OpenAI tool_calls on assistant messages.
+        if let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for call in tool_calls {
+                rewrite_id(call, "id", &id_map);
+            }
+        }
+        // Anthropic and neutral content blocks.
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for block in content {
+                let block_type = block
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                match block_type.as_str() {
+                    "tool_use" | "tool_call" => rewrite_id(block, "id", &id_map),
+                    "tool_result" => {
+                        rewrite_id(block, "tool_use_id", &id_map);
+                        rewrite_id(block, "tool_call_id", &id_map);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // OpenAI tool result messages carry `tool_call_id` at the top level.
+        rewrite_id(message, "tool_call_id", &id_map);
+    }
+}
+
+/// Replaces one ID field in a JSON object when the map holds a replacement.
+fn rewrite_id(value: &mut Value, field: &str, map: &std::collections::HashMap<String, String>) {
+    let id = value.get(field).and_then(Value::as_str).map(str::to_owned);
+    if let Some(id) = id {
+        if let Some(replacement) = map.get(&id) {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(field.to_owned(), Value::String(replacement.clone()));
+            }
+        }
+    }
 }
 
 /// The model the caller named, if any. `auto` and an absent model both give
@@ -1141,5 +1242,82 @@ mod tests {
     fn a_bad_body_is_an_invalid_request() {
         let error = decode_request(Format::OpenAiChat, &serde_json::json!("not an object"));
         assert!(matches!(error, Err(WireError::InvalidRequest(_))));
+    }
+
+    #[test]
+    fn different_tool_use_ids_produce_the_same_cache_key() {
+        // Two OpenAI-style requests that differ only in tool_call.id and
+        // tool_call_id values should produce identical canonical bytes,
+        // because normalise_tool_ids replaces them with positional indices.
+        let request_a = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_abc123", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_abc123", "content": "sunny"},
+            ],
+            "max_tokens": 100,
+        });
+        let request_b = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_xyz789", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_xyz789", "content": "sunny"},
+            ],
+            "max_tokens": 100,
+        });
+
+        let req_a = decode_request(Format::OpenAiChat, &request_a).unwrap();
+        let req_b = decode_request(Format::OpenAiChat, &request_b).unwrap();
+        assert_eq!(
+            canonical_bytes(&req_a).unwrap(),
+            canonical_bytes(&req_b).unwrap(),
+            "requests differing only in tool_call IDs should have the same cache key"
+        );
+    }
+
+    #[test]
+    fn different_anthropic_tool_use_ids_produce_the_same_cache_key() {
+        // Two Anthropic-style requests differing only in tool_use/tool_result
+        // IDs should produce identical canonical bytes.
+        let request_a = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_aaa111", "name": "get_weather", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_aaa111", "content": "sunny"}
+                ]},
+            ],
+        });
+        let request_b = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_bbb222", "name": "get_weather", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_bbb222", "content": "sunny"}
+                ]},
+            ],
+        });
+
+        let req_a = decode_request(Format::AnthropicMessages, &request_a).unwrap();
+        let req_b = decode_request(Format::AnthropicMessages, &request_b).unwrap();
+        assert_eq!(
+            canonical_bytes(&req_a).unwrap(),
+            canonical_bytes(&req_b).unwrap(),
+            "requests differing only in Anthropic tool_use IDs should have the same cache key"
+        );
     }
 }

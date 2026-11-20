@@ -187,10 +187,11 @@ impl Upstream {
         &self,
         channel: &Channel,
         body: SharedBody,
+        anthropic_beta: Option<&str>,
     ) -> std::result::Result<CallOutcome, CallError> {
         let started = Instant::now();
         let response = self
-            .request(channel, body, false)
+            .request(channel, body, false, anthropic_beta)
             .send()
             .await
             .map_err(|e| self.classify(e))?;
@@ -213,9 +214,10 @@ impl Upstream {
         &self,
         channel: &Channel,
         body: SharedBody,
+        anthropic_beta: Option<&str>,
     ) -> std::result::Result<StreamedCall, CallError> {
         let response = self
-            .request(channel, body, true)
+            .request(channel, body, true, anthropic_beta)
             .send()
             .await
             .map_err(|e| self.classify(e))?;
@@ -257,11 +259,16 @@ impl Upstream {
     /// `stream` only sets the `Accept` header. Whether the body asks the
     /// provider for a stream is decided where the body is encoded, and this
     /// module never rewrites the shared tail.
+    ///
+    /// `anthropic_beta` is the client's `anthropic-beta` header value,
+    /// forwarded to Anthropic-wire channels so server-side prompt caching
+    /// features and TTL are preserved.
     fn request(
         &self,
         channel: &Channel,
         body: SharedBody,
         stream: bool,
+        anthropic_beta: Option<&str>,
     ) -> reqwest::RequestBuilder {
         let chunks = body.chunks(&channel.model_id);
         let length = chunks[0].len() + chunks[1].len();
@@ -287,9 +294,19 @@ impl Upstream {
 
         builder = match channel.wire {
             WireName::OpenAi => builder.header(AUTHORIZATION, auth_header(channel)),
-            WireName::Anthropic => builder
-                .header("x-api-key", auth_header(channel))
-                .header("anthropic-version", ANTHROPIC_VERSION),
+            WireName::Anthropic => {
+                let mut b = builder
+                    .header("x-api-key", auth_header(channel))
+                    .header("anthropic-version", ANTHROPIC_VERSION);
+                // Forward the client's `anthropic-beta` header so server-side
+                // prompt caching TTL and features reach the provider. Without
+                // this, every turn rewrites the cache at 1.25x instead of
+                // reading it at 0.1x.
+                if let Some(beta) = anthropic_beta {
+                    b = b.header("anthropic-beta", beta);
+                }
+                b
+            }
         };
 
         builder.body(body)
@@ -371,6 +388,7 @@ mod tests {
             created: None,
             health: ChannelHealth::default(),
             telemetry: ChannelTelemetry::default(),
+            max_per_channel: None,
         }
     }
 
@@ -487,7 +505,7 @@ mod tests {
         let body = SharedBody::new(Bytes::from_static(br#"{"messages":[]}"#));
 
         let outcome = upstream
-            .call_buffered(&channel, body)
+            .call_buffered(&channel, body, None)
             .await
             .expect("the redirect is a status, not a transport failure");
         assert_eq!(outcome.status, 302, "the 3xx must surface as a status");

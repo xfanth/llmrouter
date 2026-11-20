@@ -277,6 +277,7 @@ fn generate(source: &Path, out: &Path, force: bool) -> anyhow::Result<Report> {
                 } else {
                     Vec::new()
                 },
+                max_per_channel: None,
             })
             .collect::<Vec<_>>(),
     )?;

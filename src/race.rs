@@ -66,6 +66,14 @@ pub struct RaceInput {
     /// either held in RAM or spilled to a scratch file, and each channel call
     /// asks for it when it is about to upload.
     pub outbound: Arc<PromptBody>,
+    /// Body encoded in Anthropic format, preserving `cache_control` markers.
+    /// Used for channels whose wire format is Anthropic; `None` when no such
+    /// channel exists or the request could not be encoded in that format.
+    pub anthropic_outbound: Option<Arc<PromptBody>>,
+    /// The `anthropic-beta` header value from the client, forwarded to
+    /// Anthropic-wire channels so server-side prompt caching TTL and
+    /// features are preserved.
+    pub anthropic_beta: Option<String>,
     /// What a channel must satisfy to enter the race.
     pub filter: ChannelFilter,
     /// Stream from the providers. This is `streaming` in `router.yml`, not the
@@ -468,14 +476,13 @@ impl Racer {
         &'a self,
         inflight: &mut Trials<'a>,
         snapshot: &'a [Channel],
-        input: &RaceInput,
+        input: &'a RaceInput,
         excluded: &std::sync::RwLock<Excluded>,
         cancel: &CancellationToken,
         fired: &'a WalkCount,
         walk_started: tokio::time::Instant,
         width: usize,
     ) {
-        let copies = self.config.router.max_per_channel.max(1) as u32;
         let excluded = &mut *excluded.write().unwrap();
         let wanted = width.max(1).saturating_sub(inflight.len());
         if wanted == 0 {
@@ -487,17 +494,34 @@ impl Racer {
         for channel in
             crate::catalogue::query(snapshot, &input.filter, excluded, wanted, now_unix())
         {
+            // Per-channel hedging: a provider may override the global M to
+            // avoid multiplying billing on providers where every copy pays
+            // full input cost (e.g. Anthropic).
+            let copies = channel
+                .max_per_channel
+                .unwrap_or(self.config.router.max_per_channel)
+                .max(1) as u32;
             excluded.insert(channel.id);
             let slot = fired.queued();
             fired.queued.fetch_add(copies, Ordering::Relaxed);
+            // Anthropic-wire channels get the Anthropic-format body when one
+            // was built, so `cache_control` markers reach the provider and
+            // server-side prompt caching works. All others get the OpenAI
+            // format body.
+            let body = if channel.wire == crate::config::WireName::Anthropic {
+                input.anthropic_outbound.as_ref().unwrap_or(&input.outbound)
+            } else {
+                &input.outbound
+            };
             inflight.push(Box::pin(self.run_trial(
                 channel,
-                Arc::clone(&input.outbound),
+                Arc::clone(body),
                 input.streaming,
                 slot,
                 cancel.child_token(),
                 fired,
                 walk_started,
+                input.anthropic_beta.as_deref(),
             )));
         }
     }
@@ -517,8 +541,12 @@ impl Racer {
         cancel: CancellationToken,
         fired: &'a WalkCount,
         walk_started: tokio::time::Instant,
+        anthropic_beta: Option<&str>,
     ) -> TrialOutcome<'a> {
-        let copies = self.config.router.max_per_channel.max(1);
+        let copies = channel
+            .max_per_channel
+            .unwrap_or(self.config.router.max_per_channel)
+            .max(1);
         let delay = Duration::from_millis(self.config.router.hedge_delay_ms);
         // Our own open copies, so a `429` can tell a sibling copy apart from
         // another client request hitting the same channel.
@@ -572,9 +600,11 @@ impl Racer {
                     }
                 };
                 let called = if streaming {
-                    self.copy_streamed(channel, body, &own, slot).await
+                    self.copy_streamed(channel, body, &own, slot, anthropic_beta)
+                        .await
                 } else {
-                    self.copy_buffered(channel, body, &own, slot).await
+                    self.copy_buffered(channel, body, &own, slot, anthropic_beta)
+                        .await
                 };
                 match called {
                     Ok(win) => {
@@ -699,11 +729,16 @@ impl Racer {
         body: SharedBody,
         own: &Arc<AtomicU32>,
         slot: u32,
+        anthropic_beta: Option<&str>,
     ) -> Result<CopyWin, CopyFailure> {
         let _open = InFlight::open(channel, own);
         channel.telemetry.calls.fetch_add(1, Ordering::Relaxed);
 
-        let call = match self.upstream.call_buffered(channel, body).await {
+        let call = match self
+            .upstream
+            .call_buffered(channel, body, anthropic_beta)
+            .await
+        {
             Ok(call) => call,
             Err(error) => return Err(self.copy_failed(channel, error)),
         };
@@ -812,6 +847,7 @@ impl Racer {
         body: SharedBody,
         own: &Arc<AtomicU32>,
         slot: u32,
+        anthropic_beta: Option<&str>,
     ) -> Result<CopyWin, CopyFailure> {
         // The guard travels with the stream: a streamed call ends when the
         // stream ends, not when its first frame arrives.
@@ -819,7 +855,11 @@ impl Racer {
         channel.telemetry.calls.fetch_add(1, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
 
-        let call = match self.upstream.call_streamed(channel, body).await {
+        let call = match self
+            .upstream
+            .call_streamed(channel, body, anthropic_beta)
+            .await
+        {
             Ok(call) => call,
             Err(error) => return Err(self.copy_failed(channel, error)),
         };
@@ -2286,6 +2326,7 @@ mod tests {
             created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
+            max_per_channel: None,
         }
     }
 
@@ -3561,6 +3602,7 @@ mod tests {
                     cancel,
                     &self.fired,
                     tokio::time::Instant::now(),
+                    None,
                 )
                 .await
         }
@@ -3945,6 +3987,7 @@ mod tests {
             created: None,
             health: Default::default(),
             telemetry: Default::default(),
+            max_per_channel: None,
         }
     }
 }

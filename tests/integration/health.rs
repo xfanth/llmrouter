@@ -107,6 +107,7 @@ fn channel(provider: &str, key_id: &str, model_id: &str, base_url: &str, rank: u
         created: None,
         health: ChannelHealth::live(),
         telemetry: ChannelTelemetry::default(),
+        max_per_channel: None,
     }
 }
 
@@ -178,6 +179,8 @@ impl Harness {
             .run(
                 RaceInput {
                     outbound: Arc::new(body),
+                    anthropic_outbound: None,
+                    anthropic_beta: None,
                     filter,
                     streaming: false,
                     named_model: None,

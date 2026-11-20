@@ -417,6 +417,13 @@ async fn completion_response(
     // into one in the saved log.
     static NEXT_REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
     let client = client_key_prefix(headers);
+    // Extracted here, where the headers are still available, and threaded
+    // through to the race so Anthropic-wire channels forward it and
+    // server-side prompt caching works.
+    let anthropic_beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let span = tracing::info_span!(
         "request",
         client_key = %client,
@@ -424,7 +431,7 @@ async fn completion_response(
         bytes = body.len(),
         request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
     );
-    respond(state, client_format, body, client)
+    respond(state, client_format, body, client, anthropic_beta)
         .instrument(span)
         .await
 }
@@ -444,6 +451,7 @@ async fn respond(
     client_format: Format,
     body: axum::body::Bytes,
     client: String,
+    anthropic_beta: Option<String>,
 ) -> Response {
     // The clock starts here rather than inside the handler. Everything from
     // this line on is latency the router adds, the admission gate included:
@@ -532,6 +540,7 @@ async fn respond(
                 client,
                 request_snippet,
                 ready,
+                anthropic_beta,
             )
             .in_current_span(),
         ),
@@ -864,6 +873,7 @@ async fn handle_completion(
     client: String,
     request_snippet: String,
     can_serve: tokio::sync::oneshot::Sender<()>,
+    anthropic_beta: Option<String>,
 ) -> Served {
     let (_concurrency, concurrent) = Concurrency::open();
 
@@ -1002,6 +1012,11 @@ async fn handle_completion(
             )
         }
     };
+    // A second body in Anthropic wire format, used by Anthropic-wire channels
+    // so cache_control markers and the original structure survive.
+    let anthropic_outbound = anthropic_outbound_body(&request, streaming)
+        .ok()
+        .map(|bytes| Arc::new(PromptBody::Memory(bytes)));
     drop(request);
 
     // Every outcome with a status code of its own is behind us. If a channel
@@ -1025,8 +1040,10 @@ async fn handle_completion(
     let racer = Arc::clone(&state.racer);
     let input = RaceInput {
         outbound: Arc::clone(&outbound),
+        anthropic_outbound,
         filter: filter.clone(),
         streaming,
+        anthropic_beta,
         named_model: named_model.clone(),
         exclude: std::collections::HashSet::new(),
     };
@@ -1334,6 +1351,26 @@ fn outbound_body(
                 json!({ "include_usage": true }),
             );
         }
+        object.remove("model");
+    }
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|err| crate::wire::WireError::Translation(err.to_string()))
+}
+
+/// The body for Anthropic-wire channels.
+///
+/// Keeps the original Anthropic structure so `cache_control` markers survive
+/// and the provider's server-side prompt caching works through the router.
+/// Like [`outbound_body`], `model` is removed and `stream` is set, but
+/// `stream_options` is not added (that is OpenAI-specific).
+fn anthropic_outbound_body(
+    request: &crate::wire::NeutralRequest,
+    streaming: bool,
+) -> std::result::Result<Bytes, crate::wire::WireError> {
+    let mut value = crate::wire::encode_request(request, Format::AnthropicMessages)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stream".to_string(), Value::Bool(streaming));
         object.remove("model");
     }
     serde_json::to_vec(&value)
@@ -1826,6 +1863,7 @@ mod tests {
             created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
+            max_per_channel: None,
         }
     }
 
@@ -2804,6 +2842,7 @@ mod tests {
                 created: None,
                 health: ChannelHealth::live(),
                 telemetry: ChannelTelemetry::default(),
+                max_per_channel: None,
             }
         }
 

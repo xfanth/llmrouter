@@ -87,10 +87,13 @@ pub struct Channel {
     /// published one on its `/models` row. `None` when it did not.
     pub created: Option<u64>,
 
-    /// Mutated in place by live traffic and the poller.
+    /// Per-channel health, mutated in place by live traffic and the poller.
     pub health: ChannelHealth,
-    /// Mutated in place by live traffic.
+    /// Per-channel counters, mutated in place by live traffic.
     pub telemetry: ChannelTelemetry,
+    /// Per-channel override for `max_per_channel`, inherited from the provider.
+    /// `None` means use the global default from `router.yml`.
+    pub max_per_channel: Option<usize>,
 }
 
 /// Per-channel health, mutated in place through atomics so a failure never
@@ -375,6 +378,7 @@ mod tests {
             created: None,
             health: ChannelHealth::live(),
             telemetry: ChannelTelemetry::default(),
+            max_per_channel: None,
         }
     }
 

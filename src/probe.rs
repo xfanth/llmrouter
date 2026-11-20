@@ -372,6 +372,7 @@ impl Prober {
                         in_flight: Arc::new(AtomicU32::new(0)),
                     },
                     telemetry: Default::default(),
+                    max_per_channel: provider.max_per_channel,
                 }
             })
             .collect()
@@ -1278,6 +1279,7 @@ mod tests {
             keys_env: "GEMINI_KEYS".to_string(),
             models_path: models_path.to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         }
     }
 
@@ -1405,6 +1407,7 @@ mod tests {
             keys_env: "GEMINI_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let (before, _dir) = prober_for(
             crate::config::RouterConfig::default(),
@@ -1513,6 +1516,7 @@ mod tests {
             keys_env: "SLOWHOST_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let (prober, _dir) = prober_for(router, vec![provider], HashMap::new());
 
@@ -1550,6 +1554,7 @@ mod tests {
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1604,6 +1609,7 @@ mod tests {
             keys_env: "ZAI_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let keys = HashMap::from([("ZAI_KEYS".to_string(), vec!["one".to_string()])]);
         let (prober, _dir) = prober_for(
@@ -1696,6 +1702,7 @@ mod tests {
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1794,6 +1801,7 @@ mod tests {
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1852,6 +1860,7 @@ mod tests {
             keys_env: "CLOUDFLARE_B4B050CC_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: vec!["@cf/meta/llama-3.1-8b-instruct".to_string()],
+            max_per_channel: None,
         };
         let keys = HashMap::from([(
             "CLOUDFLARE_B4B050CC_KEYS".to_string(),
@@ -1920,6 +1929,7 @@ mod tests {
             keys_env: "OPENROUTER_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let keys = HashMap::from([(
             "OPENROUTER_KEYS".to_string(),
@@ -1964,6 +1974,7 @@ mod tests {
             keys_env: "CLOUDFLARE_60BF2F13_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: vec!["@cf/meta/llama-3.1-8b-instruct".to_string()],
+            max_per_channel: None,
         };
         let keys = HashMap::from([(
             "CLOUDFLARE_60BF2F13_KEYS".to_string(),
@@ -2002,6 +2013,7 @@ mod tests {
             keys_env: "GROQ_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         let keys = HashMap::from([("GROQ_KEYS".to_string(), vec!["k".to_string()])]);
         let (prober, _dir) = prober_for(
@@ -2043,6 +2055,7 @@ mod tests {
             keys_env: "GROQ_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: vec!["llama-3.3-70b".to_string()],
+            max_per_channel: None,
         };
         let keys = HashMap::from([("GROQ_KEYS".to_string(), vec!["k".to_string()])]);
         let (prober, _dir) = prober_for(

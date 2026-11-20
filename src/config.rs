@@ -475,6 +475,12 @@ pub struct Provider {
     /// `llmrouter-make-config` writes it for Cloudflare Workers AI only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// Per-provider override for the global `max_per_channel`. When set,
+    /// channels from this provider use this value instead of the router-wide
+    /// default. Set to 1 for providers where hedging multiplies billing
+    /// (e.g. Anthropic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_per_channel: Option<usize>,
 }
 
 /// The wire format a provider speaks on the way out.
@@ -1102,6 +1108,7 @@ mod tests {
             keys_env: keys_env.to_string(),
             models_path: default_models_path(),
             models: Vec::new(),
+            max_per_channel: None,
         };
         assert_eq!(
             cfg.keys_for(&provider("GEMINI_KEYS"))[0].expose_secret(),

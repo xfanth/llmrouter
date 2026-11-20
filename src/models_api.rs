@@ -305,6 +305,7 @@ mod tests {
                 ..ChannelHealth::default()
             },
             telemetry: ChannelTelemetry::default(),
+            max_per_channel: None,
         }
     }
 

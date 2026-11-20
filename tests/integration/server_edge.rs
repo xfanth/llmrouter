@@ -108,6 +108,7 @@ fn channel(base_url: &str, model_id: &str, key: &str, limit_context: u32) -> Cha
         created: Some(1_700_000_000),
         health: ChannelHealth::live(),
         telemetry: ChannelTelemetry::default(),
+        max_per_channel: None,
     }
 }
 

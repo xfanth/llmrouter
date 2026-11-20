@@ -64,6 +64,7 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
             keys_env: "LIVE_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         },
         Provider {
             name: "dead".to_string(),
@@ -74,6 +75,7 @@ async fn startup_waves_build_the_catalogue_from_reachable_providers_only() {
             keys_env: "DEAD_KEYS".to_string(),
             models_path: "/models".to_string(),
             models: Vec::new(),
+            max_per_channel: None,
         },
     ];
     let keys = HashMap::from([

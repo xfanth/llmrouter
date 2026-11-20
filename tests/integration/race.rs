@@ -69,6 +69,7 @@ fn channel(provider: &str, base_url: &str, rank: u32) -> Channel {
         created: None,
         health: ChannelHealth::live(),
         telemetry: ChannelTelemetry::default(),
+        max_per_channel: None,
     }
 }
 
@@ -234,6 +235,8 @@ fn input(streaming: bool) -> RaceInput {
         },
         streaming,
         named_model: None,
+        anthropic_outbound: None,
+        anthropic_beta: None,
         exclude: std::collections::HashSet::new(),
     }
 }
