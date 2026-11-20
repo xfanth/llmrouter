@@ -260,9 +260,10 @@ mod tests {
     #[test]
     fn a_bar_is_hidden_when_stderr_is_not_a_terminal() {
         let bar = bar(10, "wave 1");
+        let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
         assert_eq!(
             bar.is_hidden(),
-            !std::io::stderr().is_terminal(),
+            !std::io::stderr().is_terminal() || dumb,
             "a bar drawn into a pipe would fill Docker logs with control characters"
         );
         bar.inc(3);

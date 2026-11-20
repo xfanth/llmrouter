@@ -685,7 +685,8 @@ async fn a_reasoning_model_reply_re_encodes_for_an_anthropic_client() {
     });
 
     let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
-    let encoded = wire::encode_response(&neutral, Format::AnthropicMessages, None).expect("encodes");
+    let encoded =
+        wire::encode_response(&neutral, Format::AnthropicMessages, None).expect("encodes");
     eprintln!("ENCODED REASONING BUFFERED: {:#?}", encoded);
 
     let chunks = wire::stream_of(neutral);
@@ -748,8 +749,8 @@ fn an_anthropic_request_with_thinking_and_tool_use_translates_to_openai() {
 
     let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
         .expect("decodes Anthropic request");
-    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
-        .expect("encodes for OpenAI");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
     eprintln!("OPENAI BODY: {:#?}", openai_body);
 }
 
@@ -800,8 +801,8 @@ fn an_anthropic_request_with_multiple_tool_uses_translates_to_openai() {
 
     let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
         .expect("decodes Anthropic request");
-    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
-        .expect("encodes for OpenAI");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
     eprintln!("OPENAI MULTI TOOL BODY: {:#?}", openai_body);
 }
 
@@ -947,8 +948,8 @@ fn an_assistant_message_with_empty_text_block_translates() {
 
     let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
         .expect("decodes Anthropic request");
-    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
-        .expect("encodes for OpenAI");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
     eprintln!("OPENAI BODY WITH EMPTY TEXT: {:#?}", openai_body);
 }
 
@@ -981,8 +982,8 @@ fn an_assistant_message_with_only_thinking_translates_to_openai() {
 
     let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
         .expect("decodes Anthropic request");
-    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat)
-        .expect("encodes for OpenAI");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
     eprintln!("OPENAI BODY THINKING ONLY: {:#?}", openai_body);
 }
 
@@ -1073,19 +1074,106 @@ async fn a_stream_of_tool_call_with_empty_string_content_re_encodes() {
 
 #[test]
 fn a_multi_turn_claude_request_translates() {
-    let text = std::fs::read_to_string("/tmp/reconstructed_req.json").expect("file exists");
-    let req: serde_json::Value = serde_json::from_str(&text).expect("valid json");
-    let neutral = wire::decode_request(Format::AnthropicMessages, &req).expect("decodes Anthropic request");
-    let openai_body = wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
-    std::fs::write("/tmp/openai_body.json", serde_json::to_string_pretty(&openai_body).unwrap()).unwrap();
+    let req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "start work"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Step 1 thinking process...",
+                        "signature": ""
+                    },
+                    {
+                        "type": "text",
+                        "text": "Running tool step"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "bash",
+                        "input": {"cmd": "ls"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "file1.txt\nfile2.txt"
+                    }
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Step 2 thinking process without visible text...",
+                        "signature": ""
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_2",
+                        "name": "read",
+                        "input": {"path": "file1.txt"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_2",
+                        "content": "hello world"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral =
+        wire::decode_request(Format::AnthropicMessages, &req).expect("decodes Anthropic request");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+
+    // Strict OpenAI providers (Groq, Mistral) reject requests containing 'reasoning'
+    // in message objects. Verify reasoning was stripped from all messages.
+    let messages = openai_body["messages"].as_array().expect("messages array");
+    for (i, m) in messages.iter().enumerate() {
+        assert!(
+            m.get("reasoning").is_none(),
+            "message {i} should not contain 'reasoning' field: {m:?}"
+        );
+        assert!(
+            m.get("reasoning_content").is_none(),
+            "message {i} should not contain 'reasoning_content' field: {m:?}"
+        );
+    }
+
+    // Also verify against the real reconstructed session if it exists on disk
+    if let Ok(text) = std::fs::read_to_string("/tmp/reconstructed_req.json") {
+        if let Ok(file_req) = serde_json::from_str::<serde_json::Value>(&text) {
+            let n = wire::decode_request(Format::AnthropicMessages, &file_req)
+                .expect("decodes reconstructed request");
+            let body = wire::encode_request(&n, Format::OpenAiChat)
+                .expect("encodes reconstructed request");
+            let file_msgs = body["messages"].as_array().unwrap();
+            for (i, m) in file_msgs.iter().enumerate() {
+                assert!(
+                    m.get("reasoning").is_none(),
+                    "reconstructed msg {i} reasoning"
+                );
+            }
+        }
+    }
 }
-
-
-
-
-
-
-
-
-
-

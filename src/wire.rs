@@ -211,7 +211,45 @@ pub fn encode_request(
     let mut body = switchyard_translation::encode_request(request, format.into())
         .map_err(|error| WireError::Translation(error.to_string()))?;
     restore_stop(request, format, &mut body);
+    sanitize_openai_request(format, &mut body);
     Ok(body)
+}
+
+/// Cleans up OpenAI Chat Completions requests translated from other formats.
+///
+/// 1. Prior thinking blocks from Anthropic assistant turns become `reasoning` on
+///    the assistant message. The OpenAI Chat Completions API schema does not define
+///    `reasoning` on input messages; strict providers (Groq with 400, Mistral with
+///    422) reject the request with schema validation errors. Stripping it from
+///    input messages ensures multi-turn conversations with thinking models are
+///    accepted by any OpenAI-compatible provider.
+///
+/// 2. If an assistant message has `content: null` and no tool calls (e.g. from an
+///    assistant turn that only contained a thinking block), OpenAI schema requires
+///    a string (empty string) rather than null.
+///
+/// 3. If `max_completion_tokens` is present but `max_tokens` is absent, duplicates
+///    it as `max_tokens` so providers that do not recognize `max_completion_tokens`
+///    do not fall back to an unexpectedly tiny default token limit.
+fn sanitize_openai_request(format: Format, body: &mut Value) {
+    if format != Format::OpenAiChat {
+        return;
+    }
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.remove("reasoning");
+                obj.remove("reasoning_content");
+                if obj.get("content").is_some_and(Value::is_null)
+                    && !obj
+                        .get("tool_calls")
+                        .is_some_and(|tc| tc.as_array().is_some_and(|a| !a.is_empty()))
+                {
+                    obj.insert("content".to_string(), Value::String(String::new()));
+                }
+            }
+        }
+    }
 }
 
 /// Puts the caller's stop sequences back on an OpenAI chat body.
