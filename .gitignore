@@ -40,6 +40,9 @@ target/
 
 # Agent tooling state
 .omc/
+.claude/
+.worktrees/
+*.txt
 
 # Coverage reports
 lcov.info

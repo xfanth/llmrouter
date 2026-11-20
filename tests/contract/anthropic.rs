@@ -622,3 +622,558 @@ async fn a_stream_re_encoded_for_an_anthropic_client_opens_and_closes_the_messag
         "the text block is opened, got {kinds:?}"
     );
 }
+
+#[tokio::test]
+async fn a_stream_of_a_tool_call_answer_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-tool1",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_9kQx",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"/etc/hosts\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 42, "completion_tokens": 17, "total_tokens": 59 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("TOOL EVENTS: {:#?}", event_list);
+}
+
+#[tokio::test]
+async fn a_reasoning_model_reply_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-reason1",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "nemotron",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Let me think about this carefully..."
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let encoded =
+        wire::encode_response(&neutral, Format::AnthropicMessages, None).expect("encodes");
+    eprintln!("ENCODED REASONING BUFFERED: {:#?}", encoded);
+
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("ENCODED REASONING STREAMED: {:#?}", event_list);
+}
+
+#[test]
+fn an_anthropic_request_with_thinking_and_tool_use_translates_to_openai() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "find the bug"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "I should run git status",
+                        "signature": ""
+                    },
+                    {
+                        "type": "text",
+                        "text": "Running git status now"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_123",
+                        "name": "Bash",
+                        "input": {"command": "git status"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_123",
+                        "content": "On branch master\nnothing to commit"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+    eprintln!("OPENAI BODY: {:#?}", openai_body);
+}
+
+#[test]
+fn an_anthropic_request_with_multiple_tool_uses_translates_to_openai() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "read two files"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {"path": "a.txt"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_2",
+                        "name": "Read",
+                        "input": {"path": "b.txt"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "content of a"
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_2",
+                        "content": "content of b"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+    eprintln!("OPENAI MULTI TOOL BODY: {:#?}", openai_body);
+}
+
+#[tokio::test]
+async fn a_stream_of_multiple_tool_calls_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-tool2",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"a.txt\"}"
+                        }
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"b.txt\"}"
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 42, "completion_tokens": 30, "total_tokens": 72 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("MULTI TOOL STREAMED EVENTS: {:#?}", event_list);
+}
+
+#[tokio::test]
+async fn a_stream_of_reasoning_and_tool_call_re_encodes_for_an_anthropic_client() {
+    let openai_reply = json!({
+        "id": "chatcmpl-reason-tool",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "nemotron",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "I am about to read the file.",
+                "reasoning_content": "Let me read the file first to check its contents.",
+                "tool_calls": [{
+                    "id": "call_reason_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"hello.txt\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 25, "total_tokens": 35 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    eprintln!("NEUTRAL RESPONSE: {:#?}", neutral);
+
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("REASONING + TOOL STREAMED EVENTS: {:#?}", event_list);
+}
+
+#[test]
+fn an_assistant_message_with_empty_text_block_translates() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "thinking",
+                        "signature": ""
+                    },
+                    {
+                        "type": "text",
+                        "text": ""
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "c1",
+                        "name": "f",
+                        "input": {}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "c1",
+                        "content": "ok"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+    eprintln!("OPENAI BODY WITH EMPTY TEXT: {:#?}", openai_body);
+}
+
+#[test]
+fn an_assistant_message_with_only_thinking_translates_to_openai() {
+    let anthropic_req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "thinking only",
+                        "signature": ""
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hello"}]
+            }
+        ]
+    });
+
+    let neutral = wire::decode_request(Format::AnthropicMessages, &anthropic_req)
+        .expect("decodes Anthropic request");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+    eprintln!("OPENAI BODY THINKING ONLY: {:#?}", openai_body);
+}
+
+#[tokio::test]
+async fn a_stream_of_reasoning_and_tool_call_with_null_content_re_encodes() {
+    let openai_reply = json!({
+        "id": "chatcmpl-reason-tool-null",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "nemotron",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "Let me read the file first to check its contents.",
+                "tool_calls": [{
+                    "id": "call_reason_null_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"hello.txt\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 25, "total_tokens": 35 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("REASONING + TOOL NULL CONTENT EVENTS: {:#?}", event_list);
+}
+
+#[tokio::test]
+async fn a_stream_of_tool_call_with_empty_string_content_re_encodes() {
+    let openai_reply = json!({
+        "id": "chatcmpl-tool-empty-str",
+        "object": "chat.completion",
+        "created": 1_700_000_000u64,
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_empty_str_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"hello.txt\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 25, "total_tokens": 35 }
+    });
+
+    let neutral = wire::decode_response(&openai_reply, Format::OpenAiChat).expect("decodes");
+    let chunks = wire::stream_of(neutral);
+    let mut events = wire::encode_stream(
+        chunks,
+        Format::AnthropicMessages,
+        Some("claude-sonnet-4".to_owned()),
+    )
+    .expect("the stream re-encoder starts");
+
+    let mut event_list = Vec::new();
+    while let Some(item) = events.next().await {
+        event_list.push(item.expect("event"));
+    }
+    eprintln!("TOOL WITH EMPTY STRING CONTENT EVENTS: {:#?}", event_list);
+}
+
+#[test]
+fn a_multi_turn_claude_request_translates() {
+    let req = json!({
+        "model": "claude-sonnet-4",
+        "max_tokens": 4096,
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "start work"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Step 1 thinking process...",
+                        "signature": ""
+                    },
+                    {
+                        "type": "text",
+                        "text": "Running tool step"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "bash",
+                        "input": {"cmd": "ls"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": "file1.txt\nfile2.txt"
+                    }
+                ]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Step 2 thinking process without visible text...",
+                        "signature": ""
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_2",
+                        "name": "read",
+                        "input": {"path": "file1.txt"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_2",
+                        "content": "hello world"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let neutral =
+        wire::decode_request(Format::AnthropicMessages, &req).expect("decodes Anthropic request");
+    let openai_body =
+        wire::encode_request(&neutral, Format::OpenAiChat).expect("encodes for OpenAI");
+
+    // Strict OpenAI providers (Groq, Mistral) reject requests containing 'reasoning'
+    // in message objects. Verify reasoning was stripped from all messages.
+    let messages = openai_body["messages"].as_array().expect("messages array");
+    for (i, m) in messages.iter().enumerate() {
+        assert!(
+            m.get("reasoning").is_none(),
+            "message {i} should not contain 'reasoning' field: {m:?}"
+        );
+        assert!(
+            m.get("reasoning_content").is_none(),
+            "message {i} should not contain 'reasoning_content' field: {m:?}"
+        );
+    }
+
+    // Also verify against the real reconstructed session if it exists on disk
+    if let Ok(text) = std::fs::read_to_string("/tmp/reconstructed_req.json") {
+        if let Ok(file_req) = serde_json::from_str::<serde_json::Value>(&text) {
+            let n = wire::decode_request(Format::AnthropicMessages, &file_req)
+                .expect("decodes reconstructed request");
+            let body = wire::encode_request(&n, Format::OpenAiChat)
+                .expect("encodes reconstructed request");
+            let file_msgs = body["messages"].as_array().unwrap();
+            for (i, m) in file_msgs.iter().enumerate() {
+                assert!(
+                    m.get("reasoning").is_none(),
+                    "reconstructed msg {i} reasoning"
+                );
+            }
+        }
+    }
+}
